@@ -20,7 +20,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 # Load project .env even when systemd cwd is / (not only when EnvironmentFile= is set).
 load_dotenv(Path(__file__).resolve().parent / ".env")
