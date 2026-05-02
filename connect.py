@@ -14,6 +14,7 @@ Env::
   ENABLE_HTTP=0|1           # default 1 when mode=ws (sidecar); ignored when mode=http
   PORT=5002
   LARK_WS_LOG_LEVEL=INFO    # DEBUG|INFO|WARNING|ERROR for SDK WS logs
+  LARK_WS_USE_HTTP_KEYS=0   # 1=把 LARK_ENCRYPT_KEY/VERIFICATION_TOKEN 传给 WS handler（一般勿开；长连接文档要求空）
 
 Usage::
 

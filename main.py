@@ -773,61 +773,8 @@ def _serialize_lark_user_id(uid: Any) -> Dict[str, Any]:
     return out
 
 
-def _serialize_lark_mention(m: Any) -> Dict[str, Any]:
-    if m is None:
-        return {}
-    if isinstance(m, dict):
-        out = {k: v for k, v in m.items() if k in ("key", "name", "tenant_key", "id") and v is not None}
-        return out
-    out: Dict[str, Any] = {}
-    if getattr(m, "key", None):
-        out["key"] = m.key
-    if getattr(m, "name", None):
-        out["name"] = m.name
-    uid = getattr(m, "id", None)
-    if uid:
-        out["id"] = _serialize_lark_user_id(uid)
-    return out
-
-
-def _event_message_any_to_webhook_dict(msg: Any) -> Dict[str, Any]:
-    """Normalize SDK ``EventMessage`` or plain JSON ``dict`` to webhook-style message dict."""
-    if msg is None:
-        return {}
-    if isinstance(msg, dict):
-        return dict(msg)
-    return _event_message_sdk_to_webhook_dict(msg)
-
-
-def _event_message_sdk_to_webhook_dict(msg: Any) -> Dict[str, Any]:
-    """Map ``lark_oapi`` EventMessage → same keys as HTTP ``im.message.receive_v*`` body."""
-    if msg is None:
-        return {}
-    out: Dict[str, Any] = {}
-    for attr in (
-        "message_id",
-        "root_id",
-        "parent_id",
-        "chat_id",
-        "thread_id",
-        "chat_type",
-        "message_type",
-        "content",
-        "user_agent",
-        "create_time",
-        "update_time",
-    ):
-        v = getattr(msg, attr, None)
-        if v is not None and v != "":
-            out[attr] = v
-    mlist = getattr(msg, "mentions", None) or []
-    if mlist:
-        out["mentions"] = [_serialize_lark_mention(x) for x in mlist]
-    return out
-
-
 def _lark_customized_event_to_schema2_dict(ce: Any) -> Dict[str, Any]:
-    """``im.message.receive_v2`` 等走 CustomizedEvent：``event`` 已是 dict，与 HTTP schema 2.0 一致。"""
+    """WebSocket ``CustomizedEvent`` / schema 2.0：``event`` 为 dict（与 HTTP webhook 体一致）。"""
     header: Dict[str, Any] = {}
     hdr = getattr(ce, "header", None)
     if hdr:
@@ -841,34 +788,10 @@ def _lark_customized_event_to_schema2_dict(ce: Any) -> Dict[str, Any]:
     return {"schema": "2.0", "header": header, "event": ev}
 
 
-def _p2_im_message_receive_v1_to_event_dict(p2: Any) -> Dict[str, Any]:
-    """Schema 2.0–shaped dict for :func:`_process_im_message_event` (SDK + HTTP share this)."""
-    ev = getattr(p2, "event", None)
-    header: Dict[str, Any] = {}
-    hdr = getattr(p2, "header", None)
-    if hdr:
-        for k in ("event_id", "token", "event_type", "tenant_key", "app_id", "create_time"):
-            v = getattr(hdr, k, None)
-            if v is not None and v != "":
-                header[k] = v
-
-    # Rare: JSON 反序列化后 ``event`` 已是 dict（与 v2 相同），避免对 dict 取 .sender 崩溃。
-    if isinstance(ev, dict):
-        return {"schema": "2.0", "header": header, "event": ev}
-
-    sender: Dict[str, Any] = {}
-    if ev and getattr(ev, "sender", None) and getattr(ev.sender, "sender_id", None):
-        sender["sender_id"] = _serialize_lark_user_id(ev.sender.sender_id)
-    raw_msg = getattr(ev, "message", None) if ev else None
-    message = _event_message_any_to_webhook_dict(raw_msg)
-    inner: Dict[str, Any] = {"sender": sender, "message": message}
-    return {"schema": "2.0", "header": header, "event": inner}
-
-
 def _process_im_message_event(data: Dict[str, Any]) -> None:
     """
-    Shared handler for ``im.message`` from HTTP webhook or WebSocket ``P2ImMessageReceiveV1``.
-    HTTP path verifies token before calling; WS path relies on SDK + ``EventDispatcherHandler`` keys.
+    Shared handler for ``im.message`` from HTTP webhook or WebSocket (``CustomizedEvent`` v1/v2).
+    HTTP path verifies token before calling; WS path uses ``EventDispatcherHandler.builder('', '')``.
     """
     try:
         _process_im_message_event_impl(data)
@@ -962,25 +885,19 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     return jsonify({"success": True}), 200
 
 
-def _on_ws_p2_im_message_receive_v1(p2: Any) -> None:
+def _on_ws_im_message_p2_customized(ce: Any) -> None:
+    """
+    Long-connection ``im.message.receive_v1`` / ``im.message.receive_v2`` (same payload shape; 控制台「接收消息 v2.0」
+    仍常为 ``receive_v1``)。用 CustomizedEvent + 空 builder 密钥，与飞书长连接文档一致。
+    """
     try:
-        data = _p2_im_message_receive_v1_to_event_dict(p2)
-        mid, mtype, chat = _ws_log_message_snip(data)
-        logger.info("ws p2.im.message.receive_v1 mid=%r mtype=%r chat=%r", mid, mtype, chat)
-        _process_im_message_event(data)
-    except Exception:
-        logger.exception("WebSocket im.message.receive_v1 handler failed")
-
-
-def _on_ws_p2_im_message_receive_v2(ce: Any) -> None:
-    """控制台订阅「接收消息 v2.0」时 event_type 为 im.message.receive_v2，须单独注册。"""
-    try:
+        et = getattr(getattr(ce, "header", None), "event_type", None) or "?"
         data = _lark_customized_event_to_schema2_dict(ce)
         mid, mtype, chat = _ws_log_message_snip(data)
-        logger.info("ws p2.im.message.receive_v2 mid=%r mtype=%r chat=%r", mid, mtype, chat)
+        logger.info("ws im.message %s mid=%r mtype=%r chat=%r", et, mid, mtype, chat)
         _process_im_message_event(data)
     except Exception:
-        logger.exception("WebSocket im.message.receive_v2 handler failed")
+        logger.exception("WebSocket im.message customized handler failed")
 
 
 def _lark_ws_domain_try_order() -> List[str]:
@@ -1008,16 +925,31 @@ def start_lark_ws_client_blocking() -> None:
     from lark_oapi.core.enum import LogLevel
     from lark_oapi.ws.client import Client as LarkWsClient
 
-    encrypt_key = LARK_ENCRYPT_KEY or ""
-    verification = VERIFICATION_TOKEN or ""
+    # 飞书「使用长连接接收事件」文档：builder 前两参须为 **空字符串**（勿传 HTTP 回调的 Encrypt/Verification）。
+    ws_use_http_keys = os.getenv("LARK_WS_USE_HTTP_KEYS", "").strip().lower() in ("1", "true", "yes", "on")
+    enc = (LARK_ENCRYPT_KEY or "") if ws_use_http_keys else ""
+    ver = (VERIFICATION_TOKEN or "") if ws_use_http_keys else ""
+    if ws_use_http_keys:
+        logger.warning(
+            "LARK_WS_USE_HTTP_KEYS=1 — passing encrypt/verification into WS handler (non-standard; "
+            "prefer empty per Feishu long-connection doc)."
+        )
+    else:
+        logger.info(
+            "Lark WS EventDispatcherHandler.builder('', '') — HTTP 的 VERIFICATION_TOKEN/LARK_ENCRYPT_KEY 不用于长连接"
+        )
     handler = (
-        EventDispatcherHandler.builder(encrypt_key, verification)
-        .register_p2_im_message_receive_v1(_on_ws_p2_im_message_receive_v1)
-        .register_p2_customized_event("im.message.receive_v2", _on_ws_p2_im_message_receive_v2)
+        EventDispatcherHandler.builder(enc, ver)
+        .register_p2_customized_event("im.message.receive_v1", _on_ws_im_message_p2_customized)
+        .register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
         .build()
     )
     level_name = (os.getenv("LARK_WS_LOG_LEVEL") or "INFO").strip().upper()
     log_level = getattr(LogLevel, level_name, LogLevel.INFO)
+
+    logger.warning(
+        "长连接为集群投递：同 APP 若有多条 WS 或其它实例，仅随机一台会收到消息；请只保留一个 monitoring 进程。"
+    )
 
     last_domain_err: Optional[BaseException] = None
     global _lark_open_api_domain_override, _lark_oapi_client
@@ -1035,7 +967,7 @@ def start_lark_ws_client_blocking() -> None:
             auto_reconnect=True,
         )
         logger.info(
-            "Lark WebSocket client starting (domain=%s); 长连接 im.message.receive_v1 + v2",
+            "Lark WebSocket client starting (domain=%s); 订阅 im.message.receive_v1 / v2（CustomizedEvent）",
             dnorm,
         )
         try:
