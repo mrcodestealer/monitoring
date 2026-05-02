@@ -9,9 +9,12 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana（.env 配�
 - 仍支持旧模式：仅 HTTP 时设置 ``LARK_EVENT_MODE=http`` 且 ``connect.py`` 只起 Flask。
 
 群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要；发消息用 ``lark-oapi`` HTTP API。
+
+HTTP 回调（``LARK_EVENT_MODE=http``）：飞书约 **3s** 内须 **200**；IM 事件先返回空 JSON ``{}``，再在后台拉 Grafana 并发消息。
 """
 
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -45,6 +48,7 @@ app = Flask(__name__)
 # Lark duplicate pushes (same message_id) — align with Chatbox processed_messages pattern.
 _processed_lark_message_ids: set = set()
 _PROCESSED_LARK_IDS_CAP = 4000
+_monitoring_reply_dispatch_lock = threading.Lock()
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
@@ -512,6 +516,11 @@ def _lark_min_json_response(payload: Dict[str, Any], status: int = 200) -> Respo
     )
 
 
+def _lark_feishu_webhook_ack_immediate() -> Response:
+    """Feishu event/card HTTP callbacks should get 200 within ~3s; empty body is accepted after ACK."""
+    return _lark_min_json_response({}, 200)
+
+
 def _fast_plaintext_url_verification_response(raw_in: Dict[str, Any]) -> Optional[Response]:
     """
     Return Flask response for URL verification **before** decrypt/normalize pipeline.
@@ -764,10 +773,9 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
     except Exception as e:
         logger.exception("lark send failed (background): %s", e)
 
-    if sent and mid:
-        _processed_lark_message_ids.add(mid)
-        if len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
-            _processed_lark_message_ids.clear()
+    # ``mid`` was reserved on the webhook thread before ACK to avoid duplicate workers (HTTP returns {} immediately).
+    if sent and mid and len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
+        _processed_lark_message_ids.clear()
 
 
 def _serialize_lark_user_id(uid: Any) -> Dict[str, Any]:
@@ -875,10 +883,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         return
 
-    if mid and mid in _processed_lark_message_ids:
-        logger.info("duplicate message_id=%s — already replied, skip", mid)
-        return
-
     chat_id = chat_resolved
     open_id = sender_open
 
@@ -888,6 +892,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         bool(chat_id),
         (open_id[:12] + "…") if len(open_id) > 12 else open_id,
     )
+
+    with _monitoring_reply_dispatch_lock:
+        if mid and mid in _processed_lark_message_ids:
+            logger.info("duplicate message_id=%s — skip (already dispatched)", mid)
+            return
+        if mid:
+            _processed_lark_message_ids.add(mid)
 
     threading.Thread(
         target=_monitoring_background_worker,
@@ -909,10 +920,19 @@ def _ws_log_message_snip(data: Dict[str, Any]) -> Tuple[Any, Any, str]:
     return mid, mtype, chat
 
 
-def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
-    # Token already verified in webhook_event (same as Chatbox single gate).
-    _process_im_message_event(data)
-    return jsonify({"success": True}), 200
+def _handle_im_message_receive(data: Dict[str, Any]) -> Response:
+    """
+    HTTP path: Feishu ~3s deadline — return ``{}`` immediately, parse/Grafana/send on a daemon thread.
+    WebSocket path still calls :func:`_process_im_message_event` synchronously (no HTTP timeout).
+    """
+    payload = copy.deepcopy(data)
+    threading.Thread(
+        target=_process_im_message_event,
+        args=(payload,),
+        daemon=True,
+        name="lark-im-webhook",
+    ).start()
+    return _lark_feishu_webhook_ack_immediate()
 
 
 def _on_ws_p2_im_message_receive_v1(data: Any) -> None:
@@ -1315,7 +1335,7 @@ def webhook_event():
             return fast_resp
 
     if request.method == "POST":
-        logger.info(
+        logger.debug(
             "webhook POST remote=%s len=%s ct=%r",
             request.remote_addr,
             request.content_length,
@@ -1367,8 +1387,13 @@ def webhook_event():
         return jsonify({"error": "Invalid token"}), 403
 
     et = _lark_header_event_type(data)
+    et_l = (et or "").lower()
+    # Card interactions also require a fast 200; business logic should update the card asynchronously via Open API.
+    if et_l.startswith("card.action"):
+        return _lark_feishu_webhook_ack_immediate()
+
     if _lark_ack_only_event_type(et):
-        return jsonify({"success": True})
+        return _lark_feishu_webhook_ack_immediate()
 
     if et in ("im.message.receive_v1", "im.message.receive_v2"):
         logger.info(
@@ -1384,7 +1409,7 @@ def webhook_event():
         et,
         list(data.keys())[:20],
     )
-    return jsonify({"success": True})
+    return _lark_feishu_webhook_ack_immediate()
 
 
 @app.route("/grafana/ping", methods=["GET"])
