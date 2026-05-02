@@ -12,9 +12,10 @@ Optionally runs HTTP in a **background thread** (``ENABLE_HTTP=1``) for ``/healt
 
 Env::
 
-  LARK_EVENT_MODE=ws|http     # default ws
+  LARK_EVENT_MODE=ws|http     # default ws; http = Feishu POST /webhook/event only (no WebSocket)
   ENABLE_HTTP=0|1           # default 1 when mode=ws (sidecar); ignored when mode=http
   PORT=5002
+  LARK_WEBHOOK_PUBLIC_URL=    # optional; http mode logs this as the Feishu Request URL hint
   LARK_WS_LOG_LEVEL=INFO    # DEBUG|INFO|WARNING|ERROR for SDK WS logs
   LARK_WS_USE_HTTP_KEYS=0   # 1=把 LARK_ENCRYPT_KEY/VERIFICATION_TOKEN 传给 WS handler（一般勿开；长连接文档要求空）
   LARK_WS_EXTRA_IM_TYPES=   # 逗号分隔的额外 event_type（如控制台实际推送非标准名）；与 receive_v1 同形时挂 customized handler
@@ -67,6 +68,14 @@ def main() -> None:
 
     if mode == "http":
         logger.info("LARK_EVENT_MODE=http — Feishu events via POST /webhook/event only")
+        hint = (os.getenv("LARK_WEBHOOK_PUBLIC_URL") or "").strip()
+        if hint:
+            logger.info("Feishu developer console → 事件与回调 → Request URL (示例配置): %s", hint)
+        else:
+            logger.info(
+                "Set LARK_WEBHOOK_PUBLIC_URL in .env to log your Feishu Request URL hint "
+                "(e.g. http://47.84.112.211:5002/webhook/event)."
+            )
         run_http()
         return
 
