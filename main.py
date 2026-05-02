@@ -52,6 +52,9 @@ _lark_open_api_domain_override: Optional[str] = None
 _lark_ws_transport_log_installed: bool = False
 _lark_ws_recv_method_log_installed: bool = False
 _lark_ws_saw_data_frame: bool = False
+# First N inbound protobuf frames logged at INFO (CONTROL vs DATA) without setting LARK_WS_LOG_FRAME_METHOD.
+_LARK_WS_BOOTSTRAP_FRAMES_DEFAULT = 16
+_lark_ws_bootstrap_frames_left: int = 0
 
 GRAFANA_BASE_URL = os.getenv("GRAFANA_BASE_URL", "https://grafana.client8.me").rstrip("/")
 GRAFANA_DASHBOARD_PATH = os.getenv(
@@ -986,16 +989,31 @@ def _lark_ws_patch_dispatcher_inbound_log(handler: Any) -> None:
     handler.do_without_validation = _wrapped  # type: ignore[method-assign]
 
 
+def _lark_ws_reset_bootstrap_frame_budget() -> int:
+    """How many inbound WS protobuf frames to log at INFO on this connection (0 = off)."""
+    global _lark_ws_bootstrap_frames_left
+    raw = (os.getenv("LARK_WS_BOOTSTRAP_FRAMES") or str(_LARK_WS_BOOTSTRAP_FRAMES_DEFAULT)).strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = _LARK_WS_BOOTSTRAP_FRAMES_DEFAULT
+    _lark_ws_bootstrap_frames_left = max(0, min(n, 500))
+    return _lark_ws_bootstrap_frames_left
+
+
 def _lark_ws_install_recv_frame_method_log(client_cls: Any) -> None:
     """
-    When ``LARK_WS_LOG_FRAME_METHOD=1``, log every inbound protobuf ``Frame.method`` (CONTROL vs DATA).
-    Lark SDK uses CONTROL for ping/pong/config; DATA carries events. If you see CONTROL ~every 120s but never DATA
-    after @mentioning the bot, the socket is fine — Feishu is not pushing message events to this app connection.
+    Always patch inbound ``Frame.method`` logging:
+
+    - By default, first ``LARK_WS_BOOTSTRAP_FRAMES`` frames at INFO (CONTROL vs DATA).
+    - Set ``LARK_WS_LOG_FRAME_METHOD=1`` to log **every** frame.
+
+    DATA frames carry Feishu business payloads (often IM events). CONTROL is ping/config.
+    If you only ever see CONTROL after @mentioning the bot, Feishu is not pushing IM events to this connection
+    (subscription, scopes, duplicate WS consumer, etc.).
     """
     global _lark_ws_recv_method_log_installed
     if _lark_ws_recv_method_log_installed:
-        return
-    if os.getenv("LARK_WS_LOG_FRAME_METHOD", "").strip().lower() not in ("1", "true", "yes", "on"):
         return
     from lark_oapi.ws.enum import FrameType
     from lark_oapi.ws.pb.pbbp2_pb2 import Frame as LarkWsPbFrame
@@ -1003,23 +1021,27 @@ def _lark_ws_install_recv_frame_method_log(client_cls: Any) -> None:
     _orig = client_cls._handle_message
 
     async def _wrapped_handle_message(self: Any, msg: bytes) -> None:
-        try:
-            pb = LarkWsPbFrame()
-            pb.ParseFromString(msg)
-            ft = FrameType(pb.method)
-            logger.info(
-                "Lark WS recv frame.method=%s value=%s bytes=%s",
-                getattr(ft, "name", str(ft)),
-                int(ft),
-                len(msg),
-            )
-        except Exception as ex:
-            logger.warning("Lark WS recv frame log failed: %s", ex)
+        global _lark_ws_bootstrap_frames_left
+        full = os.getenv("LARK_WS_LOG_FRAME_METHOD", "").strip().lower() in ("1", "true", "yes", "on")
+        want_log = full or (_lark_ws_bootstrap_frames_left > 0)
+        if want_log and not full:
+            _lark_ws_bootstrap_frames_left -= 1
+        if want_log:
+            try:
+                pb = LarkWsPbFrame()
+                pb.ParseFromString(msg)
+                ft = FrameType(pb.method)
+                logger.info(
+                    "Lark WS recv frame.method=%s bytes=%s (DATA=push payload; CONTROL=heartbeat/config)",
+                    getattr(ft, "name", str(ft)),
+                    len(msg),
+                )
+            except Exception as ex:
+                logger.warning("Lark WS recv frame parse failed: %s bytes=%s", ex, len(msg))
         return await _orig(self, msg)
 
     client_cls._handle_message = _wrapped_handle_message  # type: ignore[method-assign]
     _lark_ws_recv_method_log_installed = True
-    logger.info("Lark WS LARK_WS_LOG_FRAME_METHOD=1 — logging inbound protobuf frame types (CONTROL/DATA)")
 
 
 def _lark_ws_install_transport_frame_log(client_cls: Any) -> None:
@@ -1071,7 +1093,8 @@ def _lark_ws_start_no_data_watchdog() -> None:
             "① 开发者后台「事件与回调」→ 订阅方式必须是「使用长连接接收事件」且保存成功（保存时本服务须已连接）；"
             "② 勿同时选「将回调发送至开发者服务器」；③ 已订阅「消息与群组」→「接收消息」；"
             "④ 机器人已在目标群且具备 @ 机器人相关权限；⑤ 同 APP_ID 仅一条 WS（关其它环境/旧进程）；"
-            "⑥ 可设 LARK_WS_SDK_DEBUG=1 看 Lark SDK 原始日志；⑦ 设 LARK_WS_LOG_FRAME_METHOD=1：若仅有 CONTROL、无 DATA，说明链路通但事件未订阅到位。"
+            "⑥ 可设 LARK_WS_SDK_DEBUG=1 看 Lark SDK 原始日志；⑦ 默认会打前若干帧 frame.method：若始终无 DATA、仅有 CONTROL，"
+            "说明链路通但飞书未往本连接推事件（订阅/权限/多实例）。⑧ 长连接模式下 IM 事件不会走 HTTP POST /webhook/event。"
         )
 
     threading.Thread(target=_watch, name="lark-ws-watchdog", daemon=True).start()
@@ -1104,8 +1127,19 @@ def start_lark_ws_client_blocking() -> None:
 
     global _lark_ws_saw_data_frame
     _lark_ws_saw_data_frame = False
+    _n_boot = _lark_ws_reset_bootstrap_frame_budget()
     _lark_ws_install_transport_frame_log(LarkWsClient)
     _lark_ws_install_recv_frame_method_log(LarkWsClient)
+    if _n_boot:
+        logger.info(
+            "Lark WS bootstrap: will log first %s inbound protobuf frames at INFO "
+            "(CONTROL vs DATA). Long-connection IM events do **not** produce HTTP POST /webhook/event.",
+            _n_boot,
+        )
+    logger.info(
+        "Reminder: with LARK_EVENT_MODE=ws, Feishu delivers IM events only on the WebSocket — "
+        "expect journal lines like 'Lark WS recv frame.method=DATA' / 'Lark WS DATA frame', not POST /webhook/event."
+    )
     if os.getenv("LARK_WS_TRANSPORT_LOG", "1").strip().lower() not in ("0", "false", "no", "off"):
         _lark_ws_start_no_data_watchdog()
 
@@ -1170,7 +1204,8 @@ def start_lark_ws_client_blocking() -> None:
             auto_reconnect=True,
         )
         logger.info(
-            "Lark WebSocket client starting (domain=%s); 订阅 im.message.receive_v1 / v2（CustomizedEvent）",
+            "Lark WebSocket client starting (domain=%s); WS handlers: "
+            "p2 im.message.receive_v1 (typed SDK) + p2 im.message.receive_v2 (customized)",
             dnorm,
         )
         try:

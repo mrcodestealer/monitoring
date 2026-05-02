@@ -3,8 +3,10 @@
 Start the monitoring bot.
 
 **Default (``LARK_EVENT_MODE=ws``)** — Feishu/Lark **long connection** (official ``lark_oapi.ws.Client``):
-no public Request URL, no ~3s HTTP URL verification. Optionally runs HTTP in a **background thread**
-(``ENABLE_HTTP=1``) for ``/health``, ``/grafana/ping``, ``/webhook/event`` (legacy).
+no public Request URL, no ~3s HTTP URL verification. IM events arrive **only on WebSocket DATA frames** —
+journalctl will **not** show ``POST /webhook/event`` for chat messages (that path is HTTP mode only).
+Optionally runs HTTP in a **background thread** (``ENABLE_HTTP=1``) for ``/health``, ``/grafana/ping``,
+``/webhook/event`` (legacy / manual tests).
 
 **HTTP-only (``LARK_EVENT_MODE=http``)** — same as before: only Flask/Waitress on ``PORT`` (default 5002).
 
@@ -16,7 +18,9 @@ Env::
   LARK_WS_LOG_LEVEL=INFO    # DEBUG|INFO|WARNING|ERROR for SDK WS logs
   LARK_WS_USE_HTTP_KEYS=0   # 1=把 LARK_ENCRYPT_KEY/VERIFICATION_TOKEN 传给 WS handler（一般勿开；长连接文档要求空）
   LARK_WS_EXTRA_IM_TYPES=   # 逗号分隔的额外 event_type（如控制台实际推送非标准名）；与 receive_v1 同形时挂 customized handler
-  LARK_WS_TRANSPORT_LOG=1   # 0=关闭；默认 1 在每条 WS DATA 帧打 header.type（event/card）与长度，便于判断是否收到推送
+  LARK_WS_TRANSPORT_LOG=1   # 0=关闭；默认 1 在每条 WS DATA 帧打 header.type（event/card）与长度
+  LARK_WS_BOOTSTRAP_FRAMES=16  # 启动后前 N 条下行 protobuf 帧打 INFO（CONTROL/DATA）；0=关闭
+  LARK_WS_LOG_FRAME_METHOD=0   # 1=每条帧都打 INFO（比 bootstrap 更啰嗦）
   LARK_WS_SDK_DEBUG=0       # 1=Lark SDK 内部 DEBUG（含 payload 片段）
 
 Usage::
