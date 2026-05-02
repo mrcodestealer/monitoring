@@ -426,6 +426,35 @@ def _lark_ack_only_event_type(het: str) -> bool:
     return False
 
 
+def _fast_plaintext_url_verification_response(raw_in: Dict[str, Any]) -> Optional[Any]:
+    """
+    Return Flask response for URL verification **before** decrypt/normalize pipeline.
+    Cuts work on the hot path so Feishu is less likely to see a ~3s timeout (network + app budget).
+    """
+    if "encrypt" in raw_in:
+        return None
+    work = dict(raw_in)
+    _lark_coerce_event_dict(work)
+    if work.get("type") == "url_verification":
+        ch0 = work.get("challenge", "")
+        return jsonify({"challenge": str(ch0) if ch0 is not None else ""})
+    uv = _extract_url_verification(work)
+    if not uv:
+        return None
+    token_from_event, challenge = uv
+    if VERIFICATION_TOKEN:
+        effective_tok = _lark_extract_verification_token(work) or str(token_from_event or "").strip()
+        if effective_tok != VERIFICATION_TOKEN:
+            logger.warning(
+                "url_verification token mismatch (fast path) exp_len=%s got_len=%s",
+                len(VERIFICATION_TOKEN),
+                len(effective_tok or ""),
+            )
+            return jsonify({"error": "invalid verification token"}), 403
+    logger.info("url_verification OK (fast path), challenge len=%s", len(str(challenge)))
+    return jsonify({"challenge": str(challenge)})
+
+
 def _walk_panels(panels: Optional[List[Dict[str, Any]]]) -> Generator[Dict[str, Any], None, None]:
     for p in panels or []:
         yield p
@@ -741,6 +770,7 @@ def webhook_event():
                     "发消息依赖 lark-oapi：pip install -U lark-oapi；GET 本 URL 可查看 lark_oapi_version。",
                     "lark_oapi_installed=false 只影响发消息，不影响「请求 URL 校验」；校验失败多半是 VERIFICATION_TOKEN 与后台不一致。",
                     "若用 systemd：进程里可能没有 .env — 请在 unit 里 EnvironmentFile=/path/to/.env 或 Environment=VERIFICATION_TOKEN=… 后 systemctl daemon-reload && restart。",
+                    "若飞书提示 3s 超时：云厂商安全组/防火墙须放行公网入站 TCP 5002；本机 curl -m 5 -X POST http://IP:5002/webhook/event -H Content-Type:application/json -d '{...}' 测连通。",
                 ],
             }
         )
@@ -748,6 +778,11 @@ def webhook_event():
     raw_in = _lark_safe_parse_json_body(request)
     if raw_in is None:
         return jsonify({"error": "invalid json"}), 400
+
+    if isinstance(raw_in, dict):
+        fast_resp = _fast_plaintext_url_verification_response(raw_in)
+        if fast_resp is not None:
+            return fast_resp
 
     data = _feishu_maybe_decrypt_webhook_payload(raw_in)
     data = _lark_normalize_webhook(data if isinstance(data, dict) else {})
@@ -844,4 +879,10 @@ def metrics_request_total_1m():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5002"))
-    app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG") == "1")
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=os.getenv("FLASK_DEBUG") == "1",
+        threaded=True,
+        use_reloader=False,
+    )
