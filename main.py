@@ -4,6 +4,7 @@ Lark webhook + Grafana session login (credentials from .env).
 Run: ``python connect.py`` (recommended) or ``python main.py`` → 0.0.0.0:5002, POST /webhook/event
 Public URL example: http://47.84.112.211:5002/webhook/event
 群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要。
+飞书发消息使用官方 SDK：``pip install -U lark-oapi``（见 requirements.txt）。
 """
 
 import base64
@@ -30,6 +31,8 @@ app = Flask(__name__)
 # Lark duplicate pushes (same message_id) — align with Chatbox processed_messages pattern.
 _processed_lark_message_ids: set = set()
 _PROCESSED_LARK_IDS_CAP = 4000
+_lark_oapi_client: Optional[Any] = None
+_lark_oapi_client_lock = threading.Lock()
 
 GRAFANA_BASE_URL = os.getenv("GRAFANA_BASE_URL", "https://grafana.client8.me").rstrip("/")
 GRAFANA_DASHBOARD_PATH = os.getenv(
@@ -490,41 +493,53 @@ def fetch_request_total_1m_series() -> Dict[str, Any]:
     }
 
 
-def _lark_tenant_access_token() -> str:
+def _get_lark_oapi_client() -> Any:
+    """Singleton Feishu/Lark OpenAPI client (``lark-oapi``); token refresh handled by SDK."""
+    global _lark_oapi_client
     if not APP_ID or not APP_SECRET:
         raise ValueError("APP_ID and APP_SECRET required for Lark reply")
-    url = f"{LARK_HOST}/open-apis/auth/v3/tenant_access_token/internal"
-    r = requests.post(url, json={"app_id": APP_ID, "app_secret": APP_SECRET}, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-    if j.get("code") != 0:
-        raise RuntimeError(f"Lark token: {j}")
-    return str(j["tenant_access_token"])
+    try:
+        from lark_oapi import Client
+    except ImportError as e:
+        raise ImportError(
+            "Install the Feishu/Lark Python SDK: pip install -U lark-oapi"
+        ) from e
+    with _lark_oapi_client_lock:
+        if _lark_oapi_client is None:
+            _lark_oapi_client = (
+                Client.builder()
+                .app_id(str(APP_ID).strip())
+                .app_secret(str(APP_SECRET).strip())
+                .domain(LARK_HOST.rstrip("/"))
+                .timeout(120.0)
+                .build()
+            )
+    return _lark_oapi_client
 
 
 def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
-    token = _lark_tenant_access_token()
-    url = f"{LARK_HOST}/open-apis/im/v1/messages"
-    params = {"receive_id_type": receive_id_type}
-    body = {
-        "receive_id": receive_id,
-        "msg_type": "text",
-        "content": json.dumps({"text": text}),
-    }
-    r = requests.post(
-        url,
-        params=params,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8",
-        },
-        json=body,
-        timeout=30,
+    from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
+    from lark_oapi.api.im.v1.model.create_message_request_body import CreateMessageRequestBody
+
+    client = _get_lark_oapi_client()
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(receive_id)
+        .msg_type("text")
+        .content(json.dumps({"text": text}))
+        .build()
     )
-    r.raise_for_status()
-    j = r.json()
-    if j.get("code") != 0:
-        raise RuntimeError(f"Lark send failed: {j} (HTTP {r.status_code})")
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type(receive_id_type)
+        .request_body(body)
+        .build()
+    )
+    resp = client.im.v1.message.create(req)
+    if not resp.success():
+        raise RuntimeError(
+            f"Lark send failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
+        )
 
 
 def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
@@ -666,11 +681,20 @@ def webhook_event():
     if request.method == "GET":
         # No secrets — use to confirm env + URL reachability from browser/curl.
         app_id = (APP_ID or "").strip()
+        lark_sdk_version: Optional[str] = None
+        try:
+            from lark_oapi.core.const import VERSION as _lark_oapi_pkg_version  # type: ignore
+
+            lark_sdk_version = str(_lark_oapi_pkg_version)
+        except ImportError:
+            lark_sdk_version = None
         return jsonify(
             {
                 "ok": True,
                 "hint": "Feishu must POST JSON to this path for events.",
                 "lark_host": LARK_HOST,
+                "lark_oapi_installed": lark_sdk_version is not None,
+                "lark_oapi_version": lark_sdk_version,
                 "app_id_prefix": (app_id[:12] + "…") if len(app_id) > 12 else app_id,
                 "verification_token_configured": bool(VERIFICATION_TOKEN),
                 "app_secret_configured": bool(APP_SECRET),
@@ -684,6 +708,7 @@ def webhook_event():
                     "机器人需能力「机器人」+ 权限「以应用身份发消息」等，且机器人在目标群内。",
                     "发 /monitoring 后看日志：handling im.message / monitoring background job / monitoring reply sent (background)。",
                     "飞书约 3s 超时：请用 python connect.py 启动；webhook 先 200，Grafana 在后台线程执行。",
+                    "发消息依赖 lark-oapi：pip install -U lark-oapi；GET 本 URL 可查看 lark_oapi_version。",
                 ],
             }
         )
