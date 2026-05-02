@@ -8,7 +8,10 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 
 **默认 ``LARK_EVENT_MODE=ws``** — 长连接；可选 ``ENABLE_HTTP=1`` 并行 HTTP。
 
-**``LARK_EVENT_MODE=http``** — 仅 Waitress 监听 ``PORT``，事件走 ``POST /webhook/event``。
+**``LARK_EVENT_MODE=http``** — 监听 ``PORT``（本仓库默认 **5002**，与同机运行的 ``Chatbox/main.py``（常用 **5000**）错开端口），事件走 ``POST /webhook/event``。
+默认 HTTP 栈为 **Flask ``threaded=True``**（实现方式对齐 Chatbox）；生产可设 ``HTTP_SERVER=waitress``。
+
+端口解析顺序：**环境变量 ``PORT`` → ``LARKBOT_PORT`` → ``_CFG["PORT"]``**（与 Chatbox 的 ``PORT``/``LARKBOT_PORT`` 习惯一致）。
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
@@ -36,6 +39,7 @@ from flask import Flask, Response, g, jsonify, request
 # ---------------------------------------------------------------------------
 _CFG: Dict[str, Any] = {
     "PORT": 5002,
+    "HTTP_SERVER": "flask",
     "LARK_EVENT_MODE": "http",
     "ENABLE_HTTP": "1",
     "WAITRESS_THREADS": 24,
@@ -92,6 +96,35 @@ def _cfg_int(key: str, default: int) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def _cfg_listen_port(default: int = 5002) -> int:
+    """
+    Same order as ``Chatbox/main.py``: ``PORT`` or ``LARKBOT_PORT`` in env (skip blanks),
+    then ``_CFG["PORT"]`` / ``_CFG["LARKBOT_PORT"]``, then ``default`` (default **5002** here vs Chatbox **5000**).
+    """
+    for raw in (os.environ.get("PORT"), os.environ.get("LARKBOT_PORT")):
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            return int(s)
+        except ValueError:
+            continue
+    for key in ("PORT", "LARKBOT_PORT"):
+        v = _CFG.get(key)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        try:
+            return int(s)
+        except ValueError:
+            continue
+    return default
 
 
 # ``lark_oapi`` → ``ws/pb/google/__init__.py`` uses ``pkg_resources.declare_namespace`` (no upstream fix yet).
@@ -1461,6 +1494,7 @@ def webhook_event():
 
     if request.method == "GET":
         # No secrets — use to confirm env + URL reachability from browser/curl.
+        _listen_port = _cfg_listen_port(5002)
         app_id = (APP_ID or "").strip()
         lark_sdk_version: Optional[str] = None
         try:
@@ -1479,7 +1513,7 @@ def webhook_event():
                 ),
                 "url_protocol_tip": (
                     "Lark 请求 URL 校验走 POST。若控制台填了 https:// 而本服务只监听 http://（无 TLS），"
-                    "客户端会一直握手直到约 3s 超时 — 请改为 http://IP:5002/webhook/event，或在前面加 Nginx/证书。"
+                    f"客户端会一直握手直到约 3s 超时 — 请改为 http://IP:{_listen_port}/webhook/event，或在前面加 Nginx/证书。"
                 ),
                 "lark_host": LARK_HOST,
                 "lark_oapi_installed": lark_sdk_version is not None,
@@ -1491,7 +1525,7 @@ def webhook_event():
                 "grafana_user_configured": bool(GRAFANA_USER),
                 "feishu_url_verify_local_test_cn": (
                     "勿只 POST {\"challenge\":\"...\"}：不会被识别为 URL 校验，会走事件 token 校验 → 403 Invalid token（属正常）。"
-                    "正确测本机延迟请用 legacy 体：{\"type\":\"url_verification\",\"token\":\"与 .env 中 VERIFICATION_TOKEN 一致\",\"challenge\":\"ping\"}，"
+                    "正确测本机延迟请用 legacy 体：{\"type\":\"url_verification\",\"token\":\"与 _CFG 中 VERIFICATION_TOKEN 一致\",\"challenge\":\"ping\"}，"
                     "应返回 HTTP 200 且 JSON 内含 challenge。"
                 ),
                 "feishu_url_verify_local_test_en": (
@@ -1522,8 +1556,8 @@ def webhook_event():
                     "飞书约 3s 超时：请用 python main.py 启动；webhook 先 200，Grafana 在后台线程执行。",
                     "发消息依赖 lark-oapi：pip install -U lark-oapi；GET 本 URL 可查看 lark_oapi_version。",
                     "lark_oapi_installed=false 只影响发消息，不影响「请求 URL 校验」；校验失败多半是 VERIFICATION_TOKEN 与后台不一致。",
-                    "若用 systemd：进程里可能没有 .env — 请在 unit 里 EnvironmentFile=/path/to/.env 或 Environment=VERIFICATION_TOKEN=… 后 systemctl daemon-reload && restart。",
-                    "若飞书提示 3s 超时：云厂商安全组/防火墙须放行公网入站 TCP 5002；本机 curl -m 5 -X POST http://IP:5002/webhook/event -H Content-Type:application/json -d '{...}' 测连通。",
+                    "若用 systemd：可在 unit 里 Environment=VERIFICATION_TOKEN=… / Environment=PORT=5002（与同机 Chatbox 的 5000 区分），或 EnvironmentFile=-/path/to/.env；修改后 daemon-reload && restart。",
+                    f"若飞书提示 3s 超时：云厂商安全组/防火墙须放行公网入站 TCP {_listen_port}；本机 curl -m 5 -X POST http://IP:{_listen_port}/webhook/event -H Content-Type:application/json -d '{{...}}' 测连通。",
                     "仍超时：核对控制台 URL 与监听一致（http/https）；排查时设 LARK_WEBHOOK_WSGI_LOG=1 再看 journal。",
                     "curl 勿只发 {\"challenge\":\"ping\"}→403 正常；应用 {\"type\":\"url_verification\",\"token\":\"…\",\"challenge\":\"ping\"} 测 POST 延迟。",
                     "本机 200 仍超时：外网 curl POST url_verification；设 LARK_WEBHOOK_TIMING_LOG=1 看 elapsed_ms；或改用 ws 模式。",
@@ -1647,11 +1681,21 @@ def run_monitoring_bot() -> None:
     Process entrypoint: HTTP-only, WebSocket-only, or WS + HTTP sidecar (see module docstring).
     Uses :data:`app`, :data:`logger`, :func:`start_lark_ws_client_blocking` from this module.
     """
-    port = _cfg_int("PORT", 5002)
+    port = _cfg_listen_port(5002)
     raw_mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower()
     mode = raw_mode if raw_mode else "ws"
 
     def run_http() -> None:
+        stack = _cfg_str("HTTP_SERVER", "flask").strip().lower()
+        use_waitress = stack in ("waitress", "wsgi")
+        if not use_waitress:
+            logger.info(
+                "HTTP (Flask threaded=True, Chatbox/main.py style) on 0.0.0.0:%s — "
+                "/health /grafana/ping /webhook/event (set HTTP_SERVER=waitress for Waitress)",
+                port,
+            )
+            app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False, debug=False)
+            return
         try:
             from waitress import serve
 
@@ -1668,8 +1712,8 @@ def run_monitoring_bot() -> None:
             )
             serve(app, host="0.0.0.0", port=port, threads=threads, channel_timeout=120)
         except ImportError:
-            logger.warning("waitress not installed — pip install waitress; using Flask dev server")
-            app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+            logger.warning("waitress not installed — pip install waitress; falling back to Flask threaded server")
+            app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False, debug=False)
 
     if mode == "http":
         logger.info("LARK_EVENT_MODE=http — Feishu events via POST /webhook/event only")
@@ -1679,7 +1723,8 @@ def run_monitoring_bot() -> None:
             if hint.lower().startswith("https://"):
                 logger.error(
                     "LARK_WEBHOOK_PUBLIC_URL / 控制台若使用 https:// 而本进程仅 plain HTTP，飞书会 TLS 握手失败或卡住≈3s。"
-                    "请改为 http://…:5002/webhook/event，或在前面加 Nginx/证书终止 TLS。"
+                    "请改为 http://…:%s/webhook/event，或在前面加 Nginx/证书终止 TLS。",
+                    port,
                 )
             if hint.rstrip("/").endswith("/webhook/event/"):
                 logger.warning(
@@ -1687,8 +1732,9 @@ def run_monitoring_bot() -> None:
                 )
         else:
             logger.info(
-                "Set LARK_WEBHOOK_PUBLIC_URL in .env to log your Feishu Request URL hint "
-                "(e.g. http://YOUR_IP:5002/webhook/event)."
+                "Set LARK_WEBHOOK_PUBLIC_URL in _CFG to log your Feishu Request URL hint "
+                "(e.g. http://YOUR_IP:%s/webhook/event).",
+                port,
             )
         logger.warning(
             "飞书 HTTP「请求网址校验」文档常写 **约 1 秒内** 返回 challenge（含网络往返）；推送事件常见 **约 3 秒**。"
