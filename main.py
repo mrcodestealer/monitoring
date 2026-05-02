@@ -26,6 +26,8 @@ Env::
   LARK_WS_BOOTSTRAP_FRAMES=16
   LARK_WS_LOG_FRAME_METHOD=0
   LARK_WS_SDK_DEBUG=0
+  LARK_WEBHOOK_WSGI_LOG=0    # 1=WSGI 层 /webhook 诊断日志（默认关，避免 journald 拖慢校验）
+  LARK_WEBHOOK_TIMING_LOG=0   # 1=POST /webhook/event 耗时日志（默认关）
 
 飞书后台「事件与回调」→ 长连接或 HTTP；订阅「接收消息」；``APP_ID`` / ``APP_SECRET`` 必填。
 默认 ``LARK_HOST=https://open.feishu.cn``；国际 Lark ``https://open.larksuite.com``。
@@ -65,18 +67,28 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def _lark_env_truthy(key: str) -> bool:
+    return os.getenv(key, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 app = Flask(__name__)
 
 
 class _WsgiWebhookDiagMiddleware:
-    """Log at WSGI boundary when Feishu hits /webhook — if this never appears, TCP never reached Waitress."""
+    """
+    Optional WSGI logging — **default off**: sync writes to journald on every webhook can add latency.
+    Feishu URL verification is often quoted as **~1s total budget** (RTT + handler); enable only when debugging::
+
+      LARK_WEBHOOK_WSGI_LOG=1
+    """
 
     def __init__(self, flask_app: Any):
         self.flask_app = flask_app
 
     def __call__(self, environ: Any, start_response: Any):
         path = environ.get("PATH_INFO") or ""
-        if path.rstrip("/") == "/webhook/event":
+        if path.rstrip("/") == "/webhook/event" and _lark_env_truthy("LARK_WEBHOOK_WSGI_LOG"):
             logger.info(
                 "WSGI enter %s %s content_length=%s expect=%r remote=%s",
                 environ.get("REQUEST_METHOD"),
@@ -97,35 +109,44 @@ def _request_is_webhook_event() -> bool:
 
 @app.before_request
 def _lark_webhook_request_timer_start():
-    if _request_is_webhook_event() and request.method == "POST":
+    if (
+        _request_is_webhook_event()
+        and request.method == "POST"
+        and _lark_env_truthy("LARK_WEBHOOK_TIMING_LOG")
+    ):
         g._lark_wh_t0 = time.perf_counter()
 
 
 @app.after_request
 def _lark_webhook_request_timer_end(response: Response):
-    """Measure app-side handling time. Feishu ~3s timeout includes RTT + TLS + body upload — not shown here."""
-    if _request_is_webhook_event() and request.method == "POST":
-        t0 = getattr(g, "_lark_wh_t0", None)
-        if t0 is not None:
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-            remote = xff or (request.remote_addr or "")
-            ua = (request.headers.get("User-Agent") or "")[:160]
-            if elapsed_ms > 1000:
-                logger.warning(
-                    "webhook/event POST slow elapsed_ms=%.1f status=%s remote=%s ua=%r",
-                    elapsed_ms,
-                    response.status_code,
-                    remote,
-                    ua,
-                )
-            else:
-                logger.info(
-                    "webhook/event POST elapsed_ms=%.1f status=%s remote=%s",
-                    elapsed_ms,
-                    response.status_code,
-                    remote,
-                )
+    """Optional timing log — ``LARK_WEBHOOK_TIMING_LOG=1``. Default off to avoid journald latency on hot path."""
+    if not (
+        _request_is_webhook_event()
+        and request.method == "POST"
+        and _lark_env_truthy("LARK_WEBHOOK_TIMING_LOG")
+    ):
+        return response
+    t0 = getattr(g, "_lark_wh_t0", None)
+    if t0 is not None:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        remote = xff or (request.remote_addr or "")
+        ua = (request.headers.get("User-Agent") or "")[:160]
+        if elapsed_ms > 1000:
+            logger.warning(
+                "webhook/event POST slow elapsed_ms=%.1f status=%s remote=%s ua=%r",
+                elapsed_ms,
+                response.status_code,
+                remote,
+                ua,
+            )
+        else:
+            logger.info(
+                "webhook/event POST elapsed_ms=%.1f status=%s remote=%s",
+                elapsed_ms,
+                response.status_code,
+                remote,
+            )
     return response
 
 
@@ -1456,10 +1477,11 @@ def webhook_event():
                     "lark_oapi_installed=false 只影响发消息，不影响「请求 URL 校验」；校验失败多半是 VERIFICATION_TOKEN 与后台不一致。",
                     "若用 systemd：进程里可能没有 .env — 请在 unit 里 EnvironmentFile=/path/to/.env 或 Environment=VERIFICATION_TOKEN=… 后 systemctl daemon-reload && restart。",
                     "若飞书提示 3s 超时：云厂商安全组/防火墙须放行公网入站 TCP 5002；本机 curl -m 5 -X POST http://IP:5002/webhook/event -H Content-Type:application/json -d '{...}' 测连通。",
-                    "仍超时：核对飞书里填的 URL 是 http 还是 https，须与监听一致；点校验时 journalctl -u monitoringbot -f 看是否出现 POST /webhook/event。",
+                    "仍超时：核对控制台 URL 与监听一致（http/https）；排查时设 LARK_WEBHOOK_WSGI_LOG=1 再看 journal。",
                     "curl 勿只发 {\"challenge\":\"ping\"}→403 正常；应用 {\"type\":\"url_verification\",\"token\":\"…\",\"challenge\":\"ping\"} 测 POST 延迟。",
-                    "本机 200 仍报飞书 3s：用外网 curl 公网 URL；看 journal 有无 webhook/event POST elapsed_ms（没有则请求没到）。",
-                    "点飞书校验时应有 WSGI enter POST ... /webhook/event — 若无则请求未到本进程（https/console URL 错误/安全组）。",
+                    "本机 200 仍超时：外网 curl POST url_verification；设 LARK_WEBHOOK_TIMING_LOG=1 看 elapsed_ms；或改用 ws 模式。",
+                    "URL 校验文档常见「约 1s」总预算（含 RTT）：默认关闭 webhook 热路径 INFO 日志；排查时再设 LARK_WEBHOOK_WSGI_LOG=1 / LARK_WEBHOOK_TIMING_LOG=1。",
+                    "HTTP 校验仍失败可改 LARK_EVENT_MODE=ws 用长连接，免 Request URL。",
                 ],
             }
         )
@@ -1622,8 +1644,9 @@ def run_monitoring_bot() -> None:
                 "(e.g. http://YOUR_IP:5002/webhook/event)."
             )
         logger.warning(
-            "若本机 curl 很快 200 但飞书仍 ~3s 超时：多为公网/TLS/安全组链路问题。"
-            "请从外网主机 curl 同一 Request URL，并在点击校验时看日志是否出现 webhook/event POST elapsed_ms=…。"
+            "飞书 HTTP「请求网址校验」文档常写 **约 1 秒内** 返回 challenge（含网络往返）；推送事件常见 **约 3 秒**。"
+            "webhook 热路径默认 **不写** WSGI/耗时 INFO，避免 journald 延迟；若仍超时，先试 ``LARK_EVENT_MODE=ws`` 长连接免 URL 校验，"
+            "或在前面加 Nginx+HTTPS；排查时再设 LARK_WEBHOOK_WSGI_LOG=1。"
         )
         run_http()
         return
