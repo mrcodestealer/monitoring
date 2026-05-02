@@ -39,6 +39,8 @@ _processed_lark_message_ids: set = set()
 _PROCESSED_LARK_IDS_CAP = 4000
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
+# Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
+_lark_open_api_domain_override: Optional[str] = None
 
 GRAFANA_BASE_URL = os.getenv("GRAFANA_BASE_URL", "https://grafana.client8.me").rstrip("/")
 GRAFANA_DASHBOARD_PATH = os.getenv(
@@ -586,6 +588,12 @@ def fetch_request_total_1m_series() -> Dict[str, Any]:
     }
 
 
+def _lark_api_domain() -> str:
+    """Open Platform API host (tenant token + send message); align with working WS region when set."""
+    d = (_lark_open_api_domain_override or LARK_HOST or "").strip().rstrip("/")
+    return d or "https://open.feishu.cn"
+
+
 def _get_lark_oapi_client() -> Any:
     """Singleton Feishu/Lark OpenAPI client (``lark-oapi``); token refresh handled by SDK."""
     global _lark_oapi_client
@@ -603,7 +611,7 @@ def _get_lark_oapi_client() -> Any:
                 Client.builder()
                 .app_id(str(APP_ID).strip())
                 .app_secret(str(APP_SECRET).strip())
-                .domain(LARK_HOST.rstrip("/"))
+                .domain(_lark_api_domain())
                 .timeout(120.0)
                 .build()
             )
@@ -919,6 +927,19 @@ def _on_ws_p2_im_message_receive_v2(ce: Any) -> None:
         logger.exception("WebSocket im.message.receive_v2 handler failed")
 
 
+def _lark_ws_domain_try_order() -> List[str]:
+    """Prefer ``LARK_HOST``, then try the other public Open Platform host (fixes 1000040351)."""
+    seen: set = set()
+    out: List[str] = []
+    raw = (LARK_HOST or "").strip().rstrip("/")
+    for d in (raw, "https://open.feishu.cn", "https://open.larksuite.com"):
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
 def start_lark_ws_client_blocking() -> None:
     """
     Official long-connection mode (no public Request URL, no HTTP challenge).
@@ -942,35 +963,46 @@ def start_lark_ws_client_blocking() -> None:
     level_name = (os.getenv("LARK_WS_LOG_LEVEL") or "INFO").strip().upper()
     log_level = getattr(LogLevel, level_name, LogLevel.INFO)
 
-    cli = LarkWsClient(
-        str(APP_ID).strip(),
-        str(APP_SECRET).strip(),
-        log_level=log_level,
-        event_handler=handler,
-        domain=LARK_HOST.rstrip("/"),
-        auto_reconnect=True,
-    )
-    logger.info(
-        "Lark WebSocket client starting (domain=%s); 长连接已注册 im.message.receive_v1 + v2",
-        LARK_HOST,
-    )
-    if "larksuite.com" in LARK_HOST and "feishu.cn" not in LARK_HOST:
-        logger.warning(
-            "LARK_HOST 指向国际站；若应用为国内飞书，请在 .env 设置 LARK_HOST=https://open.feishu.cn，否则收/发消息可能异常"
+    last_domain_err: Optional[BaseException] = None
+    global _lark_open_api_domain_override, _lark_oapi_client
+    for domain in _lark_ws_domain_try_order():
+        dnorm = domain.rstrip("/")
+        with _lark_oapi_client_lock:
+            _lark_oapi_client = None
+        _lark_open_api_domain_override = dnorm
+        cli = LarkWsClient(
+            str(APP_ID).strip(),
+            str(APP_SECRET).strip(),
+            log_level=log_level,
+            event_handler=handler,
+            domain=dnorm,
+            auto_reconnect=True,
         )
-    try:
-        cli.start()
-    except Exception as e:
-        err = str(e)
-        if "1000040351" in err or "incorrect domain" in err.lower():
-            logger.error(
-                "Lark WebSocket 域名与租户不匹配 (1000040351)。当前 LARK_HOST=%r — "
-                "国内飞书请设 LARK_HOST=https://open.feishu.cn；国际 Lark 请设 "
-                "LARK_HOST=https://open.larksuite.com；改后 systemctl restart monitoringbot。SDK: %s",
-                LARK_HOST,
-                err,
-            )
-        raise
+        logger.info(
+            "Lark WebSocket client starting (domain=%s); 长连接 im.message.receive_v1 + v2",
+            dnorm,
+        )
+        try:
+            cli.start()
+        except Exception as e:
+            err = str(e)
+            if "1000040351" in err or "incorrect domain" in err.lower():
+                last_domain_err = e
+                logger.warning(
+                    "Lark WebSocket domain rejected on %r (%s) — trying alternate open-platform host if any.",
+                    domain,
+                    err,
+                )
+                continue
+            raise
+
+    if last_domain_err is not None:
+        logger.error(
+            "Lark WebSocket: every candidate domain failed with incorrect-domain (1000040351). "
+            "Set LARK_HOST explicitly to the host shown in your Feishu/Lark developer console. Last: %s",
+            last_domain_err,
+        )
+        raise last_domain_err
 
 
 @app.route("/health", methods=["GET"])
