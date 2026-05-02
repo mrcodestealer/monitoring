@@ -15,7 +15,7 @@ Env::
   PORT=5002
   LARK_WS_LOG_LEVEL=INFO    # DEBUG|INFO|WARNING|ERROR for SDK WS logs
   LARK_WS_USE_HTTP_KEYS=0   # 1=把 LARK_ENCRYPT_KEY/VERIFICATION_TOKEN 传给 WS handler（一般勿开；长连接文档要求空）
-  LARK_WS_EXTRA_IM_TYPES=   # 逗号分隔的额外 event_type，与 receive_v1 同形时挂同一 handler（见 journal 里 no handler 提示）
+  LARK_WS_EXTRA_IM_TYPES=   # 逗号分隔的额外 event_type（如控制台实际推送非标准名）；与 receive_v1 同形时挂 customized handler
   LARK_WS_TRANSPORT_LOG=1   # 0=关闭；默认 1 在每条 WS DATA 帧打 header.type（event/card）与长度，便于判断是否收到推送
   LARK_WS_SDK_DEBUG=0       # 1=Lark SDK 内部 DEBUG（含 payload 片段）
 
@@ -45,7 +45,7 @@ def main() -> None:
     raw_mode = (os.getenv("LARK_EVENT_MODE") or "ws").strip().lower()
     # ``Environment=LARK_EVENT_MODE=`` in systemd → empty string → treat as default ws.
     mode = raw_mode if raw_mode else "ws"
-    # Import after load_dotenv so main.py sees the same env as this process.
+    # Import after load_dotenv so module-level os.getenv() in main.py matches this process.
     from main import app, logger, start_lark_ws_client_blocking  # noqa: WPS433
 
     def run_http() -> None:

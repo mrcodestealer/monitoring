@@ -326,6 +326,8 @@ def _lark_extract_plain_text_from_message(msg: Dict[str, Any]) -> str:
         return ""
     raw_c = msg.get("content")
     if raw_c is None:
+        raw_c = msg.get("Content")
+    if raw_c is None:
         raw_c = msg.get("body")
     if isinstance(raw_c, dict):
         content_str = json.dumps(raw_c, ensure_ascii=False)
@@ -776,19 +778,35 @@ def _serialize_lark_user_id(uid: Any) -> Dict[str, Any]:
     return out
 
 
+def _lark_ws_sdk_event_to_dict(model: Any) -> Dict[str, Any]:
+    """
+    Normalize WebSocket handler payloads to plain dict (same shape as HTTP webhook).
+
+    Feishu docs recommend ``register_p2_im_message_receive_v1`` for long connection; that passes
+    typed SDK models. ``JSON.marshal`` converts nested objects reliably; ``CustomizedEvent`` works too.
+    """
+    from lark_oapi.core.json import JSON
+
+    if isinstance(model, dict):
+        out = dict(model)
+        _lark_coerce_event_dict(out)
+        return out if isinstance(out, dict) else {}
+    try:
+        s = JSON.marshal(model)
+        if not s:
+            return {}
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            _lark_coerce_event_dict(obj)
+            return obj
+    except Exception as e:
+        logger.warning("Lark WS SDK event JSON marshal failed: %s", e)
+    return {}
+
+
 def _lark_customized_event_to_schema2_dict(ce: Any) -> Dict[str, Any]:
-    """WebSocket ``CustomizedEvent`` / schema 2.0：``event`` 为 dict（与 HTTP webhook 体一致）。"""
-    header: Dict[str, Any] = {}
-    hdr = getattr(ce, "header", None)
-    if hdr:
-        for k in ("event_id", "token", "event_type", "tenant_key", "app_id", "create_time"):
-            v = getattr(hdr, k, None)
-            if v is not None and str(v) != "":
-                header[k] = v
-    ev = getattr(ce, "event", None)
-    if not isinstance(ev, dict):
-        ev = {}
-    return {"schema": "2.0", "header": header, "event": ev}
+    """Backward-compatible path for customized handlers; prefer :func:`_lark_ws_sdk_event_to_dict`."""
+    return _lark_ws_sdk_event_to_dict(ce)
 
 
 def _process_im_message_event(data: Dict[str, Any]) -> None:
@@ -803,6 +821,8 @@ def _process_im_message_event(data: Dict[str, Any]) -> None:
 
 
 def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
+    if isinstance(data, dict):
+        data = _lark_coerce_event_dict(data)
     event = data.get("event") if isinstance(data.get("event"), dict) else {}
     raw_msg = event.get("message")
     msg = raw_msg if isinstance(raw_msg, dict) else {}
@@ -835,6 +855,10 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         return
 
     raw_text = _lark_extract_plain_text_from_message(msg)
+    if not (raw_text or "").strip():
+        fb = _lark_dict_pick_str(event, "text_without_at_bot", "textWithoutAtBot", "text")
+        if fb:
+            raw_text = fb
     mentions_raw = msg.get("mentions") or []
     mentions = mentions_raw if isinstance(mentions_raw, list) else []
     clean = _lark_clean_command_text(raw_text, mentions)
@@ -888,14 +912,25 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     return jsonify({"success": True}), 200
 
 
+def _on_ws_p2_im_message_receive_v1(data: Any) -> None:
+    """Official WS handler for ``im.message.receive_v1`` (Feishu long-connection sample code)."""
+    try:
+        payload = _lark_ws_sdk_event_to_dict(data)
+        mid, mtype, chat = _ws_log_message_snip(payload)
+        logger.info("ws im.message.receive_v1 mid=%r mtype=%r chat=%r", mid, mtype, chat)
+        _process_im_message_event(payload)
+    except Exception:
+        logger.exception("WebSocket P2ImMessageReceiveV1 handler failed")
+
+
 def _on_ws_im_message_p2_customized(ce: Any) -> None:
     """
-    Long-connection ``im.message.receive_v1`` / ``im.message.receive_v2`` (same payload shape; 控制台「接收消息 v2.0」
-    仍常为 ``receive_v1``)。用 CustomizedEvent + 空 builder 密钥，与飞书长连接文档一致。
+    Fallback for ``im.message.receive_v2`` or extra types (``LARK_WS_EXTRA_IM_TYPES``).
+    ``receive_v1`` is handled by :func:`_on_ws_p2_im_message_receive_v1` per Feishu SDK guidance.
     """
     try:
         et = getattr(getattr(ce, "header", None), "event_type", None) or "?"
-        data = _lark_customized_event_to_schema2_dict(ce)
+        data = _lark_ws_sdk_event_to_dict(ce)
         mid, mtype, chat = _ws_log_message_snip(data)
         logger.info("ws im.message %s mid=%r mtype=%r chat=%r", et, mid, mtype, chat)
         _process_im_message_event(data)
@@ -1087,9 +1122,11 @@ def start_lark_ws_client_blocking() -> None:
         logger.info(
             "Lark WS EventDispatcherHandler.builder('', '') — HTTP 的 VERIFICATION_TOKEN/LARK_ENCRYPT_KEY 不用于长连接"
         )
-    bld = EventDispatcherHandler.builder(enc, ver).register_p2_customized_event(
-        "im.message.receive_v1", _on_ws_im_message_p2_customized
-    ).register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
+    bld = (
+        EventDispatcherHandler.builder(enc, ver)
+        .register_p2_im_message_receive_v1(_on_ws_p2_im_message_receive_v1)
+        .register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
+    )
     for raw_t in (os.getenv("LARK_WS_EXTRA_IM_TYPES") or "").replace(";", ",").split(","):
         t = raw_t.strip()
         if not t:
