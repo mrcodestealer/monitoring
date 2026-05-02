@@ -19,12 +19,20 @@ import os
 import re
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
+
+# ``lark_oapi`` → ``ws/pb/google/__init__.py`` uses ``pkg_resources.declare_namespace`` (no upstream fix yet).
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API",
+    category=UserWarning,
+)
 
 # Load project .env even when systemd cwd is / (not only when EnvironmentFile= is set).
 load_dotenv(Path(__file__).resolve().parent / ".env")
