@@ -50,6 +50,7 @@ _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
 _lark_open_api_domain_override: Optional[str] = None
 _lark_ws_transport_log_installed: bool = False
+_lark_ws_saw_data_frame: bool = False
 
 GRAFANA_BASE_URL = os.getenv("GRAFANA_BASE_URL", "https://grafana.client8.me").rstrip("/")
 GRAFANA_DASHBOARD_PATH = os.getenv(
@@ -949,34 +950,59 @@ def _lark_ws_patch_dispatcher_inbound_log(handler: Any) -> None:
     handler.do_without_validation = _wrapped  # type: ignore[method-assign]
 
 
-def _lark_ws_install_transport_frame_log_once() -> None:
+def _lark_ws_install_transport_frame_log(client_cls: Any) -> None:
     """
-    Log every DATA-frame ``header.type`` (e.g. ``event`` / ``card``). If you never see ``type=event`` when
-    chatting, the server is not receiving business callbacks on this socket (console subscription / another client).
+    Log every DATA-frame ``header.type`` (e.g. ``event`` / ``card``). Must patch the **same** ``Client`` class
+    later used by ``LarkWsClient(...)`` (import identity issues prevented logs on some deployments).
     """
-    global _lark_ws_transport_log_installed
+    global _lark_ws_transport_log_installed, _lark_ws_saw_data_frame
     if _lark_ws_transport_log_installed:
         return
     if os.getenv("LARK_WS_TRANSPORT_LOG", "1").strip().lower() in ("0", "false", "no", "off"):
+        logger.info("Lark WS transport frame logging disabled (LARK_WS_TRANSPORT_LOG=0)")
         return
-    _lark_ws_transport_log_installed = True
-    from lark_oapi.ws import client as _lark_ws_client_mod
-    from lark_oapi.ws.const import HEADER_TYPE
 
-    LarkCls = _lark_ws_client_mod.Client
-    _orig_hdf = LarkCls._handle_data_frame
+    from lark_oapi.ws.const import HEADER_TYPE
+    from lark_oapi.ws import client as _lark_ws_client_mod
+
+    _orig_hdf = client_cls._handle_data_frame
 
     async def _logged_handle_data_frame(self: Any, frame: Any) -> None:
+        global _lark_ws_saw_data_frame
         try:
             hs = frame.headers
             t = _lark_ws_client_mod._get_by_key(hs, HEADER_TYPE)
             plen = len(frame.payload or b"")
             logger.info("Lark WS DATA frame header.type=%r payload_len=%s", t, plen)
+            _lark_ws_saw_data_frame = True
         except Exception as ex:
             logger.warning("Lark WS DATA frame log failed: %s", ex)
         return await _orig_hdf(self, frame)
 
-    LarkCls._handle_data_frame = _logged_handle_data_frame  # type: ignore[method-assign]
+    client_cls._handle_data_frame = _logged_handle_data_frame  # type: ignore[method-assign]
+    _lark_ws_transport_log_installed = True
+    logger.info(
+        "Lark WS transport frame log patch applied to %s._handle_data_frame",
+        getattr(client_cls, "__name__", "Client"),
+    )
+
+
+def _lark_ws_start_no_data_watchdog() -> None:
+    """If zero DATA frames in 120s, emit ERROR (console subscription / duplicate client)."""
+
+    def _watch() -> None:
+        time.sleep(120)
+        if _lark_ws_saw_data_frame:
+            return
+        logger.error(
+            "Lark WS: 启动 120 秒内未收到任何 DATA 帧 — 飞书未往本连接推事件。请逐项核对："
+            "① 开发者后台「事件与回调」→ 订阅方式必须是「使用长连接接收事件」且保存成功（保存时本服务须已连接）；"
+            "② 勿同时选「将回调发送至开发者服务器」；③ 已订阅「消息与群组」→「接收消息」；"
+            "④ 机器人已在目标群且具备 @ 机器人相关权限；⑤ 同 APP_ID 仅一条 WS（关其它环境/旧进程）；"
+            "⑥ 可设 LARK_WS_SDK_DEBUG=1 看 Lark SDK 原始日志。"
+        )
+
+    threading.Thread(target=_watch, name="lark-ws-watchdog", daemon=True).start()
 
 
 def _lark_ws_domain_try_order() -> List[str]:
@@ -1004,6 +1030,12 @@ def start_lark_ws_client_blocking() -> None:
     from lark_oapi.core.enum import LogLevel
     from lark_oapi.ws.client import Client as LarkWsClient
 
+    global _lark_ws_saw_data_frame
+    _lark_ws_saw_data_frame = False
+    _lark_ws_install_transport_frame_log(LarkWsClient)
+    if os.getenv("LARK_WS_TRANSPORT_LOG", "1").strip().lower() not in ("0", "false", "no", "off"):
+        _lark_ws_start_no_data_watchdog()
+
     # 飞书「使用长连接接收事件」文档：builder 前两参须为 **空字符串**（勿传 HTTP 回调的 Encrypt/Verification）。
     ws_use_http_keys = os.getenv("LARK_WS_USE_HTTP_KEYS", "").strip().lower() in ("1", "true", "yes", "on")
     enc = (LARK_ENCRYPT_KEY or "") if ws_use_http_keys else ""
@@ -1030,7 +1062,6 @@ def start_lark_ws_client_blocking() -> None:
     pmap = getattr(handler, "_processorMap", None) or {}
     logger.info("Lark WS p2 processors registered: %s", sorted(pmap.keys()))
     _lark_ws_patch_dispatcher_inbound_log(handler)
-    _lark_ws_install_transport_frame_log_once()
 
     level_name = (os.getenv("LARK_WS_LOG_LEVEL") or "INFO").strip().upper()
     log_level = getattr(LogLevel, level_name, LogLevel.INFO)
