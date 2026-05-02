@@ -900,6 +900,41 @@ def _on_ws_im_message_p2_customized(ce: Any) -> None:
         logger.exception("WebSocket im.message customized handler failed")
 
 
+def _lark_ws_patch_dispatcher_inbound_log(handler: Any) -> None:
+    """
+    Wrap ``do_without_validation`` so we always see ``header.event_type`` for DATA/EVENT frames.
+    Catches ``processor not found`` and logs the missing type (SDK default log may go to another logger).
+    """
+    orig = handler.do_without_validation
+
+    def _wrapped(payload: bytes) -> Any:
+        et_log: Any = None
+        try:
+            obj = json.loads(payload.decode("utf-8"))
+            h = obj.get("header") if isinstance(obj.get("header"), dict) else {}
+            et_log = h.get("event_type")
+            if et_log and str(et_log).startswith("im."):
+                logger.info("Lark WS inbound event_type=%r", et_log)
+            elif et_log:
+                logger.debug("Lark WS inbound event_type=%r", et_log)
+        except Exception as ex:
+            logger.warning("Lark WS payload peek failed: %s first=%r", ex, payload[:72])
+        try:
+            return orig(payload)
+        except Exception as e:
+            es = str(e).lower()
+            if et_log is not None and "processor" in es and "not found" in es:
+                logger.error(
+                    "Lark WS no handler for event_type=%r — add to LARK_WS_EXTRA_IM_TYPES in .env (comma-separated) "
+                    "or upgrade lark-oapi. err=%s",
+                    et_log,
+                    e,
+                )
+            raise
+
+    handler.do_without_validation = _wrapped  # type: ignore[method-assign]
+
+
 def _lark_ws_domain_try_order() -> List[str]:
     """Prefer ``LARK_HOST``, then try the other public Open Platform host (fixes 1000040351)."""
     seen: set = set()
@@ -938,12 +973,20 @@ def start_lark_ws_client_blocking() -> None:
         logger.info(
             "Lark WS EventDispatcherHandler.builder('', '') — HTTP 的 VERIFICATION_TOKEN/LARK_ENCRYPT_KEY 不用于长连接"
         )
-    handler = (
-        EventDispatcherHandler.builder(enc, ver)
-        .register_p2_customized_event("im.message.receive_v1", _on_ws_im_message_p2_customized)
-        .register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
-        .build()
-    )
+    bld = EventDispatcherHandler.builder(enc, ver).register_p2_customized_event(
+        "im.message.receive_v1", _on_ws_im_message_p2_customized
+    ).register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
+    for raw_t in (os.getenv("LARK_WS_EXTRA_IM_TYPES") or "").replace(";", ",").split(","):
+        t = raw_t.strip()
+        if not t:
+            continue
+        logger.info("Lark WS also registering custom event_type=%r (LARK_WS_EXTRA_IM_TYPES)", t)
+        bld = bld.register_p2_customized_event(t, _on_ws_im_message_p2_customized)
+    handler = bld.build()
+    pmap = getattr(handler, "_processorMap", None) or {}
+    logger.info("Lark WS p2 processors registered: %s", sorted(pmap.keys()))
+    _lark_ws_patch_dispatcher_inbound_log(handler)
+
     level_name = (os.getenv("LARK_WS_LOG_LEVEL") or "INFO").strip().upper()
     log_level = getattr(LogLevel, level_name, LogLevel.INFO)
 

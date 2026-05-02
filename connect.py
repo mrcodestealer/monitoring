@@ -15,6 +15,7 @@ Env::
   PORT=5002
   LARK_WS_LOG_LEVEL=INFO    # DEBUG|INFO|WARNING|ERROR for SDK WS logs
   LARK_WS_USE_HTTP_KEYS=0   # 1=把 LARK_ENCRYPT_KEY/VERIFICATION_TOKEN 传给 WS handler（一般勿开；长连接文档要求空）
+  LARK_WS_EXTRA_IM_TYPES=   # 逗号分隔的额外 event_type，与 receive_v1 同形时挂同一 handler（见 journal 里 no handler 提示）
 
 Usage::
 
