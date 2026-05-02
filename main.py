@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Lark webhook + Grafana session login (credentials from .env).
-Run: python main.py  → listens on 0.0.0.0:5002, webhook: POST /webhook/event
+Run: ``python connect.py`` (recommended) or ``python main.py`` → 0.0.0.0:5002, POST /webhook/event
 Public URL example: http://47.84.112.211:5002/webhook/event
 群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要。
 """
@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
@@ -565,6 +566,45 @@ def _lark_verify_event_token(data: Dict[str, Any]) -> bool:
     return tok == VERIFICATION_TOKEN
 
 
+def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
+    """
+    Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
+    """
+    logger.info("monitoring background job start mid=%r chat=%r open=%r", mid, bool(chat_id), bool(open_id))
+    try:
+        payload = fetch_request_total_1m_series()
+        reply = _format_monitoring_reply(payload)
+    except Exception as e:
+        logger.exception("monitoring fetch failed (background)")
+        reply = f"监控数据拉取失败：{e}"
+
+    sent = False
+    try:
+        if chat_id:
+            _lark_send_text("chat_id", chat_id, reply)
+            sent = True
+            logger.info(
+                "monitoring reply sent (background) receive_id_type=chat_id chat_id_prefix=%s... len=%s",
+                chat_id[:16],
+                len(reply),
+            )
+        elif open_id:
+            _lark_send_text("open_id", open_id, reply)
+            sent = True
+            logger.info("monitoring reply sent (background) receive_id_type=open_id len=%s", len(reply))
+        else:
+            logger.warning(
+                "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
+            )
+    except Exception as e:
+        logger.exception("lark send failed (background): %s", e)
+
+    if sent and mid:
+        _processed_lark_message_ids.add(mid)
+        if len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
+            _processed_lark_message_ids.clear()
+
+
 def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     # Token already verified in webhook_event (same as Chatbox single gate).
     event = data.get("event") or {}
@@ -602,37 +642,13 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     chat_id = (msg.get("chat_id") or msg.get("open_chat_id") or "").strip()
     open_id = sender_open
 
-    try:
-        payload = fetch_request_total_1m_series()
-        reply = _format_monitoring_reply(payload)
-    except Exception as e:
-        logger.exception("monitoring fetch failed")
-        reply = f"监控数据拉取失败：{e}"
-
-    sent = False
-    try:
-        if chat_id:
-            _lark_send_text("chat_id", chat_id, reply)
-            sent = True
-            logger.info(
-                "monitoring reply sent receive_id_type=chat_id chat_id_prefix=%s... len=%s",
-                chat_id[:16],
-                len(reply),
-            )
-        elif open_id:
-            _lark_send_text("open_id", open_id, reply)
-            sent = True
-            logger.info("monitoring reply sent receive_id_type=open_id len=%s", len(reply))
-        else:
-            logger.warning("no chat_id/open_chat_id or sender open_id; cannot reply. msg keys=%s", list(msg.keys()))
-    except Exception as e:
-        logger.exception("lark send failed: %s", e)
-
-    if sent and mid:
-        _processed_lark_message_ids.add(mid)
-        if len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
-            _processed_lark_message_ids.clear()
-
+    # Lark expects HTTP 200 within ~3s; Grafana + Prometheus often exceeds that — ACK first, work in thread.
+    threading.Thread(
+        target=_monitoring_background_worker,
+        args=(chat_id, open_id, mid),
+        daemon=True,
+        name="monitoring-reply",
+    ).start()
     return jsonify({"success": True}), 200
 
 
@@ -666,7 +682,8 @@ def webhook_event():
                     "VERIFICATION_TOKEN 与后台「Verification Token」一致（无多余空格）。",
                     "国内飞书应用将 LARK_HOST 设为 https://open.feishu.cn；国际用 https://open.larksuite.com。",
                     "机器人需能力「机器人」+ 权限「以应用身份发消息」等，且机器人在目标群内。",
-                    "发 /monitoring 后看服务日志：handling im.message / monitoring reply sent / lark send failed。",
+                    "发 /monitoring 后看日志：handling im.message / monitoring background job / monitoring reply sent (background)。",
+                    "飞书约 3s 超时：请用 python connect.py 启动；webhook 先 200，Grafana 在后台线程执行。",
                 ],
             }
         )
