@@ -426,10 +426,21 @@ def _lark_ack_only_event_type(het: str) -> bool:
     return False
 
 
-def _fast_plaintext_url_verification_response(raw_in: Dict[str, Any]) -> Optional[Any]:
+def _lark_min_json_response(payload: Dict[str, Any], status: int = 200) -> Response:
+    """Tight JSON body + explicit length — return before logging for URL verification."""
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    return Response(
+        body,
+        status=status,
+        mimetype="application/json; charset=utf-8",
+        headers={"X-Accel-Buffering": "no"},
+    )
+
+
+def _fast_plaintext_url_verification_response(raw_in: Dict[str, Any]) -> Optional[Response]:
     """
     Return Flask response for URL verification **before** decrypt/normalize pipeline.
-    Cuts work on the hot path so Feishu is less likely to see a ~3s timeout (network + app budget).
+    Uses :class:`Response` (not ``jsonify``) and no success logging so bytes leave ASAP.
     """
     if "encrypt" in raw_in:
         return None
@@ -437,7 +448,7 @@ def _fast_plaintext_url_verification_response(raw_in: Dict[str, Any]) -> Optiona
     _lark_coerce_event_dict(work)
     if work.get("type") == "url_verification":
         ch0 = work.get("challenge", "")
-        return jsonify({"challenge": str(ch0) if ch0 is not None else ""})
+        return _lark_min_json_response({"challenge": str(ch0) if ch0 is not None else ""})
     uv = _extract_url_verification(work)
     if not uv:
         return None
@@ -450,9 +461,8 @@ def _fast_plaintext_url_verification_response(raw_in: Dict[str, Any]) -> Optiona
                 len(VERIFICATION_TOKEN),
                 len(effective_tok or ""),
             )
-            return jsonify({"error": "invalid verification token"}), 403
-    logger.info("url_verification OK (fast path), challenge len=%s", len(str(challenge)))
-    return jsonify({"challenge": str(challenge)})
+            return _lark_min_json_response({"error": "invalid verification token"}, status=403)
+    return _lark_min_json_response({"challenge": str(challenge)})
 
 
 def _walk_panels(panels: Optional[List[Dict[str, Any]]]) -> Generator[Dict[str, Any], None, None]:
@@ -782,14 +792,6 @@ def webhook_event():
             }
         )
 
-    if request.method == "POST":
-        logger.info(
-            "webhook POST remote=%s len=%s ct=%r",
-            request.remote_addr,
-            request.content_length,
-            (request.headers.get("Content-Type") or "")[:120],
-        )
-
     raw_in = _lark_safe_parse_json_body(request)
     if raw_in is None:
         snip = ""
@@ -811,6 +813,14 @@ def webhook_event():
         fast_resp = _fast_plaintext_url_verification_response(raw_in)
         if fast_resp is not None:
             return fast_resp
+
+    if request.method == "POST":
+        logger.info(
+            "webhook POST remote=%s len=%s ct=%r",
+            request.remote_addr,
+            request.content_length,
+            (request.headers.get("Content-Type") or "")[:120],
+        )
 
     data = _feishu_maybe_decrypt_webhook_payload(raw_in)
     data = _lark_normalize_webhook(data if isinstance(data, dict) else {})
