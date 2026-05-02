@@ -2,15 +2,37 @@
 """
 Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana（.env 配置）。
 
-- **推荐** ``python connect.py``：官方 ``lark_oapi.ws.Client`` 收事件（无需公网 URL / 无 3s HTTP 校验）；
-  可选并行 HTTP（``ENABLE_HTTP=1``）提供 ``/health``、``/grafana/ping`` 等。
-- 飞书后台「事件与回调」→ **长连接**；订阅「接收消息 v1」或 **「接收消息 v2」**（均已注册）；``APP_ID`` / ``APP_SECRET`` 必填。
-- 默认 ``LARK_HOST=https://open.feishu.cn``；国际 Lark 设 ``https://open.larksuite.com``。
-- 仍支持旧模式：仅 HTTP 时设置 ``LARK_EVENT_MODE=http`` 且 ``connect.py`` 只起 Flask。
+启动::
 
-群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要；发消息用 ``lark-oapi`` HTTP API。
+  python main.py
 
-HTTP 回调（``LARK_EVENT_MODE=http``）：飞书约 **3s** 内须 **200**；IM 事件先返回空 JSON ``{}``，再在后台拉 Grafana 并发消息。
+**默认 ``LARK_EVENT_MODE=ws``** — Feishu/Lark **长连接**（``lark_oapi.ws.Client``）：无需公网 Request URL。
+IM 事件仅通过 WebSocket DATA 帧下发（journalctl 不会出现 ``POST /webhook/event``）。
+可选并行 HTTP（``ENABLE_HTTP=1``）：``/health``、``/grafana/ping``、``/webhook/event``。
+
+**``LARK_EVENT_MODE=http``** — 仅 Flask/Waitress 监听 ``PORT``（默认 5002），事件走 ``POST /webhook/event``。
+
+Env::
+
+  LARK_EVENT_MODE=ws|http     # default ws
+  ENABLE_HTTP=0|1           # default 1 when ws (HTTP sidecar); ignored when http
+  PORT=5002
+  LARK_WEBHOOK_PUBLIC_URL=  # optional hint logged in http mode
+  WAITRESS_THREADS=24
+  LARK_WS_LOG_LEVEL=INFO
+  LARK_WS_USE_HTTP_KEYS=0
+  LARK_WS_EXTRA_IM_TYPES=
+  LARK_WS_TRANSPORT_LOG=1
+  LARK_WS_BOOTSTRAP_FRAMES=16
+  LARK_WS_LOG_FRAME_METHOD=0
+  LARK_WS_SDK_DEBUG=0
+
+飞书后台「事件与回调」→ 长连接或 HTTP；订阅「接收消息」；``APP_ID`` / ``APP_SECRET`` 必填。
+默认 ``LARK_HOST=https://open.feishu.cn``；国际 Lark ``https://open.larksuite.com``。
+
+群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要。
+
+HTTP 回调：飞书约 **3s** 内须 **200**；IM 先返回 ``{}``，再在后台拉 Grafana 并发消息。
 """
 
 import base64
@@ -46,16 +68,43 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 
+class _WsgiWebhookDiagMiddleware:
+    """Log at WSGI boundary when Feishu hits /webhook — if this never appears, TCP never reached Waitress."""
+
+    def __init__(self, flask_app: Any):
+        self.flask_app = flask_app
+
+    def __call__(self, environ: Any, start_response: Any):
+        path = environ.get("PATH_INFO") or ""
+        if path.rstrip("/") == "/webhook/event":
+            logger.info(
+                "WSGI enter %s %s content_length=%s expect=%r remote=%s",
+                environ.get("REQUEST_METHOD"),
+                path,
+                environ.get("CONTENT_LENGTH"),
+                environ.get("HTTP_EXPECT"),
+                environ.get("REMOTE_ADDR"),
+            )
+        return self.flask_app(environ, start_response)
+
+
+app.wsgi_app = _WsgiWebhookDiagMiddleware(app.wsgi_app)
+
+
+def _request_is_webhook_event() -> bool:
+    return (request.path or "").rstrip("/") == "/webhook/event"
+
+
 @app.before_request
 def _lark_webhook_request_timer_start():
-    if request.path == "/webhook/event" and request.method == "POST":
+    if _request_is_webhook_event() and request.method == "POST":
         g._lark_wh_t0 = time.perf_counter()
 
 
 @app.after_request
 def _lark_webhook_request_timer_end(response: Response):
     """Measure app-side handling time. Feishu ~3s timeout includes RTT + TLS + body upload — not shown here."""
-    if request.path == "/webhook/event" and request.method == "POST":
+    if _request_is_webhook_event() and request.method == "POST":
         t0 = getattr(g, "_lark_wh_t0", None)
         if t0 is not None:
             elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -1334,7 +1383,7 @@ def health():
     return jsonify({"ok": True})
 
 
-@app.route("/webhook/event", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.route("/webhook/event", methods=["GET", "POST", "OPTIONS", "HEAD"], strict_slashes=False)
 def webhook_event():
     # Chatbox: OPTIONS must not 405 — some clients preflight the callback URL.
     if request.method == "OPTIONS":
@@ -1357,7 +1406,7 @@ def webhook_event():
                 "ok": True,
                 "hint": "Feishu must POST JSON to this path for events (HTTP mode only).",
                 "lark_event_mode_tip": (
-                    "默认 ``python connect.py`` 使用官方 WebSocket 长连接（LARK_EVENT_MODE=ws），无需配置 Request URL。"
+                    "默认 ``python main.py`` + ``LARK_EVENT_MODE=ws`` 使用官方 WebSocket 长连接，无需配置 Request URL。"
                     "若仍用 HTTP 回调，请设 LARK_EVENT_MODE=http；并核对下方 url_protocol_tip。"
                 ),
                 "url_protocol_tip": (
@@ -1395,14 +1444,14 @@ def webhook_event():
                     "webhook/event POST elapsed_ms when you click verify (no log means the request never reached the app)."
                 ),
                 "checklist_cn": [
-                    "推荐：开发者后台「事件与回调」→ 使用长连接接收事件，运行 ``python connect.py``（LARK_EVENT_MODE=ws，默认），无需公网 URL。",
+                    "推荐：开发者后台「事件与回调」→ 使用长连接接收事件，运行 ``python main.py``（LARK_EVENT_MODE=ws，默认），无需公网 URL。",
                     "若用 HTTP：Request URL 须指向本服务 POST /webhook/event（公网可达），并设 LARK_EVENT_MODE=http。",
                     "订阅「消息与群组」→「接收消息 v2.0」；群内需权限：@机器人消息 (im:message.group_at_msg) 或群全量消息权限。",
                     "VERIFICATION_TOKEN 与后台「Verification Token」一致（无多余空格）。",
                     "国内飞书应用将 LARK_HOST 设为 https://open.feishu.cn；国际用 https://open.larksuite.com。",
                     "机器人需能力「机器人」+ 权限「以应用身份发消息」等，且机器人在目标群内。",
                     "发 /monitoring 后看日志：handling im.message / monitoring background job / monitoring reply sent (background)。",
-                    "飞书约 3s 超时：请用 python connect.py 启动；webhook 先 200，Grafana 在后台线程执行。",
+                    "飞书约 3s 超时：请用 python main.py 启动；webhook 先 200，Grafana 在后台线程执行。",
                     "发消息依赖 lark-oapi：pip install -U lark-oapi；GET 本 URL 可查看 lark_oapi_version。",
                     "lark_oapi_installed=false 只影响发消息，不影响「请求 URL 校验」；校验失败多半是 VERIFICATION_TOKEN 与后台不一致。",
                     "若用 systemd：进程里可能没有 .env — 请在 unit 里 EnvironmentFile=/path/to/.env 或 Environment=VERIFICATION_TOKEN=… 后 systemctl daemon-reload && restart。",
@@ -1410,6 +1459,7 @@ def webhook_event():
                     "仍超时：核对飞书里填的 URL 是 http 还是 https，须与监听一致；点校验时 journalctl -u monitoringbot -f 看是否出现 POST /webhook/event。",
                     "curl 勿只发 {\"challenge\":\"ping\"}→403 正常；应用 {\"type\":\"url_verification\",\"token\":\"…\",\"challenge\":\"ping\"} 测 POST 延迟。",
                     "本机 200 仍报飞书 3s：用外网 curl 公网 URL；看 journal 有无 webhook/event POST elapsed_ms（没有则请求没到）。",
+                    "点飞书校验时应有 WSGI enter POST ... /webhook/event — 若无则请求未到本进程（https/console URL 错误/安全组）。",
                 ],
             }
         )
@@ -1523,9 +1573,89 @@ def metrics_request_total_1m():
         return jsonify({"error": str(e)}), 500
 
 
-if __name__ == "__main__":
-    # Prefer ``python connect.py`` — that loads ``main`` once; ``python main.py`` loads this file as
-    # ``__main__`` then again as ``main`` when connect imports ``app``.
-    import connect as _connect
+def run_monitoring_bot() -> None:
+    """
+    Process entrypoint: HTTP-only, WebSocket-only, or WS + HTTP sidecar (see module docstring).
+    Uses :data:`app`, :data:`logger`, :func:`start_lark_ws_client_blocking` from this module.
+    """
+    port = int(os.getenv("PORT", "5002"))
+    raw_mode = (os.getenv("LARK_EVENT_MODE") or "ws").strip().lower()
+    mode = raw_mode if raw_mode else "ws"
 
-    _connect.main()
+    def run_http() -> None:
+        try:
+            from waitress import serve
+
+            try:
+                threads = int(os.getenv("WAITRESS_THREADS", "24"))
+            except ValueError:
+                threads = 24
+            threads = max(4, min(threads, 128))
+            logger.info(
+                "HTTP (Waitress) on 0.0.0.0:%s threads=%s — /health /grafana/ping /webhook/event "
+                "(raise WAITRESS_THREADS if webhooks queue behind slow requests)",
+                port,
+                threads,
+            )
+            serve(app, host="0.0.0.0", port=port, threads=threads, channel_timeout=120)
+        except ImportError:
+            logger.warning("waitress not installed — pip install waitress; using Flask dev server")
+            app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+
+    if mode == "http":
+        logger.info("LARK_EVENT_MODE=http — Feishu events via POST /webhook/event only")
+        hint = (os.getenv("LARK_WEBHOOK_PUBLIC_URL") or "").strip()
+        if hint:
+            logger.info("Feishu developer console → 事件与回调 → Request URL (示例配置): %s", hint)
+            if hint.lower().startswith("https://"):
+                logger.error(
+                    "LARK_WEBHOOK_PUBLIC_URL / 控制台若使用 https:// 而本进程仅 plain HTTP，飞书会 TLS 握手失败或卡住≈3s。"
+                    "请改为 http://…:5002/webhook/event，或在前面加 Nginx/证书终止 TLS。"
+                )
+            if hint.rstrip("/").endswith("/webhook/event/"):
+                logger.warning(
+                    "Request URL 尽量不要带末尾 /；已启用 strict_slashes=False，仍建议与控制台完全一致。"
+                )
+        else:
+            logger.info(
+                "Set LARK_WEBHOOK_PUBLIC_URL in .env to log your Feishu Request URL hint "
+                "(e.g. http://YOUR_IP:5002/webhook/event)."
+            )
+        logger.warning(
+            "若本机 curl 很快 200 但飞书仍 ~3s 超时：多为公网/TLS/安全组链路问题。"
+            "请从外网主机 curl 同一 Request URL，并在点击校验时看日志是否出现 webhook/event POST elapsed_ms=…。"
+        )
+        run_http()
+        return
+
+    if mode != "ws":
+        raise SystemExit(f"Unknown LARK_EVENT_MODE={mode!r} (use ws or http)")
+
+    http_on = os.getenv("ENABLE_HTTP", "1").strip().lower() in ("1", "true", "yes", "on")
+    http_thread: Optional[threading.Thread] = None
+    if http_on:
+        http_thread = threading.Thread(target=run_http, name="http-sidecar", daemon=False)
+        http_thread.start()
+        time.sleep(0.2)
+    else:
+        logger.info("ENABLE_HTTP=0 — only Lark WebSocket client (no HTTP listener)")
+
+    try:
+        start_lark_ws_client_blocking()
+    except Exception:
+        logger.exception(
+            "Lark WebSocket client failed to start or exited (check APP_ID/APP_SECRET/LARK_HOST, "
+            "egress firewall, and Feishu app long-connection mode)."
+        )
+        if http_on and http_thread is not None:
+            logger.warning(
+                "Continuing with HTTP sidecar only — use POST /webhook/event for events, "
+                "or set LARK_EVENT_MODE=http after fixing credentials."
+            )
+            http_thread.join()
+            return
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    run_monitoring_bot()
