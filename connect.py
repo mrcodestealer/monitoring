@@ -84,6 +84,10 @@ def main() -> None:
                 "Set LARK_WEBHOOK_PUBLIC_URL in .env to log your Feishu Request URL hint "
                 "(e.g. http://47.84.112.211:5002/webhook/event)."
             )
+        logger.warning(
+            "若本机 curl 很快 200 但飞书仍 ~3s 超时：多为公网/TLS/安全组链路问题。"
+            "请从外网主机 curl 同一 Request URL，并在点击校验时看日志是否出现 webhook/event POST elapsed_ms=…。"
+        )
         run_http()
         return
 

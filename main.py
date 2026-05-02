@@ -28,7 +28,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, g, jsonify, request
 
 # ``lark_oapi`` → ``ws/pb/google/__init__.py`` uses ``pkg_resources.declare_namespace`` (no upstream fix yet).
 warnings.filterwarnings(
@@ -44,6 +44,41 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+
+@app.before_request
+def _lark_webhook_request_timer_start():
+    if request.path == "/webhook/event" and request.method == "POST":
+        g._lark_wh_t0 = time.perf_counter()
+
+
+@app.after_request
+def _lark_webhook_request_timer_end(response: Response):
+    """Measure app-side handling time. Feishu ~3s timeout includes RTT + TLS + body upload — not shown here."""
+    if request.path == "/webhook/event" and request.method == "POST":
+        t0 = getattr(g, "_lark_wh_t0", None)
+        if t0 is not None:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            remote = xff or (request.remote_addr or "")
+            ua = (request.headers.get("User-Agent") or "")[:160]
+            if elapsed_ms > 1000:
+                logger.warning(
+                    "webhook/event POST slow elapsed_ms=%.1f status=%s remote=%s ua=%r",
+                    elapsed_ms,
+                    response.status_code,
+                    remote,
+                    ua,
+                )
+            else:
+                logger.info(
+                    "webhook/event POST elapsed_ms=%.1f status=%s remote=%s",
+                    elapsed_ms,
+                    response.status_code,
+                    remote,
+                )
+    return response
+
 
 # Lark duplicate pushes (same message_id) — align with Chatbox processed_messages pattern.
 _processed_lark_message_ids: set = set()
@@ -1348,6 +1383,17 @@ def webhook_event():
                     "{\"type\":\"url_verification\",\"token\":\"YOUR_VERIFICATION_TOKEN\",\"challenge\":\"ping\"} "
                     "(expect 200 and echoed challenge)."
                 ),
+                "feishu_timeout_local_200_cn": (
+                    "若本机 curl 很快 200，但飞书控制台仍报约 3s 超时：多半是「飞书机房到你公网 IP」链路问题，而非 Python 处理慢。"
+                    "请①用境外/另一台云的 curl 测公网 URL；②控制台 URL 必须与应用一致（http/https、端口）；③安全组放行源站入站；"
+                    "④查看 journalctl 是否在点击校验时出现 webhook/event POST elapsed_ms=…（若无日志=请求未到进程）。"
+                ),
+                "feishu_timeout_local_200_en": (
+                    "If local curl returns 200 quickly but the Lark console still shows ~3s timeout, the delay is usually "
+                    "network/TLS/firewall path from Lark servers to your public URL — not Flask handler time. "
+                    "curl the public URL from an external VPS; fix http vs https; open security groups; check logs for "
+                    "webhook/event POST elapsed_ms when you click verify (no log means the request never reached the app)."
+                ),
                 "checklist_cn": [
                     "推荐：开发者后台「事件与回调」→ 使用长连接接收事件，运行 ``python connect.py``（LARK_EVENT_MODE=ws，默认），无需公网 URL。",
                     "若用 HTTP：Request URL 须指向本服务 POST /webhook/event（公网可达），并设 LARK_EVENT_MODE=http。",
@@ -1363,6 +1409,7 @@ def webhook_event():
                     "若飞书提示 3s 超时：云厂商安全组/防火墙须放行公网入站 TCP 5002；本机 curl -m 5 -X POST http://IP:5002/webhook/event -H Content-Type:application/json -d '{...}' 测连通。",
                     "仍超时：核对飞书里填的 URL 是 http 还是 https，须与监听一致；点校验时 journalctl -u monitoringbot -f 看是否出现 POST /webhook/event。",
                     "curl 勿只发 {\"challenge\":\"ping\"}→403 正常；应用 {\"type\":\"url_verification\",\"token\":\"…\",\"challenge\":\"ping\"} 测 POST 延迟。",
+                    "本机 200 仍报飞书 3s：用外网 curl 公网 URL；看 journal 有无 webhook/event POST elapsed_ms（没有则请求没到）。",
                 ],
             }
         )
