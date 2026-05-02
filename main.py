@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Lark webhook + Grafana session login (credentials from .env).
-Run: ``python connect.py`` (recommended) or ``python main.py`` → 0.0.0.0:5002, POST /webhook/event
-Public URL example: http://47.84.112.211:5002/webhook/event
-群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要。
-飞书发消息使用官方 SDK：``pip install -U lark-oapi``（见 requirements.txt）。
+Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana（.env 配置）。
+
+- **推荐** ``python connect.py``：官方 ``lark_oapi.ws.Client`` 收事件（无需公网 URL / 无 3s HTTP 校验）；
+  可选并行 HTTP（``ENABLE_HTTP=1``）提供 ``/health``、``/grafana/ping`` 等。
+- 飞书后台「事件与回调」改为 **使用长连接接收事件** 并订阅「接收消息」；``APP_ID`` / ``APP_SECRET`` 必填。
+- 仍支持旧模式：仅 HTTP 时设置 ``LARK_EVENT_MODE=http`` 且 ``connect.py`` 只起 Flask。
+
+群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要；发消息用 ``lark-oapi`` HTTP API。
 """
 
 import base64
@@ -689,20 +692,93 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
             _processed_lark_message_ids.clear()
 
 
-def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
-    # Token already verified in webhook_event (same as Chatbox single gate).
+def _serialize_lark_user_id(uid: Any) -> Dict[str, Any]:
+    if uid is None:
+        return {}
+    out: Dict[str, Any] = {}
+    for k in ("user_id", "open_id", "union_id"):
+        v = getattr(uid, k, None)
+        if v:
+            out[k] = v
+    return out
+
+
+def _serialize_lark_mention(m: Any) -> Dict[str, Any]:
+    if m is None:
+        return {}
+    out: Dict[str, Any] = {}
+    if getattr(m, "key", None):
+        out["key"] = m.key
+    if getattr(m, "name", None):
+        out["name"] = m.name
+    uid = getattr(m, "id", None)
+    if uid:
+        out["id"] = _serialize_lark_user_id(uid)
+    return out
+
+
+def _event_message_sdk_to_webhook_dict(msg: Any) -> Dict[str, Any]:
+    """Map ``lark_oapi`` EventMessage → same keys as HTTP ``im.message.receive_v*`` body."""
+    if msg is None:
+        return {}
+    out: Dict[str, Any] = {}
+    for attr in (
+        "message_id",
+        "root_id",
+        "parent_id",
+        "chat_id",
+        "thread_id",
+        "chat_type",
+        "message_type",
+        "content",
+        "user_agent",
+        "create_time",
+        "update_time",
+    ):
+        v = getattr(msg, attr, None)
+        if v is not None and v != "":
+            out[attr] = v
+    mlist = getattr(msg, "mentions", None) or []
+    if mlist:
+        out["mentions"] = [_serialize_lark_mention(x) for x in mlist]
+    return out
+
+
+def _p2_im_message_receive_v1_to_event_dict(p2: Any) -> Dict[str, Any]:
+    """Schema 2.0–shaped dict for :func:`_process_im_message_event` (SDK + HTTP share this)."""
+    ev = getattr(p2, "event", None)
+    sender: Dict[str, Any] = {}
+    if ev and getattr(ev, "sender", None) and getattr(ev.sender, "sender_id", None):
+        sender["sender_id"] = _serialize_lark_user_id(ev.sender.sender_id)
+    message = _event_message_sdk_to_webhook_dict(getattr(ev, "message", None) if ev else None)
+    inner: Dict[str, Any] = {"sender": sender, "message": message}
+    header: Dict[str, Any] = {}
+    hdr = getattr(p2, "header", None)
+    if hdr:
+        for k in ("event_id", "token", "event_type", "tenant_key", "app_id", "create_time"):
+            v = getattr(hdr, k, None)
+            if v is not None and v != "":
+                header[k] = v
+    return {"schema": "2.0", "header": header, "event": inner}
+
+
+def _process_im_message_event(data: Dict[str, Any]) -> None:
+    """
+    Shared handler for ``im.message`` from HTTP webhook or WebSocket ``P2ImMessageReceiveV1``.
+    HTTP path verifies token before calling; WS path relies on SDK + ``EventDispatcherHandler`` keys.
+    """
     event = data.get("event") or {}
     msg = event.get("message") or {}
     mid = (msg.get("message_id") or "").strip()
     mtype = (msg.get("message_type") or "").lower()
     if mtype and mtype not in ("text", "post"):
         logger.info("im.message ignored: message_type=%r", mtype)
-        return jsonify({"success": True}), 200
+        return
 
     sender = (event.get("sender") or {}).get("sender_id") or {}
     sender_open = (sender.get("open_id") or "").strip()
     if LARK_BOT_OPEN_ID and sender_open == LARK_BOT_OPEN_ID:
-        return jsonify({"success": True}), 200
+        return
 
     raw_text = _lark_extract_plain_text_from_message(msg)
     mentions = msg.get("mentions") or []
@@ -715,25 +791,72 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
             (clean or "")[:160],
             MONITORING_TRIGGER,
         )
-        return jsonify({"success": True}), 200
+        return
 
-    # Dedupe only *after* trigger matches. Never register message_id before a successful send —
-    # otherwise Lark retries the same message_id would be skipped and the user would see no reply.
     if mid and mid in _processed_lark_message_ids:
         logger.info("duplicate message_id=%s — already replied, skip", mid)
-        return jsonify({"success": True}), 200
+        return
 
     chat_id = (msg.get("chat_id") or msg.get("open_chat_id") or "").strip()
     open_id = sender_open
 
-    # Lark expects HTTP 200 within ~3s; Grafana + Prometheus often exceeds that — ACK first, work in thread.
     threading.Thread(
         target=_monitoring_background_worker,
         args=(chat_id, open_id, mid),
         daemon=True,
         name="monitoring-reply",
     ).start()
+
+
+def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
+    # Token already verified in webhook_event (same as Chatbox single gate).
+    _process_im_message_event(data)
     return jsonify({"success": True}), 200
+
+
+def _on_ws_p2_im_message_receive_v1(p2: Any) -> None:
+    try:
+        data = _p2_im_message_receive_v1_to_event_dict(p2)
+        _process_im_message_event(data)
+    except Exception:
+        logger.exception("WebSocket im.message handler failed")
+
+
+def start_lark_ws_client_blocking() -> None:
+    """
+    Official long-connection mode (no public Request URL, no HTTP challenge).
+    Blocks until disconnect (or fatal error). Requires ``APP_ID`` + ``APP_SECRET``.
+    """
+    if not APP_ID or not APP_SECRET:
+        raise RuntimeError("APP_ID and APP_SECRET are required for Lark WebSocket client")
+
+    from lark_oapi import EventDispatcherHandler
+    from lark_oapi.core.enum import LogLevel
+    from lark_oapi.ws.client import Client as LarkWsClient
+
+    encrypt_key = LARK_ENCRYPT_KEY or ""
+    verification = VERIFICATION_TOKEN or ""
+    handler = (
+        EventDispatcherHandler.builder(encrypt_key, verification)
+        .register_p2_im_message_receive_v1(_on_ws_p2_im_message_receive_v1)
+        .build()
+    )
+    level_name = (os.getenv("LARK_WS_LOG_LEVEL") or "INFO").strip().upper()
+    log_level = getattr(LogLevel, level_name, LogLevel.INFO)
+
+    cli = LarkWsClient(
+        str(APP_ID).strip(),
+        str(APP_SECRET).strip(),
+        log_level=log_level,
+        event_handler=handler,
+        domain=LARK_HOST.rstrip("/"),
+        auto_reconnect=True,
+    )
+    logger.info(
+        "Lark WebSocket client starting (domain=%s); set Feishu console to 长连接接收事件 and subscribe 接收消息",
+        LARK_HOST,
+    )
+    cli.start()
 
 
 @app.route("/health", methods=["GET"])
@@ -762,7 +885,11 @@ def webhook_event():
         return jsonify(
             {
                 "ok": True,
-                "hint": "Feishu must POST JSON to this path for events.",
+                "hint": "Feishu must POST JSON to this path for events (HTTP mode only).",
+                "lark_event_mode_tip": (
+                    "默认 ``python connect.py`` 使用官方 WebSocket 长连接（LARK_EVENT_MODE=ws），无需配置 Request URL。"
+                    "若仍用 HTTP 回调，请设 LARK_EVENT_MODE=http；并核对下方 url_protocol_tip。"
+                ),
                 "url_protocol_tip": (
                     "Lark 请求 URL 校验走 POST。若控制台填了 https:// 而本服务只监听 http://（无 TLS），"
                     "客户端会一直握手直到约 3s 超时 — 请改为 http://IP:5002/webhook/event，或在前面加 Nginx/证书。"
@@ -776,7 +903,8 @@ def webhook_event():
                 "encrypt_key_configured": bool(LARK_ENCRYPT_KEY),
                 "grafana_user_configured": bool(GRAFANA_USER),
                 "checklist_cn": [
-                    "事件与回调 Request URL 必须指向本服务 POST /webhook/event（公网可达）。",
+                    "推荐：开发者后台「事件与回调」→ 使用长连接接收事件，运行 ``python connect.py``（LARK_EVENT_MODE=ws，默认），无需公网 URL。",
+                    "若用 HTTP：Request URL 须指向本服务 POST /webhook/event（公网可达），并设 LARK_EVENT_MODE=http。",
                     "订阅「消息与群组」→「接收消息 v2.0」；群内需权限：@机器人消息 (im:message.group_at_msg) 或群全量消息权限。",
                     "VERIFICATION_TOKEN 与后台「Verification Token」一致（无多余空格）。",
                     "国内飞书应用将 LARK_HOST 设为 https://open.feishu.cn；国际用 https://open.larksuite.com。",
@@ -916,11 +1044,8 @@ def metrics_request_total_1m():
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5002"))
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=os.getenv("FLASK_DEBUG") == "1",
-        threaded=True,
-        use_reloader=False,
-    )
+    # Prefer ``python connect.py`` — that loads ``main`` once; ``python main.py`` loads this file as
+    # ``__main__`` then again as ``main`` when connect imports ``app``.
+    import connect as _connect
+
+    _connect.main()

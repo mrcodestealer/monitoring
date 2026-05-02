@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 """
-Start the monitoring bot on PORT (default 5002).
+Start the monitoring bot.
 
-Why use this entry point
-------------------------
-Feishu/Lark requires the event webhook to return HTTP **200 within ~3 seconds**.
-``/webhook/event`` ACKs immediately; **Grafana + Lark send** run in a **background thread**
-(see ``main._monitoring_background_worker``).
+**Default (``LARK_EVENT_MODE=ws``)** — Feishu/Lark **long connection** (official ``lark_oapi.ws.Client``):
+no public Request URL, no ~3s HTTP URL verification. Optionally runs HTTP in a **background thread**
+(``ENABLE_HTTP=1``) for ``/health``, ``/grafana/ping``, ``/webhook/event`` (legacy).
+
+**HTTP-only (``LARK_EVENT_MODE=http``)** — same as before: only Flask/Waitress on ``PORT`` (default 5002).
+
+Env::
+
+  LARK_EVENT_MODE=ws|http     # default ws
+  ENABLE_HTTP=0|1           # default 1 when mode=ws (sidecar); ignored when mode=http
+  PORT=5002
+  LARK_WS_LOG_LEVEL=INFO    # DEBUG|INFO|WARNING|ERROR for SDK WS logs
 
 Usage::
 
   cd "/path/to/monitoring bot"
   python connect.py
 
-  PORT=5002 python connect.py
-
-Same as ``python main.py`` for the server process; ``connect.py`` documents the fast-ACK
-pattern and loads ``.env`` before importing ``main``.
-
-Install deps (includes Feishu **lark-oapi** SDK)::
+Install::
 
   pip install -U -r requirements.txt
 """
 
 import os
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -33,32 +36,38 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 def main() -> None:
     port = int(os.getenv("PORT", "5002"))
+    mode = (os.getenv("LARK_EVENT_MODE") or "ws").strip().lower()
     # Import after load_dotenv so main.py sees the same env as this process.
-    from main import app, logger  # noqa: WPS433 (import inside function)
+    from main import app, logger, start_lark_ws_client_blocking  # noqa: WPS433
 
-    # Waitress is more reliable than Flask's dev Werkzeug server for Feishu's POST + 3s budget.
-    try:
-        from waitress import serve
+    def run_http() -> None:
+        try:
+            from waitress import serve
 
-        logger.info(
-            "Serving with Waitress on 0.0.0.0:%s (threads=8); /monitoring work stays async in main.py",
-            port,
-        )
-        serve(app, host="0.0.0.0", port=port, threads=8, channel_timeout=120)
+            logger.info(
+                "HTTP sidecar (Waitress) on 0.0.0.0:%s threads=8 — /health /grafana/ping /webhook/event",
+                port,
+            )
+            serve(app, host="0.0.0.0", port=port, threads=8, channel_timeout=120)
+        except ImportError:
+            logger.warning("waitress not installed — pip install waitress; using Flask dev server")
+            app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+
+    if mode == "http":
+        logger.info("LARK_EVENT_MODE=http — Feishu events via POST /webhook/event only")
+        run_http()
         return
-    except ImportError:
-        logger.warning("waitress not installed — pip install waitress; falling back to Flask dev server")
 
-    logger.info(
-        "Monitoring bot (Flask dev server) on 0.0.0.0:%s — prefer: pip install waitress",
-        port,
-    )
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        threaded=True,
-        use_reloader=False,
-    )
+    if mode != "ws":
+        raise SystemExit(f"Unknown LARK_EVENT_MODE={mode!r} (use ws or http)")
+
+    http_on = os.getenv("ENABLE_HTTP", "1").strip().lower() in ("1", "true", "yes", "on")
+    if http_on:
+        threading.Thread(target=run_http, name="http-sidecar", daemon=True).start()
+    else:
+        logger.info("ENABLE_HTTP=0 — only Lark WebSocket client (no HTTP listener)")
+
+    start_lark_ws_client_blocking()
 
 
 if __name__ == "__main__":
