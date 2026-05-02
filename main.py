@@ -284,6 +284,8 @@ def _lark_collect_post_text(obj: Any, out: List[str]) -> None:
 
 def _lark_extract_plain_text_from_message(msg: Dict[str, Any]) -> str:
     """Support ``text`` and rich ``post`` bodies (common when @mentioning in mobile clients)."""
+    if not isinstance(msg, dict):
+        return ""
     content_str = msg.get("content") or "{}"
     mtype = (msg.get("message_type") or "").lower()
     try:
@@ -725,6 +727,9 @@ def _serialize_lark_user_id(uid: Any) -> Dict[str, Any]:
 def _serialize_lark_mention(m: Any) -> Dict[str, Any]:
     if m is None:
         return {}
+    if isinstance(m, dict):
+        out = {k: v for k, v in m.items() if k in ("key", "name", "tenant_key", "id") and v is not None}
+        return out
     out: Dict[str, Any] = {}
     if getattr(m, "key", None):
         out["key"] = m.key
@@ -734,6 +739,15 @@ def _serialize_lark_mention(m: Any) -> Dict[str, Any]:
     if uid:
         out["id"] = _serialize_lark_user_id(uid)
     return out
+
+
+def _event_message_any_to_webhook_dict(msg: Any) -> Dict[str, Any]:
+    """Normalize SDK ``EventMessage`` or plain JSON ``dict`` to webhook-style message dict."""
+    if msg is None:
+        return {}
+    if isinstance(msg, dict):
+        return dict(msg)
+    return _event_message_sdk_to_webhook_dict(msg)
 
 
 def _event_message_sdk_to_webhook_dict(msg: Any) -> Dict[str, Any]:
@@ -781,11 +795,6 @@ def _lark_customized_event_to_schema2_dict(ce: Any) -> Dict[str, Any]:
 def _p2_im_message_receive_v1_to_event_dict(p2: Any) -> Dict[str, Any]:
     """Schema 2.0–shaped dict for :func:`_process_im_message_event` (SDK + HTTP share this)."""
     ev = getattr(p2, "event", None)
-    sender: Dict[str, Any] = {}
-    if ev and getattr(ev, "sender", None) and getattr(ev.sender, "sender_id", None):
-        sender["sender_id"] = _serialize_lark_user_id(ev.sender.sender_id)
-    message = _event_message_sdk_to_webhook_dict(getattr(ev, "message", None) if ev else None)
-    inner: Dict[str, Any] = {"sender": sender, "message": message}
     header: Dict[str, Any] = {}
     hdr = getattr(p2, "header", None)
     if hdr:
@@ -793,6 +802,17 @@ def _p2_im_message_receive_v1_to_event_dict(p2: Any) -> Dict[str, Any]:
             v = getattr(hdr, k, None)
             if v is not None and v != "":
                 header[k] = v
+
+    # Rare: JSON 反序列化后 ``event`` 已是 dict（与 v2 相同），避免对 dict 取 .sender 崩溃。
+    if isinstance(ev, dict):
+        return {"schema": "2.0", "header": header, "event": ev}
+
+    sender: Dict[str, Any] = {}
+    if ev and getattr(ev, "sender", None) and getattr(ev.sender, "sender_id", None):
+        sender["sender_id"] = _serialize_lark_user_id(ev.sender.sender_id)
+    raw_msg = getattr(ev, "message", None) if ev else None
+    message = _event_message_any_to_webhook_dict(raw_msg)
+    inner: Dict[str, Any] = {"sender": sender, "message": message}
     return {"schema": "2.0", "header": header, "event": inner}
 
 
@@ -801,21 +821,39 @@ def _process_im_message_event(data: Dict[str, Any]) -> None:
     Shared handler for ``im.message`` from HTTP webhook or WebSocket ``P2ImMessageReceiveV1``.
     HTTP path verifies token before calling; WS path relies on SDK + ``EventDispatcherHandler`` keys.
     """
-    event = data.get("event") or {}
-    msg = event.get("message") or {}
+    try:
+        _process_im_message_event_impl(data)
+    except Exception:
+        logger.exception("im.message handler crashed (swallowed so WS / HTTP worker stays up)")
+
+
+def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
+    event = data.get("event") if isinstance(data.get("event"), dict) else {}
+    raw_msg = event.get("message")
+    msg = raw_msg if isinstance(raw_msg, dict) else {}
     mid = (msg.get("message_id") or "").strip()
     mtype = (msg.get("message_type") or "").lower()
     if mtype and mtype in _SKIP_IM_MESSAGE_TYPES:
         logger.info("im.message ignored (non-textual): message_type=%r", mtype)
         return
 
-    sender = (event.get("sender") or {}).get("sender_id") or {}
+    send_wrap = event.get("sender")
+    if not isinstance(send_wrap, dict):
+        send_wrap = {}
+    sid = send_wrap.get("sender_id")
+    if isinstance(sid, dict):
+        sender = sid
+    elif sid is not None and hasattr(sid, "open_id"):
+        sender = _serialize_lark_user_id(sid)
+    else:
+        sender = {}
     sender_open = (sender.get("open_id") or "").strip()
     if LARK_BOT_OPEN_ID and sender_open == LARK_BOT_OPEN_ID:
         return
 
     raw_text = _lark_extract_plain_text_from_message(msg)
-    mentions = msg.get("mentions") or []
+    mentions_raw = msg.get("mentions") or []
+    mentions = mentions_raw if isinstance(mentions_raw, list) else []
     clean = _lark_clean_command_text(raw_text, mentions)
 
     if not _text_has_monitoring_trigger(raw_text, clean):
@@ -842,6 +880,18 @@ def _process_im_message_event(data: Dict[str, Any]) -> None:
     ).start()
 
 
+def _ws_log_message_snip(data: Dict[str, Any]) -> Tuple[Any, Any, str]:
+    """Safe for ``event.message`` missing or null (``dict.get('message', {})`` returns None if key exists)."""
+    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+    msg = ev.get("message") or {}
+    if not isinstance(msg, dict):
+        msg = {}
+    mid = msg.get("message_id")
+    mtype = msg.get("message_type")
+    chat = str(msg.get("chat_id") or "")[:12]
+    return mid, mtype, chat
+
+
 def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     # Token already verified in webhook_event (same as Chatbox single gate).
     _process_im_message_event(data)
@@ -851,12 +901,8 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
 def _on_ws_p2_im_message_receive_v1(p2: Any) -> None:
     try:
         data = _p2_im_message_receive_v1_to_event_dict(p2)
-        logger.info(
-            "ws p2.im.message.receive_v1 mid=%r mtype=%r chat=%r",
-            (data.get("event") or {}).get("message", {}).get("message_id"),
-            (data.get("event") or {}).get("message", {}).get("message_type"),
-            str((data.get("event") or {}).get("message", {}).get("chat_id") or "")[:12],
-        )
+        mid, mtype, chat = _ws_log_message_snip(data)
+        logger.info("ws p2.im.message.receive_v1 mid=%r mtype=%r chat=%r", mid, mtype, chat)
         _process_im_message_event(data)
     except Exception:
         logger.exception("WebSocket im.message.receive_v1 handler failed")
@@ -866,13 +912,8 @@ def _on_ws_p2_im_message_receive_v2(ce: Any) -> None:
     """控制台订阅「接收消息 v2.0」时 event_type 为 im.message.receive_v2，须单独注册。"""
     try:
         data = _lark_customized_event_to_schema2_dict(ce)
-        em = (data.get("event") or {}).get("message") or {}
-        logger.info(
-            "ws p2.im.message.receive_v2 mid=%r mtype=%r chat=%r",
-            em.get("message_id"),
-            em.get("message_type"),
-            str(em.get("chat_id") or "")[:12],
-        )
+        mid, mtype, chat = _ws_log_message_snip(data)
+        logger.info("ws p2.im.message.receive_v2 mid=%r mtype=%r chat=%r", mid, mtype, chat)
         _process_im_message_event(data)
     except Exception:
         logger.exception("WebSocket im.message.receive_v2 handler failed")
