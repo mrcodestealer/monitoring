@@ -16,6 +16,7 @@ Env::
   ENABLE_HTTP=0|1           # default 1 when mode=ws (sidecar); ignored when mode=http
   PORT=5002
   LARK_WEBHOOK_PUBLIC_URL=    # optional; http mode logs this as the Feishu Request URL hint
+  WAITRESS_THREADS=24        # avoid Lark 3s timeout when all workers busy (HTTP mode)
   LARK_WS_LOG_LEVEL=INFO    # DEBUG|INFO|WARNING|ERROR for SDK WS logs
   LARK_WS_USE_HTTP_KEYS=0   # 1=把 LARK_ENCRYPT_KEY/VERIFICATION_TOKEN 传给 WS handler（一般勿开；长连接文档要求空）
   LARK_WS_EXTRA_IM_TYPES=   # 逗号分隔的额外 event_type（如控制台实际推送非标准名）；与 receive_v1 同形时挂 customized handler
@@ -57,11 +58,18 @@ def main() -> None:
         try:
             from waitress import serve
 
+            try:
+                threads = int(os.getenv("WAITRESS_THREADS", "24"))
+            except ValueError:
+                threads = 24
+            threads = max(4, min(threads, 128))
             logger.info(
-                "HTTP sidecar (Waitress) on 0.0.0.0:%s threads=8 — /health /grafana/ping /webhook/event",
+                "HTTP (Waitress) on 0.0.0.0:%s threads=%s — /health /grafana/ping /webhook/event "
+                "(raise WAITRESS_THREADS if webhooks queue behind slow requests)",
                 port,
+                threads,
             )
-            serve(app, host="0.0.0.0", port=port, threads=8, channel_timeout=120)
+            serve(app, host="0.0.0.0", port=port, threads=threads, channel_timeout=120)
         except ImportError:
             logger.warning("waitress not installed — pip install waitress; using Flask dev server")
             app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)

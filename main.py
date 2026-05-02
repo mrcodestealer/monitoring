@@ -516,9 +516,43 @@ def _lark_min_json_response(payload: Dict[str, Any], status: int = 200) -> Respo
     )
 
 
+# Pre-built body avoids json.dumps on the hot ACK path (tiny win; no computation before flush).
+_FEISHU_WEBHOOK_ACK_EMPTY_BODY = b"{}"
+
+
 def _lark_feishu_webhook_ack_immediate() -> Response:
     """Feishu event/card HTTP callbacks should get 200 within ~3s; empty body is accepted after ACK."""
-    return _lark_min_json_response({}, 200)
+    return Response(
+        _FEISHU_WEBHOOK_ACK_EMPTY_BODY,
+        status=200,
+        mimetype="application/json; charset=utf-8",
+        headers={
+            "Content-Length": "2",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _lark_webhook_url_verification_response_or_none(data: Dict[str, Any]) -> Optional[Response]:
+    """If payload is Feishu URL verification / challenge, return minimal JSON immediately."""
+    if data.get("type") == "url_verification":
+        ch0 = data.get("challenge", "")
+        return _lark_min_json_response({"challenge": str(ch0) if ch0 is not None else ""})
+    uv = _extract_url_verification(data)
+    if not uv:
+        return None
+    token_from_event, challenge = uv
+    if VERIFICATION_TOKEN:
+        effective_tok = _lark_extract_verification_token(data) or str(token_from_event or "").strip()
+        if effective_tok != VERIFICATION_TOKEN:
+            logger.warning(
+                "url_verification token mismatch (exp_len=%s got_len=%s)",
+                len(VERIFICATION_TOKEN),
+                len(effective_tok or ""),
+            )
+            return _lark_min_json_response({"error": "invalid verification token"}, status=403)
+    logger.debug("url_verification OK, challenge len=%s", len(str(challenge)))
+    return _lark_min_json_response({"challenge": str(challenge)})
 
 
 def _fast_plaintext_url_verification_response(raw_in: Dict[str, Any]) -> Optional[Response]:
@@ -922,16 +956,25 @@ def _ws_log_message_snip(data: Dict[str, Any]) -> Tuple[Any, Any, str]:
 
 def _handle_im_message_receive(data: Dict[str, Any]) -> Response:
     """
-    HTTP path: Feishu ~3s deadline — return ``{}`` immediately, parse/Grafana/send on a daemon thread.
+    HTTP path: Feishu ~3s deadline — return ``{}`` immediately (no deepcopy on request thread).
     WebSocket path still calls :func:`_process_im_message_event` synchronously (no HTTP timeout).
     """
-    payload = copy.deepcopy(data)
-    threading.Thread(
-        target=_process_im_message_event,
-        args=(payload,),
-        daemon=True,
-        name="lark-im-webhook",
-    ).start()
+
+    def _worker(ref: Dict[str, Any]) -> None:
+        try:
+            payload = copy.deepcopy(ref)
+            et = _lark_header_event_type(payload)
+            logger.info(
+                "handling %s (async) message_id=%r chat_id_prefix=%s",
+                et,
+                ((payload.get("event") or {}).get("message") or {}).get("message_id"),
+                str(((payload.get("event") or {}).get("message") or {}).get("chat_id") or "")[:12],
+            )
+            _process_im_message_event(payload)
+        except Exception:
+            logger.exception("lark im.message webhook worker failed")
+
+    threading.Thread(target=_worker, args=(data,), daemon=True, name="lark-im-webhook").start()
     return _lark_feishu_webhook_ack_immediate()
 
 
@@ -1294,6 +1337,17 @@ def webhook_event():
                 "app_secret_configured": bool(APP_SECRET),
                 "encrypt_key_configured": bool(LARK_ENCRYPT_KEY),
                 "grafana_user_configured": bool(GRAFANA_USER),
+                "feishu_url_verify_local_test_cn": (
+                    "勿只 POST {\"challenge\":\"...\"}：不会被识别为 URL 校验，会走事件 token 校验 → 403 Invalid token（属正常）。"
+                    "正确测本机延迟请用 legacy 体：{\"type\":\"url_verification\",\"token\":\"与 .env 中 VERIFICATION_TOKEN 一致\",\"challenge\":\"ping\"}，"
+                    "应返回 HTTP 200 且 JSON 内含 challenge。"
+                ),
+                "feishu_url_verify_local_test_en": (
+                    "Posting only {\"challenge\":\"...\"} is NOT a Feishu url_verification payload — it falls through to "
+                    "event token verification → 403 is correct. For a local latency test use "
+                    "{\"type\":\"url_verification\",\"token\":\"YOUR_VERIFICATION_TOKEN\",\"challenge\":\"ping\"} "
+                    "(expect 200 and echoed challenge)."
+                ),
                 "checklist_cn": [
                     "推荐：开发者后台「事件与回调」→ 使用长连接接收事件，运行 ``python connect.py``（LARK_EVENT_MODE=ws，默认），无需公网 URL。",
                     "若用 HTTP：Request URL 须指向本服务 POST /webhook/event（公网可达），并设 LARK_EVENT_MODE=http。",
@@ -1308,6 +1362,7 @@ def webhook_event():
                     "若用 systemd：进程里可能没有 .env — 请在 unit 里 EnvironmentFile=/path/to/.env 或 Environment=VERIFICATION_TOKEN=… 后 systemctl daemon-reload && restart。",
                     "若飞书提示 3s 超时：云厂商安全组/防火墙须放行公网入站 TCP 5002；本机 curl -m 5 -X POST http://IP:5002/webhook/event -H Content-Type:application/json -d '{...}' 测连通。",
                     "仍超时：核对飞书里填的 URL 是 http 还是 https，须与监听一致；点校验时 journalctl -u monitoringbot -f 看是否出现 POST /webhook/event。",
+                    "curl 勿只发 {\"challenge\":\"ping\"}→403 正常；应用 {\"type\":\"url_verification\",\"token\":\"…\",\"challenge\":\"ping\"} 测 POST 延迟。",
                 ],
             }
         )
@@ -1343,10 +1398,6 @@ def webhook_event():
         )
 
     data = _feishu_maybe_decrypt_webhook_payload(raw_in)
-    data = _lark_normalize_webhook(data if isinstance(data, dict) else {})
-    if not isinstance(data, dict):
-        return jsonify({"error": "invalid payload"}), 400
-    data = _lark_coerce_event_dict(data)
 
     if isinstance(raw_in, dict) and raw_in.get("encrypt") is not None and data is raw_in:
         logger.error(
@@ -1354,28 +1405,19 @@ def webhook_event():
         )
         return jsonify({"error": "Invalid token"}), 403
 
-    # Legacy flat URL challenge — Chatbox returns before global token check.
-    if data.get("type") == "url_verification":
-        ch0 = data.get("challenge", "")
-        return jsonify({"challenge": str(ch0) if ch0 is not None else ""})
+    if not isinstance(data, dict):
+        return jsonify({"error": "invalid payload"}), 400
 
-    uv = _extract_url_verification(data)
-    if uv:
-        token_from_event, challenge = uv
-        # Prefer header.token (schema 2.0); event.token is often absent → was causing 403 "verify failed".
-        if VERIFICATION_TOKEN:
-            effective_tok = _lark_extract_verification_token(data) or str(token_from_event or "").strip()
-            if effective_tok != VERIFICATION_TOKEN:
-                logger.warning(
-                    "url_verification token mismatch (exp_len=%s got_len=%s) — "
-                    "copy Verification Token from 飞书 事件与回调 into VERIFICATION_TOKEN; "
-                    "if using systemd, set EnvironmentFile= to the .env that contains it",
-                    len(VERIFICATION_TOKEN),
-                    len(effective_tok or ""),
-                )
-                return jsonify({"error": "invalid verification token"}), 403
-        logger.info("url_verification OK, echoing challenge (len=%s)", len(str(challenge)))
-        return jsonify({"challenge": str(challenge)})
+    data = _lark_coerce_event_dict(data)
+    uv_early = _lark_webhook_url_verification_response_or_none(data)
+    if uv_early is not None:
+        return uv_early
+
+    data = _lark_normalize_webhook(data)
+    data = _lark_coerce_event_dict(data)
+    uv_after_norm = _lark_webhook_url_verification_response_or_none(data)
+    if uv_after_norm is not None:
+        return uv_after_norm
 
     if not _lark_verify_event_token(data):
         logger.warning(
@@ -1396,15 +1438,9 @@ def webhook_event():
         return _lark_feishu_webhook_ack_immediate()
 
     if et in ("im.message.receive_v1", "im.message.receive_v2"):
-        logger.info(
-            "handling %s message_id=%r chat_id_prefix=%s",
-            et,
-            ((data.get("event") or {}).get("message") or {}).get("message_id"),
-            str(((data.get("event") or {}).get("message") or {}).get("chat_id") or "")[:12],
-        )
         return _handle_im_message_receive(data)
 
-    logger.info(
+    logger.debug(
         "event ignored: event_type=%r keys=%s (subscribe 消息与群组 → 接收消息 v2.0)",
         et,
         list(data.keys())[:20],
