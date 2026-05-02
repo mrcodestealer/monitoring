@@ -3,8 +3,10 @@
 Lark webhook + Grafana session login (credentials from .env).
 Run: python main.py  → listens on 0.0.0.0:5002, webhook: POST /webhook/event
 Public URL example: http://47.84.112.211:5002/webhook/event
+群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要。
 """
 
+import json
 import logging
 import os
 import time
@@ -42,6 +44,8 @@ VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN", "")
 # For Open API (e.g. send message) — see https://open.feishu.cn/document/ukTMukTMukTM/ukDNz4SO0MjL5QzM/auth-v3/auth/tenant_access_token_internal
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
+LARK_HOST = os.getenv("LARK_HOST", "https://open.larksuite.com").rstrip("/")
+MONITORING_TRIGGER = os.getenv("MONITORING_TRIGGER", "/monitoring")
 
 
 def grafana_login_session() -> requests.Session:
@@ -198,6 +202,120 @@ def fetch_request_total_1m_series() -> Dict[str, Any]:
     }
 
 
+def _lark_tenant_access_token() -> str:
+    if not APP_ID or not APP_SECRET:
+        raise ValueError("APP_ID and APP_SECRET required for Lark reply")
+    url = f"{LARK_HOST}/open-apis/auth/v3/tenant_access_token/internal"
+    r = requests.post(url, json={"app_id": APP_ID, "app_secret": APP_SECRET}, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("code") != 0:
+        raise RuntimeError(f"Lark token: {j}")
+    return str(j["tenant_access_token"])
+
+
+def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
+    token = _lark_tenant_access_token()
+    url = f"{LARK_HOST}/open-apis/im/v1/messages"
+    params = {"receive_id_type": receive_id_type}
+    body = {
+        "receive_id": receive_id,
+        "msg_type": "text",
+        "content": json.dumps({"text": text}),
+    }
+    r = requests.post(
+        url,
+        params=params,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if j.get("code") != 0:
+        raise RuntimeError(f"Lark send: {j}")
+
+
+def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
+    w = payload.get("window") or {}
+    span = int(w.get("endUnix", 0)) - int(w.get("startUnix", 0))
+    lines: List[str] = [
+        f"【{payload.get('panelTitle')}】最近 {span}s（步长 {w.get('stepSeconds')}s）",
+        f"Dashboard: {GRAFANA_BASE_URL}/d/{payload.get('dashboardUid')}",
+    ]
+    for s in payload.get("series") or []:
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        results = pdata.get("result") or []
+        ref = s.get("refId") or "?"
+        if not results:
+            lines.append(f"- [{ref}] 无数据 / no data")
+            continue
+        for r in results[:12]:
+            m = r.get("metric") or {}
+            legend_bits = [f"{k}={v}" for k, v in sorted(m.items()) if k not in ("__name__",)][:4]
+            legend = ", ".join(legend_bits) or str(m.get("__name__", ref))
+            vals = r.get("values") or []
+            if vals:
+                last = vals[-1]
+                lines.append(f"- {legend}\n  latest: {last[1]} @ {last[0]} ({len(vals)} pts)")
+            else:
+                lines.append(f"- {legend}\n  (empty)")
+    out = "\n".join(lines)
+    if len(out) > 4500:
+        out = out[:4490] + "\n…(truncated)"
+    return out
+
+
+def _lark_header_token_ok(data: Dict[str, Any]) -> bool:
+    if not VERIFICATION_TOKEN:
+        return True
+    tok = (data.get("header") or {}).get("token")
+    return tok == VERIFICATION_TOKEN
+
+
+def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
+    if not _lark_header_token_ok(data):
+        return jsonify({"error": "invalid verification token"}), 403
+
+    event = data.get("event") or {}
+    msg = event.get("message") or {}
+    if msg.get("message_type") != "text":
+        return jsonify({}), 200
+
+    try:
+        inner = json.loads(msg.get("content") or "{}")
+        raw_text = inner.get("text") or ""
+    except (json.JSONDecodeError, TypeError):
+        return jsonify({}), 200
+
+    if MONITORING_TRIGGER not in raw_text:
+        return jsonify({}), 200
+
+    chat_id = msg.get("chat_id") or ""
+    sender = (event.get("sender") or {}).get("sender_id") or {}
+    open_id = sender.get("open_id") or ""
+
+    try:
+        payload = fetch_request_total_1m_series()
+        reply = _format_monitoring_reply(payload)
+    except Exception as e:
+        logger.exception("monitoring fetch failed")
+        reply = f"监控数据拉取失败：{e}"
+
+    try:
+        if chat_id:
+            _lark_send_text("chat_id", chat_id, reply)
+        elif open_id:
+            _lark_send_text("open_id", open_id, reply)
+        else:
+            logger.warning("no chat_id or open_id; cannot reply")
+    except Exception as e:
+        logger.exception("lark send failed: %s", e)
+
+    return jsonify({}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
@@ -217,8 +335,11 @@ def webhook_event():
             return jsonify({"error": "invalid verification token"}), 403
         return jsonify({"challenge": challenge})
 
-    # Other Lark events: extend here (e.g. message, card actions)
-    logger.info("event received: %s", data.get("header", data) if isinstance(data, dict) else data)
+    et = (data.get("header") or {}).get("event_type")
+    if et == "im.message.receive_v1":
+        return _handle_im_message_receive(data)
+
+    logger.info("event ignored: %s", et)
     return jsonify({})
 
 
