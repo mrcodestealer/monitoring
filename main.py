@@ -49,6 +49,7 @@ _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
 _lark_open_api_domain_override: Optional[str] = None
+_lark_ws_transport_log_installed: bool = False
 
 GRAFANA_BASE_URL = os.getenv("GRAFANA_BASE_URL", "https://grafana.client8.me").rstrip("/")
 GRAFANA_DASHBOARD_PATH = os.getenv(
@@ -910,15 +911,28 @@ def _lark_ws_patch_dispatcher_inbound_log(handler: Any) -> None:
     def _wrapped(payload: bytes) -> Any:
         et_log: Any = None
         try:
-            obj = json.loads(payload.decode("utf-8"))
+            obj = json.loads(payload.decode("utf-8", errors="replace"))
             h = obj.get("header") if isinstance(obj.get("header"), dict) else {}
             et_log = h.get("event_type")
-            if et_log and str(et_log).startswith("im."):
-                logger.info("Lark WS inbound event_type=%r", et_log)
-            elif et_log:
-                logger.debug("Lark WS inbound event_type=%r", et_log)
+            if et_log:
+                logger.info(
+                    "Lark WS inbound event_type=%r schema=%r",
+                    et_log,
+                    obj.get("schema"),
+                )
+            else:
+                logger.info(
+                    "Lark WS inbound (no header.event_type) top_keys=%r event_keys=%r",
+                    list(obj.keys())[:14],
+                    list((obj.get("event") or {}).keys())[:14] if isinstance(obj.get("event"), dict) else None,
+                )
         except Exception as ex:
-            logger.warning("Lark WS payload peek failed: %s first=%r", ex, payload[:72])
+            logger.warning(
+                "Lark WS payload not JSON (%s) len=%s head=%r",
+                ex,
+                len(payload),
+                payload[:80],
+            )
         try:
             return orig(payload)
         except Exception as e:
@@ -933,6 +947,36 @@ def _lark_ws_patch_dispatcher_inbound_log(handler: Any) -> None:
             raise
 
     handler.do_without_validation = _wrapped  # type: ignore[method-assign]
+
+
+def _lark_ws_install_transport_frame_log_once() -> None:
+    """
+    Log every DATA-frame ``header.type`` (e.g. ``event`` / ``card``). If you never see ``type=event`` when
+    chatting, the server is not receiving business callbacks on this socket (console subscription / another client).
+    """
+    global _lark_ws_transport_log_installed
+    if _lark_ws_transport_log_installed:
+        return
+    if os.getenv("LARK_WS_TRANSPORT_LOG", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    _lark_ws_transport_log_installed = True
+    from lark_oapi.ws import client as _lark_ws_client_mod
+    from lark_oapi.ws.const import HEADER_TYPE
+
+    LarkCls = _lark_ws_client_mod.Client
+    _orig_hdf = LarkCls._handle_data_frame
+
+    async def _logged_handle_data_frame(self: Any, frame: Any) -> None:
+        try:
+            hs = frame.headers
+            t = _lark_ws_client_mod._get_by_key(hs, HEADER_TYPE)
+            plen = len(frame.payload or b"")
+            logger.info("Lark WS DATA frame header.type=%r payload_len=%s", t, plen)
+        except Exception as ex:
+            logger.warning("Lark WS DATA frame log failed: %s", ex)
+        return await _orig_hdf(self, frame)
+
+    LarkCls._handle_data_frame = _logged_handle_data_frame  # type: ignore[method-assign]
 
 
 def _lark_ws_domain_try_order() -> List[str]:
@@ -986,12 +1030,21 @@ def start_lark_ws_client_blocking() -> None:
     pmap = getattr(handler, "_processorMap", None) or {}
     logger.info("Lark WS p2 processors registered: %s", sorted(pmap.keys()))
     _lark_ws_patch_dispatcher_inbound_log(handler)
+    _lark_ws_install_transport_frame_log_once()
 
     level_name = (os.getenv("LARK_WS_LOG_LEVEL") or "INFO").strip().upper()
     log_level = getattr(LogLevel, level_name, LogLevel.INFO)
+    if os.getenv("LARK_WS_SDK_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
+        log_level = LogLevel.DEBUG
+        logger.info("LARK_WS_SDK_DEBUG=1 — Lark SDK internal logs at DEBUG")
 
     logger.warning(
         "长连接为集群投递：同 APP 若有多条 WS 或其它实例，仅随机一台会收到消息；请只保留一个 monitoring 进程。"
+    )
+    logger.warning(
+        "若发消息后始终没有「Lark WS DATA frame」或「Lark WS inbound」日志：请到飞书开发者后台确认 "
+        "「事件与回调」订阅方式为「使用长连接接收事件」并已保存成功（保存时本进程须在线）；"
+        "且已订阅「接收消息」并具备群 @ 等权限；勿与「将回调发送至开发者服务器」混用。"
     )
 
     last_domain_err: Optional[BaseException] = None

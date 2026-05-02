@@ -16,6 +16,8 @@ Env::
   LARK_WS_LOG_LEVEL=INFO    # DEBUG|INFO|WARNING|ERROR for SDK WS logs
   LARK_WS_USE_HTTP_KEYS=0   # 1=把 LARK_ENCRYPT_KEY/VERIFICATION_TOKEN 传给 WS handler（一般勿开；长连接文档要求空）
   LARK_WS_EXTRA_IM_TYPES=   # 逗号分隔的额外 event_type，与 receive_v1 同形时挂同一 handler（见 journal 里 no handler 提示）
+  LARK_WS_TRANSPORT_LOG=1   # 0=关闭；默认 1 在每条 WS DATA 帧打 header.type（event/card）与长度，便于判断是否收到推送
+  LARK_WS_SDK_DEBUG=0       # 1=Lark SDK 内部 DEBUG（含 payload 片段）
 
 Usage::
 
