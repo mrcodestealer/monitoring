@@ -1,40 +1,18 @@
 #!/usr/bin/env python3
 """
-Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana（.env 配置）。
+Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 
-启动::
+启动: ``python main.py``
 
-  python main.py
+**配置**：编辑本文件顶部 ``_CFG`` 字典（不再读取 ``.env``）。也可用 **systemd ``Environment=KEY=value``** 覆盖同名键。
 
-**默认 ``LARK_EVENT_MODE=ws``** — Feishu/Lark **长连接**（``lark_oapi.ws.Client``）：无需公网 Request URL。
-IM 事件仅通过 WebSocket DATA 帧下发（journalctl 不会出现 ``POST /webhook/event``）。
-可选并行 HTTP（``ENABLE_HTTP=1``）：``/health``、``/grafana/ping``、``/webhook/event``。
+**默认 ``LARK_EVENT_MODE=ws``** — 长连接；可选 ``ENABLE_HTTP=1`` 并行 HTTP。
 
-**``LARK_EVENT_MODE=http``** — 仅 Flask/Waitress 监听 ``PORT``（默认 5002），事件走 ``POST /webhook/event``。
+**``LARK_EVENT_MODE=http``** — 仅 Waitress 监听 ``PORT``，事件走 ``POST /webhook/event``。
 
-Env::
+飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-  LARK_EVENT_MODE=ws|http     # default ws
-  ENABLE_HTTP=0|1           # default 1 when ws (HTTP sidecar); ignored when http
-  PORT=5002
-  LARK_WEBHOOK_PUBLIC_URL=  # optional hint logged in http mode
-  WAITRESS_THREADS=24
-  LARK_WS_LOG_LEVEL=INFO
-  LARK_WS_USE_HTTP_KEYS=0
-  LARK_WS_EXTRA_IM_TYPES=
-  LARK_WS_TRANSPORT_LOG=1
-  LARK_WS_BOOTSTRAP_FRAMES=16
-  LARK_WS_LOG_FRAME_METHOD=0
-  LARK_WS_SDK_DEBUG=0
-  LARK_WEBHOOK_WSGI_LOG=0    # 1=WSGI 层 /webhook 诊断日志（默认关，避免 journald 拖慢校验）
-  LARK_WEBHOOK_TIMING_LOG=0   # 1=POST /webhook/event 耗时日志（默认关）
-
-飞书后台「事件与回调」→ 长连接或 HTTP；订阅「接收消息」；``APP_ID`` / ``APP_SECRET`` 必填。
-默认 ``LARK_HOST=https://open.feishu.cn``；国际 Lark ``https://open.larksuite.com``。
-
-群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要。
-
-HTTP 回调：飞书约 **3s** 内须 **200**；IM 先返回 ``{}``，再在后台拉 Grafana 并发消息。
+群/at 机器人发 /monitoring → Grafana 摘要。HTTP 回调先返回 ``{}`` 再后台处理。
 """
 
 import base64
@@ -47,12 +25,74 @@ import re
 import threading
 import time
 import warnings
-from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
-from dotenv import load_dotenv
 from flask import Flask, Response, g, jsonify, request
+
+# ---------------------------------------------------------------------------
+# 单一配置：只改这里（也可用 systemd Environment= 覆盖同名变量，无需 .env）
+# 勿将含真实密钥的 main.py 提交到公开仓库；泄露请到飞书/Grafana 后台轮换。
+# ---------------------------------------------------------------------------
+_CFG: Dict[str, Any] = {
+    "PORT": 5002,
+    "LARK_EVENT_MODE": "http",
+    "ENABLE_HTTP": "1",
+    "WAITRESS_THREADS": 24,
+    "LARK_HOST": "https://open.larksuite.com",
+    "LARK_WEBHOOK_PUBLIC_URL": "http://47.84.112.211:5002/webhook/event",
+    "GRAFANA_BASE_URL": "https://grafana.client8.me",
+    "GRAFANA_DASHBOARD_PATH": "/d/281e8816-ccb0-4335-922b-6b248491fd28/core-metrics-arms-aliyun",
+    "GRAFANA_DASHBOARD_UID": "281e8816-ccb0-4335-922b-6b248491fd28",
+    "GRAFANA_PANEL_TITLE": "请求总数/1m",
+    "GRAFANA_DASHBOARD_FROM": "now-10m",
+    "GRAFANA_DASHBOARD_TO": "now",
+    "GRAFANA_QUERY_STEP": 60,
+    "GRAFANA_QUERY_LOOKBACK_SECONDS": 600,
+    "GRAFANA_USER": "om_duty",
+    "GRAFANA_PASSWORD": "",
+    "VERIFICATION_TOKEN": "",
+    "APP_ID": "cli_a97fcc6df7615ed1",
+    "APP_SECRET": "",
+    "MONITORING_TRIGGER": "/monitoring",
+    "LARK_ENCRYPT_KEY": "",
+    "LARK_BOT_OPEN_ID": "",
+    "LARK_WS_LOG_LEVEL": "INFO",
+    "LARK_WS_USE_HTTP_KEYS": "0",
+    "LARK_WS_EXTRA_IM_TYPES": "",
+    "LARK_WS_TRANSPORT_LOG": "1",
+    "LARK_WS_BOOTSTRAP_FRAMES": 16,
+    "LARK_WS_LOG_FRAME_METHOD": "0",
+    "LARK_WS_SDK_DEBUG": "0",
+    "LARK_WEBHOOK_WSGI_LOG": "0",
+    "LARK_WEBHOOK_TIMING_LOG": "0",
+}
+
+
+def _cfg_raw(key: str) -> Any:
+    """``os.environ`` wins (systemd), else ``_CFG``."""
+    if key in os.environ and str(os.environ.get(key, "")).strip() != "":
+        return os.environ[key]
+    return _CFG.get(key)
+
+
+def _cfg_str(key: str, default: str = "") -> str:
+    v = _cfg_raw(key)
+    if v is None:
+        return default
+    s = str(v).strip()
+    return s if s else default
+
+
+def _cfg_int(key: str, default: int) -> int:
+    v = _cfg_raw(key)
+    if v is None or (isinstance(v, str) and not str(v).strip()):
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
 
 # ``lark_oapi`` → ``ws/pb/google/__init__.py`` uses ``pkg_resources.declare_namespace`` (no upstream fix yet).
 warnings.filterwarnings(
@@ -61,15 +101,15 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-# Load project .env even when systemd cwd is / (not only when EnvironmentFile= is set).
-load_dotenv(Path(__file__).resolve().parent / ".env")
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def _lark_env_truthy(key: str) -> bool:
-    return os.getenv(key, "").strip().lower() in ("1", "true", "yes", "on")
+    v = _cfg_raw(key)
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 app = Flask(__name__)
@@ -165,34 +205,41 @@ _lark_ws_saw_data_frame: bool = False
 _LARK_WS_BOOTSTRAP_FRAMES_DEFAULT = 16
 _lark_ws_bootstrap_frames_left: int = 0
 
-GRAFANA_BASE_URL = os.getenv("GRAFANA_BASE_URL", "https://grafana.client8.me").rstrip("/")
-GRAFANA_DASHBOARD_PATH = os.getenv(
+GRAFANA_BASE_URL = _cfg_str("GRAFANA_BASE_URL", "https://grafana.client8.me").rstrip("/")
+GRAFANA_DASHBOARD_PATH = _cfg_str(
     "GRAFANA_DASHBOARD_PATH",
     "/d/281e8816-ccb0-4335-922b-6b248491fd28/core-metrics-arms-aliyun",
 )
-GRAFANA_DASHBOARD_UID = os.getenv(
+GRAFANA_DASHBOARD_UID = _cfg_str(
     "GRAFANA_DASHBOARD_UID", "281e8816-ccb0-4335-922b-6b248491fd28"
 )
-GRAFANA_PANEL_TITLE = os.getenv("GRAFANA_PANEL_TITLE", "请求总数/1m")
+GRAFANA_PANEL_TITLE = _cfg_str("GRAFANA_PANEL_TITLE", "请求总数/1m")
 # Browser URL time range: last 10 minutes (matches “latest 10 mins”). Override e.g. now-1m if you want.
-GRAFANA_DASHBOARD_FROM = os.getenv("GRAFANA_DASHBOARD_FROM", "now-10m")
-GRAFANA_DASHBOARD_TO = os.getenv("GRAFANA_DASHBOARD_TO", "now")
+GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-10m")
+GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 # Prometheus query_range step (seconds); 60 → up to 10 buckets in 10m
-GRAFANA_QUERY_STEP = int(os.getenv("GRAFANA_QUERY_STEP", "60"))
-GRAFANA_QUERY_LOOKBACK_SECONDS = int(os.getenv("GRAFANA_QUERY_LOOKBACK_SECONDS", "600"))
-GRAFANA_USER = os.getenv("GRAFANA_USER") or os.getenv("GRAFANA_ID") or os.getenv("grafanaid")
-GRAFANA_PASSWORD = os.getenv("GRAFANA_PASSWORD") or os.getenv("grafanapassword")
-VERIFICATION_TOKEN = (os.getenv("VERIFICATION_TOKEN") or "").strip()
-# For Open API (e.g. send message) — see https://open.feishu.cn/document/ukTMukTMukTM/ukDNz4SO0MjL5QzM/auth-v3/auth/tenant_access_token_internal
-APP_ID = os.getenv("APP_ID")
-APP_SECRET = os.getenv("APP_SECRET")
-# Default matches ``lark_oapi.core.const.FEISHU_DOMAIN`` — 国际 Lark 请在 .env 设 LARK_HOST=https://open.larksuite.com
-LARK_HOST = os.getenv("LARK_HOST", "https://open.feishu.cn").rstrip("/")
-MONITORING_TRIGGER = os.getenv("MONITORING_TRIGGER", "/monitoring")
+GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
+GRAFANA_QUERY_LOOKBACK_SECONDS = _cfg_int("GRAFANA_QUERY_LOOKBACK_SECONDS", 600)
+GRAFANA_USER = (
+    _cfg_str("GRAFANA_USER")
+    or _cfg_str("GRAFANA_ID")
+    or _cfg_str("grafanaid")
+)
+GRAFANA_PASSWORD = _cfg_str("GRAFANA_PASSWORD") or _cfg_str("grafanapassword")
+VERIFICATION_TOKEN = _cfg_str("VERIFICATION_TOKEN", "").strip()
+# For Open API (e.g. send message) — see Lark auth tenant_access_token_internal
+APP_ID = _cfg_str("APP_ID", "").strip() or None
+APP_SECRET = _cfg_str("APP_SECRET", "").strip() or None
+# Default matches ``lark_oapi.core.const.FEISHU_DOMAIN`` — 国际 Lark 用 ``https://open.larksuite.com``（见 ``_CFG``）
+LARK_HOST = _cfg_str("LARK_HOST", "https://open.feishu.cn").rstrip("/")
+MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/monitoring")
 LARK_ENCRYPT_KEY = (
-    os.getenv("LARK_ENCRYPT_KEY") or os.getenv("ENCRYPT_KEY") or os.getenv("FEISHU_ENCRYPT_KEY") or ""
+    _cfg_str("LARK_ENCRYPT_KEY")
+    or _cfg_str("ENCRYPT_KEY")
+    or _cfg_str("FEISHU_ENCRYPT_KEY")
+    or ""
 ).strip()
-LARK_BOT_OPEN_ID = (os.getenv("LARK_BOT_OPEN_ID") or "").strip()
+LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
 
 # 群聊里富媒体等类型仍可能带可解析文本；仅跳过明显无 /monitoring 的类型。
 _SKIP_IM_MESSAGE_TYPES = frozenset(
@@ -1160,7 +1207,7 @@ def _lark_ws_patch_dispatcher_inbound_log(handler: Any) -> None:
 def _lark_ws_reset_bootstrap_frame_budget() -> int:
     """How many inbound WS protobuf frames to log at INFO on this connection (0 = off)."""
     global _lark_ws_bootstrap_frames_left
-    raw = (os.getenv("LARK_WS_BOOTSTRAP_FRAMES") or str(_LARK_WS_BOOTSTRAP_FRAMES_DEFAULT)).strip()
+    raw = str(_cfg_int("LARK_WS_BOOTSTRAP_FRAMES", _LARK_WS_BOOTSTRAP_FRAMES_DEFAULT))
     try:
         n = int(raw)
     except ValueError:
@@ -1190,7 +1237,7 @@ def _lark_ws_install_recv_frame_method_log(client_cls: Any) -> None:
 
     async def _wrapped_handle_message(self: Any, msg: bytes) -> None:
         global _lark_ws_bootstrap_frames_left
-        full = os.getenv("LARK_WS_LOG_FRAME_METHOD", "").strip().lower() in ("1", "true", "yes", "on")
+        full = _lark_env_truthy("LARK_WS_LOG_FRAME_METHOD")
         want_log = full or (_lark_ws_bootstrap_frames_left > 0)
         if want_log and not full:
             _lark_ws_bootstrap_frames_left -= 1
@@ -1220,7 +1267,7 @@ def _lark_ws_install_transport_frame_log(client_cls: Any) -> None:
     global _lark_ws_transport_log_installed, _lark_ws_saw_data_frame
     if _lark_ws_transport_log_installed:
         return
-    if os.getenv("LARK_WS_TRANSPORT_LOG", "1").strip().lower() in ("0", "false", "no", "off"):
+    if _cfg_str("LARK_WS_TRANSPORT_LOG", "1").strip().lower() in ("0", "false", "no", "off"):
         logger.info("Lark WS transport frame logging disabled (LARK_WS_TRANSPORT_LOG=0)")
         return
 
@@ -1308,11 +1355,11 @@ def start_lark_ws_client_blocking() -> None:
         "Reminder: with LARK_EVENT_MODE=ws, Feishu delivers IM events only on the WebSocket — "
         "expect journal lines like 'Lark WS recv frame.method=DATA' / 'Lark WS DATA frame', not POST /webhook/event."
     )
-    if os.getenv("LARK_WS_TRANSPORT_LOG", "1").strip().lower() not in ("0", "false", "no", "off"):
+    if _cfg_str("LARK_WS_TRANSPORT_LOG", "1").strip().lower() not in ("0", "false", "no", "off"):
         _lark_ws_start_no_data_watchdog()
 
     # 飞书「使用长连接接收事件」文档：builder 前两参须为 **空字符串**（勿传 HTTP 回调的 Encrypt/Verification）。
-    ws_use_http_keys = os.getenv("LARK_WS_USE_HTTP_KEYS", "").strip().lower() in ("1", "true", "yes", "on")
+    ws_use_http_keys = _lark_env_truthy("LARK_WS_USE_HTTP_KEYS")
     enc = (LARK_ENCRYPT_KEY or "") if ws_use_http_keys else ""
     ver = (VERIFICATION_TOKEN or "") if ws_use_http_keys else ""
     if ws_use_http_keys:
@@ -1329,7 +1376,7 @@ def start_lark_ws_client_blocking() -> None:
         .register_p2_im_message_receive_v1(_on_ws_p2_im_message_receive_v1)
         .register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
     )
-    for raw_t in (os.getenv("LARK_WS_EXTRA_IM_TYPES") or "").replace(";", ",").split(","):
+    for raw_t in _cfg_str("LARK_WS_EXTRA_IM_TYPES", "").replace(";", ",").split(","):
         t = raw_t.strip()
         if not t:
             continue
@@ -1340,9 +1387,9 @@ def start_lark_ws_client_blocking() -> None:
     logger.info("Lark WS p2 processors registered: %s", sorted(pmap.keys()))
     _lark_ws_patch_dispatcher_inbound_log(handler)
 
-    level_name = (os.getenv("LARK_WS_LOG_LEVEL") or "INFO").strip().upper()
+    level_name = _cfg_str("LARK_WS_LOG_LEVEL", "INFO").strip().upper()
     log_level = getattr(LogLevel, level_name, LogLevel.INFO)
-    if os.getenv("LARK_WS_SDK_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
+    if _lark_env_truthy("LARK_WS_SDK_DEBUG"):
         log_level = LogLevel.DEBUG
         logger.info("LARK_WS_SDK_DEBUG=1 — Lark SDK internal logs at DEBUG")
 
@@ -1600,8 +1647,8 @@ def run_monitoring_bot() -> None:
     Process entrypoint: HTTP-only, WebSocket-only, or WS + HTTP sidecar (see module docstring).
     Uses :data:`app`, :data:`logger`, :func:`start_lark_ws_client_blocking` from this module.
     """
-    port = int(os.getenv("PORT", "5002"))
-    raw_mode = (os.getenv("LARK_EVENT_MODE") or "ws").strip().lower()
+    port = _cfg_int("PORT", 5002)
+    raw_mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower()
     mode = raw_mode if raw_mode else "ws"
 
     def run_http() -> None:
@@ -1609,7 +1656,7 @@ def run_monitoring_bot() -> None:
             from waitress import serve
 
             try:
-                threads = int(os.getenv("WAITRESS_THREADS", "24"))
+                threads = _cfg_int("WAITRESS_THREADS", 24)
             except ValueError:
                 threads = 24
             threads = max(4, min(threads, 128))
@@ -1626,7 +1673,7 @@ def run_monitoring_bot() -> None:
 
     if mode == "http":
         logger.info("LARK_EVENT_MODE=http — Feishu events via POST /webhook/event only")
-        hint = (os.getenv("LARK_WEBHOOK_PUBLIC_URL") or "").strip()
+        hint = _cfg_str("LARK_WEBHOOK_PUBLIC_URL", "").strip()
         if hint:
             logger.info("Feishu developer console → 事件与回调 → Request URL (示例配置): %s", hint)
             if hint.lower().startswith("https://"):
@@ -1654,7 +1701,7 @@ def run_monitoring_bot() -> None:
     if mode != "ws":
         raise SystemExit(f"Unknown LARK_EVENT_MODE={mode!r} (use ws or http)")
 
-    http_on = os.getenv("ENABLE_HTTP", "1").strip().lower() in ("1", "true", "yes", "on")
+    http_on = _cfg_str("ENABLE_HTTP", "1").strip().lower() in ("1", "true", "yes", "on")
     http_thread: Optional[threading.Thread] = None
     if http_on:
         http_thread = threading.Thread(target=run_http, name="http-sidecar", daemon=False)
