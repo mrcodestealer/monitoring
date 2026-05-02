@@ -36,8 +36,21 @@ def main() -> None:
     # Import after load_dotenv so main.py sees the same env as this process.
     from main import app, logger  # noqa: WPS433 (import inside function)
 
+    # Waitress is more reliable than Flask's dev Werkzeug server for Feishu's POST + 3s budget.
+    try:
+        from waitress import serve
+
+        logger.info(
+            "Serving with Waitress on 0.0.0.0:%s (threads=8); /monitoring work stays async in main.py",
+            port,
+        )
+        serve(app, host="0.0.0.0", port=port, threads=8, channel_timeout=120)
+        return
+    except ImportError:
+        logger.warning("waitress not installed — pip install waitress; falling back to Flask dev server")
+
     logger.info(
-        "Monitoring bot listening on 0.0.0.0:%s — webhook returns quickly; /monitoring work is async",
+        "Monitoring bot (Flask dev server) on 0.0.0.0:%s — prefer: pip install waitress",
         port,
     )
     app.run(

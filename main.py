@@ -731,11 +731,13 @@ def health():
     return jsonify({"ok": True})
 
 
-@app.route("/webhook/event", methods=["GET", "POST", "OPTIONS"])
+@app.route("/webhook/event", methods=["GET", "POST", "OPTIONS", "HEAD"])
 def webhook_event():
     # Chatbox: OPTIONS must not 405 — some clients preflight the callback URL.
     if request.method == "OPTIONS":
         return "", 204
+    if request.method == "HEAD":
+        return "", 200
 
     if request.method == "GET":
         # No secrets — use to confirm env + URL reachability from browser/curl.
@@ -751,6 +753,10 @@ def webhook_event():
             {
                 "ok": True,
                 "hint": "Feishu must POST JSON to this path for events.",
+                "url_protocol_tip": (
+                    "Lark 请求 URL 校验走 POST。若控制台填了 https:// 而本服务只监听 http://（无 TLS），"
+                    "客户端会一直握手直到约 3s 超时 — 请改为 http://IP:5002/webhook/event，或在前面加 Nginx/证书。"
+                ),
                 "lark_host": LARK_HOST,
                 "lark_oapi_installed": lark_sdk_version is not None,
                 "lark_oapi_version": lark_sdk_version,
@@ -771,12 +777,34 @@ def webhook_event():
                     "lark_oapi_installed=false 只影响发消息，不影响「请求 URL 校验」；校验失败多半是 VERIFICATION_TOKEN 与后台不一致。",
                     "若用 systemd：进程里可能没有 .env — 请在 unit 里 EnvironmentFile=/path/to/.env 或 Environment=VERIFICATION_TOKEN=… 后 systemctl daemon-reload && restart。",
                     "若飞书提示 3s 超时：云厂商安全组/防火墙须放行公网入站 TCP 5002；本机 curl -m 5 -X POST http://IP:5002/webhook/event -H Content-Type:application/json -d '{...}' 测连通。",
+                    "仍超时：核对飞书里填的 URL 是 http 还是 https，须与监听一致；点校验时 journalctl -u monitoringbot -f 看是否出现 POST /webhook/event。",
                 ],
             }
         )
 
+    if request.method == "POST":
+        logger.info(
+            "webhook POST remote=%s len=%s ct=%r",
+            request.remote_addr,
+            request.content_length,
+            (request.headers.get("Content-Type") or "")[:120],
+        )
+
     raw_in = _lark_safe_parse_json_body(request)
     if raw_in is None:
+        snip = ""
+        try:
+            raw_b = request.get_data(cache=False, as_text=True)
+            if raw_b:
+                snip = raw_b[:300].replace("\n", " ")
+        except Exception:
+            pass
+        logger.warning(
+            "webhook POST body not JSON remote=%s ct=%r snip=%r",
+            request.remote_addr,
+            (request.headers.get("Content-Type") or ""),
+            snip,
+        )
         return jsonify({"error": "invalid json"}), 400
 
     if isinstance(raw_in, dict):
