@@ -570,13 +570,6 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     event = data.get("event") or {}
     msg = event.get("message") or {}
     mid = (msg.get("message_id") or "").strip()
-    if mid:
-        if mid in _processed_lark_message_ids:
-            logger.info("duplicate message_id=%s skipped (Chatbox-style dedup)", mid)
-            return jsonify({"success": True}), 200
-        _processed_lark_message_ids.add(mid)
-        if len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
-            _processed_lark_message_ids.clear()
     mtype = (msg.get("message_type") or "").lower()
     if mtype and mtype not in ("text", "post"):
         logger.info("im.message ignored: message_type=%r", mtype)
@@ -600,6 +593,12 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
         )
         return jsonify({"success": True}), 200
 
+    # Dedupe only *after* trigger matches. Never register message_id before a successful send —
+    # otherwise Lark retries the same message_id would be skipped and the user would see no reply.
+    if mid and mid in _processed_lark_message_ids:
+        logger.info("duplicate message_id=%s — already replied, skip", mid)
+        return jsonify({"success": True}), 200
+
     chat_id = (msg.get("chat_id") or msg.get("open_chat_id") or "").strip()
     open_id = sender_open
 
@@ -610,15 +609,29 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
         logger.exception("monitoring fetch failed")
         reply = f"监控数据拉取失败：{e}"
 
+    sent = False
     try:
         if chat_id:
             _lark_send_text("chat_id", chat_id, reply)
+            sent = True
+            logger.info(
+                "monitoring reply sent receive_id_type=chat_id chat_id_prefix=%s... len=%s",
+                chat_id[:16],
+                len(reply),
+            )
         elif open_id:
             _lark_send_text("open_id", open_id, reply)
+            sent = True
+            logger.info("monitoring reply sent receive_id_type=open_id len=%s", len(reply))
         else:
             logger.warning("no chat_id/open_chat_id or sender open_id; cannot reply. msg keys=%s", list(msg.keys()))
     except Exception as e:
         logger.exception("lark send failed: %s", e)
+
+    if sent and mid:
+        _processed_lark_message_ids.add(mid)
+        if len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
+            _processed_lark_message_ids.clear()
 
     return jsonify({"success": True}), 200
 
@@ -628,11 +641,35 @@ def health():
     return jsonify({"ok": True})
 
 
-@app.route("/webhook/event", methods=["POST", "OPTIONS"])
+@app.route("/webhook/event", methods=["GET", "POST", "OPTIONS"])
 def webhook_event():
     # Chatbox: OPTIONS must not 405 — some clients preflight the callback URL.
     if request.method == "OPTIONS":
         return "", 204
+
+    if request.method == "GET":
+        # No secrets — use to confirm env + URL reachability from browser/curl.
+        app_id = (APP_ID or "").strip()
+        return jsonify(
+            {
+                "ok": True,
+                "hint": "Feishu must POST JSON to this path for events.",
+                "lark_host": LARK_HOST,
+                "app_id_prefix": (app_id[:12] + "…") if len(app_id) > 12 else app_id,
+                "verification_token_configured": bool(VERIFICATION_TOKEN),
+                "app_secret_configured": bool(APP_SECRET),
+                "encrypt_key_configured": bool(LARK_ENCRYPT_KEY),
+                "grafana_user_configured": bool(GRAFANA_USER),
+                "checklist_cn": [
+                    "事件与回调 Request URL 必须指向本服务 POST /webhook/event（公网可达）。",
+                    "订阅「消息与群组」→「接收消息 v2.0」；群内需权限：@机器人消息 (im:message.group_at_msg) 或群全量消息权限。",
+                    "VERIFICATION_TOKEN 与后台「Verification Token」一致（无多余空格）。",
+                    "国内飞书应用将 LARK_HOST 设为 https://open.feishu.cn；国际用 https://open.larksuite.com。",
+                    "机器人需能力「机器人」+ 权限「以应用身份发消息」等，且机器人在目标群内。",
+                    "发 /monitoring 后看服务日志：handling im.message / monitoring reply sent / lark send failed。",
+                ],
+            }
+        )
 
     raw_in = _lark_safe_parse_json_body(request)
     if raw_in is None:
@@ -676,7 +713,12 @@ def webhook_event():
         return jsonify({"success": True})
 
     if et in ("im.message.receive_v1", "im.message.receive_v2"):
-        logger.info("handling %s", et)
+        logger.info(
+            "handling %s message_id=%r chat_id_prefix=%s",
+            et,
+            ((data.get("event") or {}).get("message") or {}).get("message_id"),
+            str(((data.get("event") or {}).get("message") or {}).get("chat_id") or "")[:12],
+        )
         return _handle_im_message_receive(data)
 
     logger.info(
