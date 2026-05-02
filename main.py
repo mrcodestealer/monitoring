@@ -372,15 +372,25 @@ def fetch_grafana_dashboard(
 
 
 def _extract_url_verification(data: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-    """Return (token, challenge) if this is a Lark URL verification payload (schema 2.0 or flat)."""
+    """
+    Return (token_hint, challenge) for Lark URL verification.
+
+    Schema 2.0: ``challenge`` is in ``event``; Verification Token is usually in
+    ``header.token`` (not ``event.token``). Callers should prefer
+    :func:`_lark_extract_verification_token` for the actual token compare.
+    """
     if not isinstance(data, dict):
         return None
     if _lark_header_event_type(data) == "url_verification":
         ev = data.get("event") or {}
         ch = ev.get("challenge")
+        if ch is None:
+            return None
         tok = ev.get("token")
-        if ch is not None:
-            return (str(tok or ""), str(ch))
+        if tok is None or (isinstance(tok, str) and not str(tok).strip()):
+            h = data.get("header") if isinstance(data.get("header"), dict) else {}
+            tok = h.get("token") or h.get("Token") or h.get("verification_token")
+        return (str(tok or ""), str(ch))
     if data.get("type") == "url_verification":
         return (str(data.get("token") or ""), str(data.get("challenge") or ""))
     return None
@@ -709,6 +719,7 @@ def webhook_event():
                     "发 /monitoring 后看日志：handling im.message / monitoring background job / monitoring reply sent (background)。",
                     "飞书约 3s 超时：请用 python connect.py 启动；webhook 先 200，Grafana 在后台线程执行。",
                     "发消息依赖 lark-oapi：pip install -U lark-oapi；GET 本 URL 可查看 lark_oapi_version。",
+                    "lark_oapi_installed=false 只影响发消息，不影响「请求 URL 校验」；校验失败多半是 VERIFICATION_TOKEN 与后台不一致。",
                 ],
             }
         )
@@ -735,10 +746,15 @@ def webhook_event():
 
     uv = _extract_url_verification(data)
     if uv:
-        token, challenge = uv
-        if VERIFICATION_TOKEN and str(token).strip() != VERIFICATION_TOKEN:
-            logger.warning("url_verification token mismatch")
-            return jsonify({"error": "invalid verification token"}), 403
+        token_from_event, challenge = uv
+        # Prefer header.token (schema 2.0); event.token is often absent → was causing 403 "verify failed".
+        if VERIFICATION_TOKEN:
+            effective_tok = _lark_extract_verification_token(data) or str(token_from_event or "").strip()
+            if effective_tok != VERIFICATION_TOKEN:
+                logger.warning(
+                    "url_verification token mismatch — copy Verification Token from 事件与回调 into VERIFICATION_TOKEN"
+                )
+                return jsonify({"error": "invalid verification token"}), 403
         return jsonify({"challenge": challenge})
 
     if not _lark_verify_event_token(data):
