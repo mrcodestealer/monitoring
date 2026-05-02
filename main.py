@@ -97,6 +97,31 @@ _SKIP_IM_MESSAGE_TYPES = frozenset(
 )
 
 
+def _lark_dict_pick_str(d: Any, *keys: str) -> str:
+    """Lark payloads may use snake_case (HTTP) or camelCase (WebSocket / international)."""
+    if not isinstance(d, dict):
+        return ""
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def _lark_message_chat_id(msg: Dict[str, Any]) -> str:
+    """Group / topic chat id for ``create_message`` (``receive_id_type=chat_id``)."""
+    cid = _lark_dict_pick_str(msg, "chat_id", "chatId", "open_chat_id", "openChatId")
+    if cid:
+        return cid
+    c = msg.get("container")
+    if isinstance(c, dict):
+        return _lark_dict_pick_str(c, "chat_id", "chatId", "open_chat_id", "openChatId")
+    return ""
+
+
 def _feishu_decrypt_encrypt_field(ciphertext_b64: str, encrypt_key: str) -> str:
     """Decrypt Lark ``encrypt`` field (AES-256-CBC + PKCS7), same as Feishu open-platform samples."""
     try:
@@ -296,8 +321,16 @@ def _lark_extract_plain_text_from_message(msg: Dict[str, Any]) -> str:
     """Support ``text`` and rich ``post`` bodies (common when @mentioning in mobile clients)."""
     if not isinstance(msg, dict):
         return ""
-    content_str = msg.get("content") or "{}"
-    mtype = (msg.get("message_type") or "").lower()
+    raw_c = msg.get("content")
+    if raw_c is None:
+        raw_c = msg.get("body")
+    if isinstance(raw_c, dict):
+        content_str = json.dumps(raw_c, ensure_ascii=False)
+    elif isinstance(raw_c, str):
+        content_str = raw_c or "{}"
+    else:
+        content_str = "{}"
+    mtype = (_lark_dict_pick_str(msg, "message_type", "messageType") or "").lower()
     try:
         obj = json.loads(content_str)
     except (json.JSONDecodeError, TypeError):
@@ -847,8 +880,16 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     event = data.get("event") if isinstance(data.get("event"), dict) else {}
     raw_msg = event.get("message")
     msg = raw_msg if isinstance(raw_msg, dict) else {}
-    mid = (msg.get("message_id") or "").strip()
-    mtype = (msg.get("message_type") or "").lower()
+    mid = _lark_dict_pick_str(msg, "message_id", "messageId")
+    mtype = (_lark_dict_pick_str(msg, "message_type", "messageType") or "").lower()
+    chat_resolved = _lark_message_chat_id(msg)
+    logger.info(
+        "im.message mid=%r mtype=%r chat_prefix=%r",
+        mid or None,
+        mtype or None,
+        (chat_resolved[:12] + "…") if len(chat_resolved) > 12 else (chat_resolved or None),
+    )
+    logger.debug("im.message msg_keys=%s", list(msg.keys())[:24] if isinstance(msg, dict) else [])
     if mtype and mtype in _SKIP_IM_MESSAGE_TYPES:
         logger.info("im.message ignored (non-textual): message_type=%r", mtype)
         return
@@ -856,14 +897,14 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     send_wrap = event.get("sender")
     if not isinstance(send_wrap, dict):
         send_wrap = {}
-    sid = send_wrap.get("sender_id")
+    sid = send_wrap.get("sender_id") or send_wrap.get("senderId")
     if isinstance(sid, dict):
         sender = sid
     elif sid is not None and hasattr(sid, "open_id"):
         sender = _serialize_lark_user_id(sid)
     else:
         sender = {}
-    sender_open = (sender.get("open_id") or "").strip()
+    sender_open = _lark_dict_pick_str(sender, "open_id", "openId", "user_id", "userId")
     if LARK_BOT_OPEN_ID and sender_open == LARK_BOT_OPEN_ID:
         return
 
@@ -885,8 +926,15 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         logger.info("duplicate message_id=%s — already replied, skip", mid)
         return
 
-    chat_id = (msg.get("chat_id") or msg.get("open_chat_id") or "").strip()
+    chat_id = chat_resolved
     open_id = sender_open
+
+    logger.info(
+        "monitoring trigger matched — background job mid=%r chat_id=%r open_id_prefix=%r",
+        mid,
+        bool(chat_id),
+        (open_id[:12] + "…") if len(open_id) > 12 else open_id,
+    )
 
     threading.Thread(
         target=_monitoring_background_worker,
@@ -902,9 +950,9 @@ def _ws_log_message_snip(data: Dict[str, Any]) -> Tuple[Any, Any, str]:
     msg = ev.get("message") or {}
     if not isinstance(msg, dict):
         msg = {}
-    mid = msg.get("message_id")
-    mtype = msg.get("message_type")
-    chat = str(msg.get("chat_id") or "")[:12]
+    mid = _lark_dict_pick_str(msg, "message_id", "messageId") or None
+    mtype = _lark_dict_pick_str(msg, "message_type", "messageType") or None
+    chat = (_lark_message_chat_id(msg) or "")[:12]
     return mid, mtype, chat
 
 
