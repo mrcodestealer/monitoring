@@ -15,13 +15,15 @@ import os
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
-load_dotenv()
+# Load project .env even when systemd cwd is / (not only when EnvironmentFile= is set).
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -371,29 +373,47 @@ def fetch_grafana_dashboard(
     return resp
 
 
+def _lark_is_url_verification_payload(data: Dict[str, Any]) -> bool:
+    """True for challenge/URL verification POST (several Feishu/Lark body shapes)."""
+    if not isinstance(data, dict):
+        return False
+    if _lark_header_event_type(data) == "url_verification":
+        return True
+    if data.get("type") == "url_verification":
+        return True
+    ev = data.get("event")
+    if isinstance(ev, dict) and str(ev.get("type") or "").strip() == "url_verification":
+        return True
+    return False
+
+
 def _extract_url_verification(data: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     """
     Return (token_hint, challenge) for Lark URL verification.
 
-    Schema 2.0: ``challenge`` is in ``event``; Verification Token is usually in
-    ``header.token`` (not ``event.token``). Callers should prefer
-    :func:`_lark_extract_verification_token` for the actual token compare.
+    Challenge may live in ``event.challenge``, or top-level ``challenge`` if a proxy
+    flattened the JSON. Token: prefer :func:`_lark_extract_verification_token` at call site.
     """
     if not isinstance(data, dict):
         return None
-    if _lark_header_event_type(data) == "url_verification":
-        ev = data.get("event") or {}
-        ch = ev.get("challenge")
-        if ch is None:
-            return None
-        tok = ev.get("token")
-        if tok is None or (isinstance(tok, str) and not str(tok).strip()):
-            h = data.get("header") if isinstance(data.get("header"), dict) else {}
-            tok = h.get("token") or h.get("Token") or h.get("verification_token")
-        return (str(tok or ""), str(ch))
+    if not _lark_is_url_verification_payload(data):
+        return None
+
     if data.get("type") == "url_verification":
         return (str(data.get("token") or ""), str(data.get("challenge") or ""))
-    return None
+
+    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+    ch = ev.get("challenge")
+    if ch is None:
+        ch = data.get("challenge")
+    if ch is None:
+        return None
+
+    tok = ev.get("token")
+    if tok is None or (isinstance(tok, str) and not str(tok).strip()):
+        h = data.get("header") if isinstance(data.get("header"), dict) else {}
+        tok = h.get("token") or h.get("Token") or h.get("verification_token")
+    return (str(tok or ""), str(ch))
 
 
 def _lark_ack_only_event_type(het: str) -> bool:
@@ -720,6 +740,7 @@ def webhook_event():
                     "飞书约 3s 超时：请用 python connect.py 启动；webhook 先 200，Grafana 在后台线程执行。",
                     "发消息依赖 lark-oapi：pip install -U lark-oapi；GET 本 URL 可查看 lark_oapi_version。",
                     "lark_oapi_installed=false 只影响发消息，不影响「请求 URL 校验」；校验失败多半是 VERIFICATION_TOKEN 与后台不一致。",
+                    "若用 systemd：进程里可能没有 .env — 请在 unit 里 EnvironmentFile=/path/to/.env 或 Environment=VERIFICATION_TOKEN=… 后 systemctl daemon-reload && restart。",
                 ],
             }
         )
@@ -742,7 +763,8 @@ def webhook_event():
 
     # Legacy flat URL challenge — Chatbox returns before global token check.
     if data.get("type") == "url_verification":
-        return jsonify({"challenge": data.get("challenge", "")})
+        ch0 = data.get("challenge", "")
+        return jsonify({"challenge": str(ch0) if ch0 is not None else ""})
 
     uv = _extract_url_verification(data)
     if uv:
@@ -752,10 +774,15 @@ def webhook_event():
             effective_tok = _lark_extract_verification_token(data) or str(token_from_event or "").strip()
             if effective_tok != VERIFICATION_TOKEN:
                 logger.warning(
-                    "url_verification token mismatch — copy Verification Token from 事件与回调 into VERIFICATION_TOKEN"
+                    "url_verification token mismatch (exp_len=%s got_len=%s) — "
+                    "copy Verification Token from 飞书 事件与回调 into VERIFICATION_TOKEN; "
+                    "if using systemd, set EnvironmentFile= to the .env that contains it",
+                    len(VERIFICATION_TOKEN),
+                    len(effective_tok or ""),
                 )
                 return jsonify({"error": "invalid verification token"}), 403
-        return jsonify({"challenge": challenge})
+        logger.info("url_verification OK, echoing challenge (len=%s)", len(str(challenge)))
+        return jsonify({"challenge": str(challenge)})
 
     if not _lark_verify_event_token(data):
         logger.warning(
