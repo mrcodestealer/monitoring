@@ -6,9 +6,12 @@ Public URL example: http://47.84.112.211:5002/webhook/event
 群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要。
 """
 
+import base64
+import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
@@ -46,6 +49,142 @@ APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
 LARK_HOST = os.getenv("LARK_HOST", "https://open.larksuite.com").rstrip("/")
 MONITORING_TRIGGER = os.getenv("MONITORING_TRIGGER", "/monitoring")
+LARK_ENCRYPT_KEY = (
+    os.getenv("LARK_ENCRYPT_KEY") or os.getenv("ENCRYPT_KEY") or os.getenv("FEISHU_ENCRYPT_KEY") or ""
+).strip()
+LARK_BOT_OPEN_ID = (os.getenv("LARK_BOT_OPEN_ID") or "").strip()
+
+
+def _feishu_decrypt_encrypt_field(ciphertext_b64: str, encrypt_key: str) -> str:
+    """Decrypt Lark ``encrypt`` field (AES-256-CBC + PKCS7), same as Feishu open-platform samples."""
+    try:
+        from Crypto.Cipher import AES
+    except ImportError as e:
+        raise ImportError("pip install pycryptodome") from e
+
+    bs = AES.block_size
+    key = hashlib.sha256(encrypt_key.encode("utf-8")).digest()
+    enc = base64.b64decode(ciphertext_b64)
+    iv = enc[:bs]
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    raw = cipher.decrypt(enc[bs:])
+    pad_len = raw[-1]
+    if pad_len < 1 or pad_len > bs:
+        raise ValueError("invalid PKCS7 padding")
+    raw = raw[:-pad_len]
+    return raw.decode("utf-8")
+
+
+def _feishu_maybe_decrypt_webhook_payload(raw: Any) -> Any:
+    """
+    When 开发者后台 → 事件与回调 enables Encrypt Key, POST body is only ``{"encrypt":"..."}``.
+    Set LARK_ENCRYPT_KEY to the same key (or turn encryption off in console).
+    """
+    if not isinstance(raw, dict) or "encrypt" not in raw:
+        return raw
+    if not LARK_ENCRYPT_KEY:
+        logger.warning(
+            "Lark POST has `encrypt` but LARK_ENCRYPT_KEY is unset — "
+            "set it or disable encryption in 事件与回调; events will be ignored."
+        )
+        return raw
+    try:
+        plain = _feishu_decrypt_encrypt_field(str(raw["encrypt"]), LARK_ENCRYPT_KEY)
+        if plain.startswith("\ufeff"):
+            plain = plain.lstrip("\ufeff")
+        return json.loads(plain)
+    except ImportError as e:
+        logger.error("%s — encrypted webhooks need pycryptodome.", e)
+        return raw
+    except Exception as e:
+        logger.exception("Lark decrypt failed: %s", e)
+        return raw
+
+
+def _lark_legacy_event_callback_message_to_v2(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Old ``type: event_callback`` + ``event.type: message`` → schema-2-like dict for one code path."""
+    if data.get("type") != "event_callback":
+        return None
+    ev = data.get("event")
+    if not isinstance(ev, dict) or ev.get("type") != "message":
+        return None
+    token = str(data.get("token") or (data.get("header") or {}).get("token") or "")
+    chat_id = ev.get("open_chat_id") or ev.get("chat_id") or ""
+    text_raw = ev.get("text_without_at_bot") or ev.get("text") or ""
+    if not text_raw and ev.get("content"):
+        try:
+            c = json.loads(ev["content"])
+            text_raw = c.get("text") or ""
+        except (json.JSONDecodeError, TypeError):
+            text_raw = ""
+    msg_type = (ev.get("msg_type") or "text").lower()
+    return {
+        "schema": "2.0",
+        "header": {"event_type": "im.message.receive_v1", "token": token},
+        "event": {
+            "message": {
+                "chat_id": chat_id,
+                "chat_type": ev.get("chat_type") or "group",
+                "message_type": "text" if msg_type == "text" else msg_type,
+                "content": json.dumps({"text": text_raw}),
+                "mentions": ev.get("mentions") or [],
+            },
+            "sender": {"sender_id": {"open_id": ev.get("open_id") or ""}},
+        },
+    }
+
+
+def _lark_normalize_webhook(data: Dict[str, Any]) -> Dict[str, Any]:
+    legacy = _lark_legacy_event_callback_message_to_v2(data)
+    return legacy if legacy else data
+
+
+def _lark_extract_plain_text_from_message(msg: Dict[str, Any]) -> str:
+    """Support ``text`` and rich ``post`` bodies (common when @mentioning in mobile clients)."""
+    content_str = msg.get("content") or "{}"
+    mtype = (msg.get("message_type") or "text").lower()
+    try:
+        obj = json.loads(content_str)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+    if mtype == "text":
+        return obj.get("text") or ""
+
+    if mtype == "post":
+        for locale_key in ("zh_cn", "en_us", "ja_jp"):
+            block = obj.get(locale_key)
+            if not isinstance(block, dict):
+                continue
+            parts: List[str] = []
+            for row in block.get("content") or []:
+                if isinstance(row, list):
+                    for cell in row:
+                        if isinstance(cell, dict) and cell.get("tag") == "text":
+                            parts.append(cell.get("text") or "")
+                elif isinstance(row, dict) and row.get("tag") == "text":
+                    parts.append(row.get("text") or "")
+            if parts:
+                return "".join(parts)
+        return obj.get("text") or ""
+
+    return obj.get("text") or ""
+
+
+def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
+    """Remove @ placeholders so ``/monitoring`` survives after <at>...</at> blocks."""
+    text = raw_text or ""
+    if isinstance(mentions, list):
+        for m in mentions:
+            if isinstance(m, dict):
+                k = m.get("key")
+                if k:
+                    text = text.replace(str(k), "")
+    text = re.sub(r"@_user_\d+", "", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("／", "/").replace("＼", "\\")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def grafana_login_session() -> requests.Session:
@@ -270,31 +409,51 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
 def _lark_header_token_ok(data: Dict[str, Any]) -> bool:
     if not VERIFICATION_TOKEN:
         return True
-    tok = (data.get("header") or {}).get("token")
-    return tok == VERIFICATION_TOKEN
+    h = data.get("header") or {}
+    tok = h.get("token") or h.get("Token") or h.get("verification_token")
+    if tok is not None and str(tok).strip() == VERIFICATION_TOKEN:
+        return True
+    # Rare: verification on top-level (legacy)
+    top = data.get("verification_token")
+    if top is not None and str(top).strip() == VERIFICATION_TOKEN:
+        return True
+    return False
 
 
 def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     if not _lark_header_token_ok(data):
+        logger.warning(
+            "im.message token mismatch: set VERIFICATION_TOKEN to match 事件与回调 → Verification Token"
+        )
         return jsonify({"error": "invalid verification token"}), 403
 
     event = data.get("event") or {}
     msg = event.get("message") or {}
-    if msg.get("message_type") != "text":
+    mtype = (msg.get("message_type") or "").lower()
+    if mtype not in ("text", "post"):
+        logger.info("im.message ignored: message_type=%r", mtype)
         return jsonify({}), 200
 
-    try:
-        inner = json.loads(msg.get("content") or "{}")
-        raw_text = inner.get("text") or ""
-    except (json.JSONDecodeError, TypeError):
-        return jsonify({}), 200
-
-    if MONITORING_TRIGGER not in raw_text:
-        return jsonify({}), 200
-
-    chat_id = msg.get("chat_id") or ""
     sender = (event.get("sender") or {}).get("sender_id") or {}
-    open_id = sender.get("open_id") or ""
+    sender_open = (sender.get("open_id") or "").strip()
+    if LARK_BOT_OPEN_ID and sender_open == LARK_BOT_OPEN_ID:
+        return jsonify({}), 200
+
+    raw_text = _lark_extract_plain_text_from_message(msg)
+    mentions = msg.get("mentions") or []
+    clean = _lark_clean_command_text(raw_text, mentions)
+
+    if MONITORING_TRIGGER not in clean and MONITORING_TRIGGER not in (raw_text or ""):
+        logger.info(
+            "im.message no trigger %r (clean=%r); need %r in message",
+            (raw_text or "")[:120],
+            (clean or "")[:120],
+            MONITORING_TRIGGER,
+        )
+        return jsonify({}), 200
+
+    chat_id = (msg.get("chat_id") or msg.get("open_chat_id") or "").strip()
+    open_id = sender_open
 
     try:
         payload = fetch_request_total_1m_series()
@@ -309,7 +468,7 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
         elif open_id:
             _lark_send_text("open_id", open_id, reply)
         else:
-            logger.warning("no chat_id or open_id; cannot reply")
+            logger.warning("no chat_id/open_chat_id or sender open_id; cannot reply. msg keys=%s", list(msg.keys()))
     except Exception as e:
         logger.exception("lark send failed: %s", e)
 
@@ -323,9 +482,21 @@ def health():
 
 @app.route("/webhook/event", methods=["POST"])
 def webhook_event():
-    data = request.get_json(silent=True)
-    if not data:
+    raw = request.get_json(silent=True)
+    if not raw:
         return jsonify({"error": "invalid json"}), 400
+
+    data = _feishu_maybe_decrypt_webhook_payload(raw)
+    if isinstance(raw, dict) and raw.get("encrypt") is not None and data is raw:
+        logger.error(
+            "Webhook still encrypted — install pycryptodome and set LARK_ENCRYPT_KEY, "
+            "or disable 加密 in Lark 事件与回调"
+        )
+        return jsonify({}), 200
+
+    data = _lark_normalize_webhook(data if isinstance(data, dict) else {})
+    if not isinstance(data, dict):
+        return jsonify({"error": "invalid payload"}), 400
 
     uv = _extract_url_verification(data)
     if uv:
