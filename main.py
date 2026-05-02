@@ -4,7 +4,8 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana（.env 配�
 
 - **推荐** ``python connect.py``：官方 ``lark_oapi.ws.Client`` 收事件（无需公网 URL / 无 3s HTTP 校验）；
   可选并行 HTTP（``ENABLE_HTTP=1``）提供 ``/health``、``/grafana/ping`` 等。
-- 飞书后台「事件与回调」改为 **使用长连接接收事件** 并订阅「接收消息」；``APP_ID`` / ``APP_SECRET`` 必填。
+- 飞书后台「事件与回调」→ **长连接**；订阅「接收消息 v1」或 **「接收消息 v2」**（均已注册）；``APP_ID`` / ``APP_SECRET`` 必填。
+- 默认 ``LARK_HOST=https://open.feishu.cn``；国际 Lark 设 ``https://open.larksuite.com``。
 - 仍支持旧模式：仅 HTTP 时设置 ``LARK_EVENT_MODE=http`` 且 ``connect.py`` 只起 Flask。
 
 群/at 机器人发 /monitoring → 回复「请求总数/1m」近 10 分钟摘要；发消息用 ``lark-oapi`` HTTP API。
@@ -60,12 +61,30 @@ VERIFICATION_TOKEN = (os.getenv("VERIFICATION_TOKEN") or "").strip()
 # For Open API (e.g. send message) — see https://open.feishu.cn/document/ukTMukTMukTM/ukDNz4SO0MjL5QzM/auth-v3/auth/tenant_access_token_internal
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
-LARK_HOST = os.getenv("LARK_HOST", "https://open.larksuite.com").rstrip("/")
+# Default matches ``lark_oapi.core.const.FEISHU_DOMAIN`` — 国际 Lark 请在 .env 设 LARK_HOST=https://open.larksuite.com
+LARK_HOST = os.getenv("LARK_HOST", "https://open.feishu.cn").rstrip("/")
 MONITORING_TRIGGER = os.getenv("MONITORING_TRIGGER", "/monitoring")
 LARK_ENCRYPT_KEY = (
     os.getenv("LARK_ENCRYPT_KEY") or os.getenv("ENCRYPT_KEY") or os.getenv("FEISHU_ENCRYPT_KEY") or ""
 ).strip()
 LARK_BOT_OPEN_ID = (os.getenv("LARK_BOT_OPEN_ID") or "").strip()
+
+# 群聊里富媒体等类型仍可能带可解析文本；仅跳过明显无 /monitoring 的类型。
+_SKIP_IM_MESSAGE_TYPES = frozenset(
+    {
+        "image",
+        "file",
+        "audio",
+        "media",
+        "sticker",
+        "location",
+        "folder",
+        "system",
+        "hongbao",
+        "share_chat",
+        "share_user",
+    }
+)
 
 
 def _feishu_decrypt_encrypt_field(ciphertext_b64: str, encrypt_key: str) -> str:
@@ -744,6 +763,21 @@ def _event_message_sdk_to_webhook_dict(msg: Any) -> Dict[str, Any]:
     return out
 
 
+def _lark_customized_event_to_schema2_dict(ce: Any) -> Dict[str, Any]:
+    """``im.message.receive_v2`` 等走 CustomizedEvent：``event`` 已是 dict，与 HTTP schema 2.0 一致。"""
+    header: Dict[str, Any] = {}
+    hdr = getattr(ce, "header", None)
+    if hdr:
+        for k in ("event_id", "token", "event_type", "tenant_key", "app_id", "create_time"):
+            v = getattr(hdr, k, None)
+            if v is not None and str(v) != "":
+                header[k] = v
+    ev = getattr(ce, "event", None)
+    if not isinstance(ev, dict):
+        ev = {}
+    return {"schema": "2.0", "header": header, "event": ev}
+
+
 def _p2_im_message_receive_v1_to_event_dict(p2: Any) -> Dict[str, Any]:
     """Schema 2.0–shaped dict for :func:`_process_im_message_event` (SDK + HTTP share this)."""
     ev = getattr(p2, "event", None)
@@ -771,8 +805,8 @@ def _process_im_message_event(data: Dict[str, Any]) -> None:
     msg = event.get("message") or {}
     mid = (msg.get("message_id") or "").strip()
     mtype = (msg.get("message_type") or "").lower()
-    if mtype and mtype not in ("text", "post"):
-        logger.info("im.message ignored: message_type=%r", mtype)
+    if mtype and mtype in _SKIP_IM_MESSAGE_TYPES:
+        logger.info("im.message ignored (non-textual): message_type=%r", mtype)
         return
 
     sender = (event.get("sender") or {}).get("sender_id") or {}
@@ -817,9 +851,31 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
 def _on_ws_p2_im_message_receive_v1(p2: Any) -> None:
     try:
         data = _p2_im_message_receive_v1_to_event_dict(p2)
+        logger.info(
+            "ws p2.im.message.receive_v1 mid=%r mtype=%r chat=%r",
+            (data.get("event") or {}).get("message", {}).get("message_id"),
+            (data.get("event") or {}).get("message", {}).get("message_type"),
+            str((data.get("event") or {}).get("message", {}).get("chat_id") or "")[:12],
+        )
         _process_im_message_event(data)
     except Exception:
-        logger.exception("WebSocket im.message handler failed")
+        logger.exception("WebSocket im.message.receive_v1 handler failed")
+
+
+def _on_ws_p2_im_message_receive_v2(ce: Any) -> None:
+    """控制台订阅「接收消息 v2.0」时 event_type 为 im.message.receive_v2，须单独注册。"""
+    try:
+        data = _lark_customized_event_to_schema2_dict(ce)
+        em = (data.get("event") or {}).get("message") or {}
+        logger.info(
+            "ws p2.im.message.receive_v2 mid=%r mtype=%r chat=%r",
+            em.get("message_id"),
+            em.get("message_type"),
+            str(em.get("chat_id") or "")[:12],
+        )
+        _process_im_message_event(data)
+    except Exception:
+        logger.exception("WebSocket im.message.receive_v2 handler failed")
 
 
 def start_lark_ws_client_blocking() -> None:
@@ -839,6 +895,7 @@ def start_lark_ws_client_blocking() -> None:
     handler = (
         EventDispatcherHandler.builder(encrypt_key, verification)
         .register_p2_im_message_receive_v1(_on_ws_p2_im_message_receive_v1)
+        .register_p2_customized_event("im.message.receive_v2", _on_ws_p2_im_message_receive_v2)
         .build()
     )
     level_name = (os.getenv("LARK_WS_LOG_LEVEL") or "INFO").strip().upper()
@@ -853,9 +910,13 @@ def start_lark_ws_client_blocking() -> None:
         auto_reconnect=True,
     )
     logger.info(
-        "Lark WebSocket client starting (domain=%s); set Feishu console to 长连接接收事件 and subscribe 接收消息",
+        "Lark WebSocket client starting (domain=%s); 长连接已注册 im.message.receive_v1 + v2",
         LARK_HOST,
     )
+    if "larksuite.com" in LARK_HOST and "feishu.cn" not in LARK_HOST:
+        logger.warning(
+            "LARK_HOST 指向国际站；若应用为国内飞书，请在 .env 设置 LARK_HOST=https://open.feishu.cn，否则收/发消息可能异常"
+        )
     cli.start()
 
 
