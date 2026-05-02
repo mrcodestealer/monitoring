@@ -27,7 +27,9 @@ Install::
 
 import os
 import threading
+import time
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -36,7 +38,9 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 def main() -> None:
     port = int(os.getenv("PORT", "5002"))
-    mode = (os.getenv("LARK_EVENT_MODE") or "ws").strip().lower()
+    raw_mode = (os.getenv("LARK_EVENT_MODE") or "ws").strip().lower()
+    # ``Environment=LARK_EVENT_MODE=`` in systemd → empty string → treat as default ws.
+    mode = raw_mode if raw_mode else "ws"
     # Import after load_dotenv so main.py sees the same env as this process.
     from main import app, logger, start_lark_ws_client_blocking  # noqa: WPS433
 
@@ -62,12 +66,30 @@ def main() -> None:
         raise SystemExit(f"Unknown LARK_EVENT_MODE={mode!r} (use ws or http)")
 
     http_on = os.getenv("ENABLE_HTTP", "1").strip().lower() in ("1", "true", "yes", "on")
+    http_thread: Optional[threading.Thread] = None
     if http_on:
-        threading.Thread(target=run_http, name="http-sidecar", daemon=True).start()
+        # Non-daemon so if WebSocket start fails we can ``join()`` and keep Waitress alive for systemd.
+        http_thread = threading.Thread(target=run_http, name="http-sidecar", daemon=False)
+        http_thread.start()
+        time.sleep(0.2)
     else:
         logger.info("ENABLE_HTTP=0 — only Lark WebSocket client (no HTTP listener)")
 
-    start_lark_ws_client_blocking()
+    try:
+        start_lark_ws_client_blocking()
+    except Exception as e:
+        logger.exception(
+            "Lark WebSocket client failed to start or exited (check APP_ID/APP_SECRET/LARK_HOST, "
+            "egress firewall, and Feishu app long-connection mode)."
+        )
+        if http_on and http_thread is not None:
+            logger.warning(
+                "Continuing with HTTP sidecar only — use POST /webhook/event for events, "
+                "or set LARK_EVENT_MODE=http after fixing credentials."
+            )
+            http_thread.join()
+            return
+        raise SystemExit(1) from e
 
 
 if __name__ == "__main__":
