@@ -958,7 +958,19 @@ def start_lark_ws_client_blocking() -> None:
         logger.warning(
             "LARK_HOST 指向国际站；若应用为国内飞书，请在 .env 设置 LARK_HOST=https://open.feishu.cn，否则收/发消息可能异常"
         )
-    cli.start()
+    try:
+        cli.start()
+    except Exception as e:
+        err = str(e)
+        if "1000040351" in err or "incorrect domain" in err.lower():
+            logger.error(
+                "Lark WebSocket 域名与租户不匹配 (1000040351)。当前 LARK_HOST=%r — "
+                "国内飞书请设 LARK_HOST=https://open.feishu.cn；国际 Lark 请设 "
+                "LARK_HOST=https://open.larksuite.com；改后 systemctl restart monitoringbot。SDK: %s",
+                LARK_HOST,
+                err,
+            )
+        raise
 
 
 @app.route("/health", methods=["GET"])
