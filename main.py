@@ -43,7 +43,7 @@ GRAFANA_QUERY_STEP = int(os.getenv("GRAFANA_QUERY_STEP", "60"))
 GRAFANA_QUERY_LOOKBACK_SECONDS = int(os.getenv("GRAFANA_QUERY_LOOKBACK_SECONDS", "600"))
 GRAFANA_USER = os.getenv("GRAFANA_USER") or os.getenv("GRAFANA_ID") or os.getenv("grafanaid")
 GRAFANA_PASSWORD = os.getenv("GRAFANA_PASSWORD") or os.getenv("grafanapassword")
-VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN", "")
+VERIFICATION_TOKEN = (os.getenv("VERIFICATION_TOKEN") or "").strip()
 # For Open API (e.g. send message) — see https://open.feishu.cn/document/ukTMukTMukTM/ukDNz4SO0MjL5QzM/auth-v3/auth/tenant_access_token_internal
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
@@ -139,14 +139,64 @@ def _lark_normalize_webhook(data: Dict[str, Any]) -> Dict[str, Any]:
     return legacy if legacy else data
 
 
+def _lark_coerce_event_json_string(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Some gateways pass ``event`` as a JSON string instead of an object."""
+    ev = data.get("event")
+    if isinstance(ev, str):
+        try:
+            parsed = json.loads(ev)
+            data["event"] = parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            data["event"] = {}
+    return data
+
+
+def _lark_header_event_type(data: Dict[str, Any]) -> str:
+    """``header.event_type`` or top-level ``event_type`` (proxies sometimes flatten the body)."""
+    h = data.get("header")
+    if isinstance(h, dict):
+        et = h.get("event_type")
+        if et is not None:
+            return str(et).strip()
+    et2 = data.get("event_type")
+    if et2 is not None:
+        return str(et2).strip()
+    return ""
+
+
+def _lark_collect_post_text(obj: Any, out: List[str]) -> None:
+    """Depth-first collect human text from rich post / mixed blocks."""
+    if isinstance(obj, dict):
+        tag = obj.get("tag")
+        if tag == "text" and "text" in obj:
+            t = obj.get("text")
+            if t is not None:
+                out.append(str(t))
+        elif tag in ("a", "code") and "text" in obj:
+            t = obj.get("text")
+            if t is not None:
+                out.append(str(t))
+        for v in obj.values():
+            _lark_collect_post_text(v, out)
+    elif isinstance(obj, list):
+        for x in obj:
+            _lark_collect_post_text(x, out)
+
+
 def _lark_extract_plain_text_from_message(msg: Dict[str, Any]) -> str:
     """Support ``text`` and rich ``post`` bodies (common when @mentioning in mobile clients)."""
     content_str = msg.get("content") or "{}"
-    mtype = (msg.get("message_type") or "text").lower()
+    mtype = (msg.get("message_type") or "").lower()
     try:
         obj = json.loads(content_str)
     except (json.JSONDecodeError, TypeError):
         return ""
+
+    if not mtype:
+        if "text" in obj and isinstance(obj.get("text"), str):
+            mtype = "text"
+        elif any(k in obj for k in ("zh_cn", "en_us", "ja_jp")) or isinstance(obj.get("content"), list):
+            mtype = "post"
 
     if mtype == "text":
         return obj.get("text") or ""
@@ -166,8 +216,16 @@ def _lark_extract_plain_text_from_message(msg: Dict[str, Any]) -> str:
                     parts.append(row.get("text") or "")
             if parts:
                 return "".join(parts)
+        parts2: List[str] = []
+        _lark_collect_post_text(obj, parts2)
+        if parts2:
+            return "".join(parts2)
         return obj.get("text") or ""
 
+    parts3: List[str] = []
+    _lark_collect_post_text(obj, parts3)
+    if parts3:
+        return "".join(parts3)
     return obj.get("text") or ""
 
 
@@ -182,9 +240,20 @@ def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
                     text = text.replace(str(k), "")
     text = re.sub(r"@_user_\d+", "", text)
     text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[\u200b\uFEFF\u00A0]", "", text)
     text = text.replace("／", "/").replace("＼", "\\")
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
+    tri = MONITORING_TRIGGER
+    raw = raw or ""
+    clean = clean or ""
+    if tri in raw or tri in clean:
+        return True
+    tl = tri.lower()
+    return tl in clean.lower() or tl in raw.lower()
 
 
 def grafana_login_session() -> requests.Session:
@@ -372,7 +441,7 @@ def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
     r.raise_for_status()
     j = r.json()
     if j.get("code") != 0:
-        raise RuntimeError(f"Lark send: {j}")
+        raise RuntimeError(f"Lark send failed: {j} (HTTP {r.status_code})")
 
 
 def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
@@ -410,12 +479,18 @@ def _lark_header_token_ok(data: Dict[str, Any]) -> bool:
     if not VERIFICATION_TOKEN:
         return True
     h = data.get("header") or {}
-    tok = h.get("token") or h.get("Token") or h.get("verification_token")
+    tok = h.get("token") if isinstance(h, dict) else None
+    if tok is None:
+        tok = h.get("Token") if isinstance(h, dict) else None
+    if tok is None:
+        tok = h.get("verification_token") if isinstance(h, dict) else None
     if tok is not None and str(tok).strip() == VERIFICATION_TOKEN:
         return True
-    # Rare: verification on top-level (legacy)
     top = data.get("verification_token")
     if top is not None and str(top).strip() == VERIFICATION_TOKEN:
+        return True
+    top_tok = data.get("token")
+    if top_tok is not None and str(top_tok).strip() == VERIFICATION_TOKEN:
         return True
     return False
 
@@ -430,7 +505,7 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     event = data.get("event") or {}
     msg = event.get("message") or {}
     mtype = (msg.get("message_type") or "").lower()
-    if mtype not in ("text", "post"):
+    if mtype and mtype not in ("text", "post"):
         logger.info("im.message ignored: message_type=%r", mtype)
         return jsonify({}), 200
 
@@ -443,11 +518,11 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     mentions = msg.get("mentions") or []
     clean = _lark_clean_command_text(raw_text, mentions)
 
-    if MONITORING_TRIGGER not in clean and MONITORING_TRIGGER not in (raw_text or ""):
+    if not _text_has_monitoring_trigger(raw_text, clean):
         logger.info(
-            "im.message no trigger %r (clean=%r); need %r in message",
-            (raw_text or "")[:120],
-            (clean or "")[:120],
+            "im.message no trigger raw=%r clean=%r (need %r)",
+            (raw_text or "")[:160],
+            (clean or "")[:160],
             MONITORING_TRIGGER,
         )
         return jsonify({}), 200
@@ -498,19 +573,26 @@ def webhook_event():
     if not isinstance(data, dict):
         return jsonify({"error": "invalid payload"}), 400
 
+    data = _lark_coerce_event_json_string(data)
+
     uv = _extract_url_verification(data)
     if uv:
         token, challenge = uv
-        if VERIFICATION_TOKEN and token != VERIFICATION_TOKEN:
+        if VERIFICATION_TOKEN and str(token).strip() != VERIFICATION_TOKEN:
             logger.warning("url_verification token mismatch")
             return jsonify({"error": "invalid verification token"}), 403
         return jsonify({"challenge": challenge})
 
-    et = (data.get("header") or {}).get("event_type")
-    if et == "im.message.receive_v1":
+    et = _lark_header_event_type(data)
+    if et in ("im.message.receive_v1", "im.message.receive_v2"):
+        logger.info("handling %s", et)
         return _handle_im_message_receive(data)
 
-    logger.info("event ignored: %s", et)
+    logger.info(
+        "event ignored: event_type=%r keys=%s (subscribe 消息与群组 → 接收消息; ensure URL hits this service)",
+        et,
+        list(data.keys())[:20],
+    )
     return jsonify({})
 
 
