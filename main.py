@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Lark duplicate pushes (same message_id) — align with Chatbox processed_messages pattern.
+_processed_lark_message_ids: set = set()
+_PROCESSED_LARK_IDS_CAP = 4000
+
 GRAFANA_BASE_URL = os.getenv("GRAFANA_BASE_URL", "https://grafana.client8.me").rstrip("/")
 GRAFANA_DASHBOARD_PATH = os.getenv(
     "GRAFANA_DASHBOARD_PATH",
@@ -139,14 +143,81 @@ def _lark_normalize_webhook(data: Dict[str, Any]) -> Dict[str, Any]:
     return legacy if legacy else data
 
 
-def _lark_coerce_event_json_string(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Some gateways pass ``event`` as a JSON string instead of an object."""
+def _lark_safe_parse_json_body(req: Any) -> Optional[Dict[str, Any]]:
+    """Prefer ``get_json``; fallback to raw body (some proxies strip / alter Content-Type). Same idea as Chatbox."""
+    raw = req.get_json(silent=True)
+    if isinstance(raw, dict):
+        return raw
+    b = req.get_data(cache=False)
+    if not b:
+        return None
+    if b.startswith(b"\xef\xbb\xbf"):
+        b = b[3:]
+    try:
+        parsed = json.loads(b.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _lark_is_schema_v2(data: Any) -> bool:
+    """Schema may arrive as str ``2.0`` or occasionally non-string — same guard as Chatbox."""
+    if not isinstance(data, dict):
+        return False
+    s = data.get("schema")
+    return s == "2.0" or str(s).strip() == "2.0"
+
+
+def _lark_looks_like_lark_card_update_credential(token_str: Any) -> bool:
+    """
+    Flat ``card.action.trigger_v1`` uses top-level ``token`` = card credential (``c-``/``d-``), not Verification Token.
+    Do not treat that as verification (Chatbox :func:`_lark_looks_like_lark_card_update_credential`).
+    """
+    s = (str(token_str or "")).strip()
+    if not s:
+        return False
+    return s.startswith("c-") or s.startswith("d-")
+
+
+def _lark_extract_verification_token(data: Any) -> Optional[str]:
+    """
+    App Verification Token: schema 2.0 ``header.token``; some payloads ``verification_token``.
+    Same extraction order as Chatbox :func:`_lark_extract_verification_token`.
+    """
+    if not isinstance(data, dict):
+        return None
+    h = data.get("header")
+    if isinstance(h, dict):
+        for key in ("token", "Token", "verification_token"):
+            t = h.get(key)
+            if t is not None:
+                return str(t).strip()
+    vt = data.get("verification_token")
+    if vt is not None:
+        return str(vt).strip()
+    t2 = data.get("token")
+    if t2 is None:
+        return None
+    ts = str(t2).strip()
+    if _lark_looks_like_lark_card_update_credential(ts):
+        return None
+    return ts
+
+
+def _lark_coerce_event_dict(data: Any) -> Any:
+    """Some gateways deliver ``event`` as a JSON string — normalize to dict (Chatbox :func:`_lark_coerce_event_dict`)."""
+    if not isinstance(data, dict):
+        return data
     ev = data.get("event")
     if isinstance(ev, str):
         try:
             parsed = json.loads(ev)
             data["event"] = parsed if isinstance(parsed, dict) else {}
-        except (json.JSONDecodeError, TypeError):
+        except Exception:
+            data["event"] = {}
+    elif ev is None and isinstance(data, dict):
+        het = _lark_header_event_type(data)
+        if isinstance(het, str) and het.startswith("card.action"):
             data["event"] = {}
     return data
 
@@ -297,20 +368,28 @@ def fetch_grafana_dashboard(
 
 
 def _extract_url_verification(data: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-    """Return (token, challenge) if this is a Lark URL verification payload."""
+    """Return (token, challenge) if this is a Lark URL verification payload (schema 2.0 or flat)."""
     if not isinstance(data, dict):
         return None
-    # Event subscription 2.0
-    if data.get("header", {}).get("event_type") == "url_verification":
+    if _lark_header_event_type(data) == "url_verification":
         ev = data.get("event") or {}
         ch = ev.get("challenge")
         tok = ev.get("token")
         if ch is not None:
             return (str(tok or ""), str(ch))
-    # Legacy / flat
     if data.get("type") == "url_verification":
         return (str(data.get("token") or ""), str(data.get("challenge") or ""))
     return None
+
+
+def _lark_ack_only_event_type(het: str) -> bool:
+    """Subscribed but not handled — still HTTP 200 (Chatbox :func:`_lark_ack_only_event_type`)."""
+    if not het:
+        return False
+    h = het.lower()
+    if h.startswith("meeting_room."):
+        return True
+    return False
 
 
 def _walk_panels(panels: Optional[List[Dict[str, Any]]]) -> Generator[Dict[str, Any], None, None]:
@@ -434,7 +513,10 @@ def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
     r = requests.post(
         url,
         params=params,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
         json=body,
         timeout=30,
     )
@@ -475,44 +557,35 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
     return out
 
 
-def _lark_header_token_ok(data: Dict[str, Any]) -> bool:
+def _lark_verify_event_token(data: Dict[str, Any]) -> bool:
+    """True when ``_lark_extract_verification_token`` matches ``VERIFICATION_TOKEN`` (Chatbox pattern)."""
     if not VERIFICATION_TOKEN:
         return True
-    h = data.get("header") or {}
-    tok = h.get("token") if isinstance(h, dict) else None
-    if tok is None:
-        tok = h.get("Token") if isinstance(h, dict) else None
-    if tok is None:
-        tok = h.get("verification_token") if isinstance(h, dict) else None
-    if tok is not None and str(tok).strip() == VERIFICATION_TOKEN:
-        return True
-    top = data.get("verification_token")
-    if top is not None and str(top).strip() == VERIFICATION_TOKEN:
-        return True
-    top_tok = data.get("token")
-    if top_tok is not None and str(top_tok).strip() == VERIFICATION_TOKEN:
-        return True
-    return False
+    tok = _lark_extract_verification_token(data)
+    return tok == VERIFICATION_TOKEN
 
 
 def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
-    if not _lark_header_token_ok(data):
-        logger.warning(
-            "im.message token mismatch: set VERIFICATION_TOKEN to match 事件与回调 → Verification Token"
-        )
-        return jsonify({"error": "invalid verification token"}), 403
-
+    # Token already verified in webhook_event (same as Chatbox single gate).
     event = data.get("event") or {}
     msg = event.get("message") or {}
+    mid = (msg.get("message_id") or "").strip()
+    if mid:
+        if mid in _processed_lark_message_ids:
+            logger.info("duplicate message_id=%s skipped (Chatbox-style dedup)", mid)
+            return jsonify({"success": True}), 200
+        _processed_lark_message_ids.add(mid)
+        if len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
+            _processed_lark_message_ids.clear()
     mtype = (msg.get("message_type") or "").lower()
     if mtype and mtype not in ("text", "post"):
         logger.info("im.message ignored: message_type=%r", mtype)
-        return jsonify({}), 200
+        return jsonify({"success": True}), 200
 
     sender = (event.get("sender") or {}).get("sender_id") or {}
     sender_open = (sender.get("open_id") or "").strip()
     if LARK_BOT_OPEN_ID and sender_open == LARK_BOT_OPEN_ID:
-        return jsonify({}), 200
+        return jsonify({"success": True}), 200
 
     raw_text = _lark_extract_plain_text_from_message(msg)
     mentions = msg.get("mentions") or []
@@ -525,7 +598,7 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
             (clean or "")[:160],
             MONITORING_TRIGGER,
         )
-        return jsonify({}), 200
+        return jsonify({"success": True}), 200
 
     chat_id = (msg.get("chat_id") or msg.get("open_chat_id") or "").strip()
     open_id = sender_open
@@ -547,7 +620,7 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Tuple[Any, int]:
     except Exception as e:
         logger.exception("lark send failed: %s", e)
 
-    return jsonify({}), 200
+    return jsonify({"success": True}), 200
 
 
 @app.route("/health", methods=["GET"])
@@ -555,25 +628,31 @@ def health():
     return jsonify({"ok": True})
 
 
-@app.route("/webhook/event", methods=["POST"])
+@app.route("/webhook/event", methods=["POST", "OPTIONS"])
 def webhook_event():
-    raw = request.get_json(silent=True)
-    if not raw:
+    # Chatbox: OPTIONS must not 405 — some clients preflight the callback URL.
+    if request.method == "OPTIONS":
+        return "", 204
+
+    raw_in = _lark_safe_parse_json_body(request)
+    if raw_in is None:
         return jsonify({"error": "invalid json"}), 400
 
-    data = _feishu_maybe_decrypt_webhook_payload(raw)
-    if isinstance(raw, dict) and raw.get("encrypt") is not None and data is raw:
-        logger.error(
-            "Webhook still encrypted — install pycryptodome and set LARK_ENCRYPT_KEY, "
-            "or disable 加密 in Lark 事件与回调"
-        )
-        return jsonify({}), 200
-
+    data = _feishu_maybe_decrypt_webhook_payload(raw_in)
     data = _lark_normalize_webhook(data if isinstance(data, dict) else {})
     if not isinstance(data, dict):
         return jsonify({"error": "invalid payload"}), 400
+    data = _lark_coerce_event_dict(data)
 
-    data = _lark_coerce_event_json_string(data)
+    if isinstance(raw_in, dict) and raw_in.get("encrypt") is not None and data is raw_in:
+        logger.error(
+            "Webhook still encrypted — set LARK_ENCRYPT_KEY + pycryptodome, or disable 加密 (Chatbox logs this as 403)."
+        )
+        return jsonify({"error": "Invalid token"}), 403
+
+    # Legacy flat URL challenge — Chatbox returns before global token check.
+    if data.get("type") == "url_verification":
+        return jsonify({"challenge": data.get("challenge", "")})
 
     uv = _extract_url_verification(data)
     if uv:
@@ -583,17 +662,29 @@ def webhook_event():
             return jsonify({"error": "invalid verification token"}), 403
         return jsonify({"challenge": challenge})
 
+    if not _lark_verify_event_token(data):
+        logger.warning(
+            "webhook token mismatch: expected VERIFICATION_TOKEN, got %r schema=%r schema_v2=%s",
+            _lark_extract_verification_token(data),
+            data.get("schema"),
+            _lark_is_schema_v2(data),
+        )
+        return jsonify({"error": "Invalid token"}), 403
+
     et = _lark_header_event_type(data)
+    if _lark_ack_only_event_type(et):
+        return jsonify({"success": True})
+
     if et in ("im.message.receive_v1", "im.message.receive_v2"):
         logger.info("handling %s", et)
         return _handle_im_message_receive(data)
 
     logger.info(
-        "event ignored: event_type=%r keys=%s (subscribe 消息与群组 → 接收消息; ensure URL hits this service)",
+        "event ignored: event_type=%r keys=%s (subscribe 消息与群组 → 接收消息 v2.0)",
         et,
         list(data.keys())[:20],
     )
-    return jsonify({})
+    return jsonify({"success": True})
 
 
 @app.route("/grafana/ping", methods=["GET"])
