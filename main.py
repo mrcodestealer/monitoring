@@ -30,9 +30,9 @@ from flask import Flask, jsonify, request
 _CFG: Dict[str, Any] = {
     "PORT": 5002,
     "LARK_HOST": "https://open.larksuite.com",
-    "VERIFICATION_TOKEN": "",
-    "APP_ID": "",
-    "APP_SECRET": "",
+    "VERIFICATION_TOKEN": "QlZMYp7rogAS914dxxMVNgboUKxQP7jc",
+    "APP_ID": "cli_a97fcc6df7615ed1",
+    "APP_SECRET": "NwAi6xJxMYDHMFAQcTG8ZfJxpeTOibvy",
     "LARK_ENCRYPT_KEY": "",
     # 若设置，忽略机器人自己发出的消息（open_id）
     "LARK_BOT_OPEN_ID": "",
@@ -92,6 +92,12 @@ LARK_ENCRYPT_KEY = (
     or ""
 ).strip()
 LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
+
+if not APP_ID or not APP_SECRET:
+    logger.warning(
+        "APP_ID / APP_SECRET 为空：无法拉 tenant_access_token、也无法发消息。"
+        "请填 ``_CFG`` 或在 systemd 里 ``Environment=APP_ID=...`` ``Environment=APP_SECRET=...``。"
+    )
 
 app = Flask(__name__)
 
