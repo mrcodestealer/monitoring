@@ -75,14 +75,18 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_BOOT_WARM": "1",
     # 1=尝试点 Grafana 时间栏「Refresh」触发拉数；找不到按钮则整页 reload 一次
     "GRAFANA_SCREENSHOT_REFRESH": "1",
+    # Refresh 后等 Spinner 的最长毫秒（过大会拖慢整条截图）
+    "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": 2800,
+    # 1=点击折叠的 dashboard 行（如只显示 KPI 标题无图时）
+    "GRAFANA_SCREENSHOT_EXPAND_ROWS": "1",
     # 截图 URL 用 now-10m / now（与浏览器一致）；0 则用 Prometheus 窗口的绝对毫秒时间戳
     "GRAFANA_SCREENSHOT_RELATIVE_RANGE": "1",
     # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
-    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 12000,
+    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 7000,
     # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
     "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 1,
-    "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 220,
-    "GRAFANA_SCREENSHOT_SETTLE_MS": 1200,
+    "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 180,
+    "GRAFANA_SCREENSHOT_SETTLE_MS": 600,
     "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 12000,
     # 至少等到 N 个 .react-grid-item（0=不等待；经典大屏可设 4–8；Scenes 布局可能为 0）
     "GRAFANA_SCREENSHOT_MIN_GRID_ITEMS": 0,
@@ -307,16 +311,19 @@ GRAFANA_SCREENSHOT_STABILIZE_ROUNDS = max(
     1, min(8, _cfg_int("GRAFANA_SCREENSHOT_STABILIZE_ROUNDS", 1))
 )
 GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS = max(
-    80, min(3000, _cfg_int("GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS", 220))
+    80, min(3000, _cfg_int("GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS", 180))
 )
 GRAFANA_SCREENSHOT_SETTLE_MS = max(
-    0, min(120_000, _cfg_int("GRAFANA_SCREENSHOT_SETTLE_MS", 1200))
+    0, min(120_000, _cfg_int("GRAFANA_SCREENSHOT_SETTLE_MS", 600))
 )
 GRAFANA_SCREENSHOT_SPINNER_MAX_MS = max(
     2000, min(60_000, _cfg_int("GRAFANA_SCREENSHOT_SPINNER_MAX_MS", 12000))
 )
 GRAFANA_SCREENSHOT_POPULATE_MAX_MS = max(
-    2000, min(90_000, _cfg_int("GRAFANA_SCREENSHOT_POPULATE_MAX_MS", 12000))
+    2000, min(90_000, _cfg_int("GRAFANA_SCREENSHOT_POPULATE_MAX_MS", 7000))
+)
+GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS = max(
+    500, min(30_000, _cfg_int("GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS", 2800))
 )
 GRAFANA_SCREENSHOT_MIN_GRID_ITEMS = max(
     0, min(200, _cfg_int("GRAFANA_SCREENSHOT_MIN_GRID_ITEMS", 0))
@@ -1117,17 +1124,63 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     except Exception as e:
         logger.info("Grafana screenshot: dock nav optional step failed: %s", e)
 
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(450)
 
 
-def _grafana_click_dashboard_refresh(page: Any, timeout_ms: int) -> None:
+def _grafana_expand_collapsed_dashboard_rows(page: Any) -> None:
+    """
+    Grafana dashboards often collapse row groups (only the row title e.g. ``KPI`` is visible).
+    Click collapsed row toggles so panels mount and queries run.
+    """
+    if not _lark_env_truthy("GRAFANA_SCREENSHOT_EXPAND_ROWS"):
+        return
+    selectors = (
+        '[data-testid="dashboard-row-title"] [aria-expanded="false"]',
+        '[data-testid="dashboard-row-title"] button[aria-expanded="false"]',
+        'section[data-testid="dashboard-row"] button[aria-expanded="false"]',
+    )
+    for sel in selectors:
+        loc = page.locator(sel)
+        try:
+            n = loc.count()
+        except Exception:
+            continue
+        if n == 0:
+            continue
+        clicked = 0
+        for i in range(min(int(n), 24)):
+            try:
+                loc.nth(i).click(timeout=1100)
+                clicked += 1
+                page.wait_for_timeout(60)
+            except Exception:
+                pass
+        if clicked:
+            logger.info(
+                "Grafana screenshot: expanded %s collapsed dashboard row(s) via %r",
+                clicked,
+                sel,
+            )
+            page.wait_for_timeout(250)
+        return
+
+
+def _grafana_click_dashboard_refresh(
+    page: Any, timeout_ms: int, spinner_budget_ms: Optional[int] = None
+) -> None:
     """
     Same as a user hitting Grafana's **Refresh** (re-runs queries). If no control matches,
     fall back to ``page.reload`` once — fixes stuck shells that only show header / row titles (e.g. ``KPI``).
     """
     if not _lark_env_truthy("GRAFANA_SCREENSHOT_REFRESH"):
         return
-    tclick = min(5000, max(2000, int(timeout_ms) // 20))
+    tclick = min(3500, max(1200, int(timeout_ms) // 35))
+    spin_cap = (
+        int(spinner_budget_ms)
+        if spinner_budget_ms is not None
+        else int(GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS)
+    )
+    spin_cap = max(600, min(25_000, spin_cap))
     locators: List[Any] = [
         page.get_by_role("button", name=re.compile(r"refresh", re.I)).first,
         page.locator('[aria-label="Refresh dashboard"]').first,
@@ -1139,8 +1192,8 @@ def _grafana_click_dashboard_refresh(page: Any, timeout_ms: int) -> None:
         try:
             loc.click(timeout=tclick)
             logger.info("Grafana screenshot: clicked dashboard Refresh (locator #%s)", idx)
-            page.wait_for_timeout(450)
-            _grafana_wait_loading_like_gone(page, min(12000, max(2500, int(timeout_ms // 5))))
+            page.wait_for_timeout(350)
+            _grafana_wait_loading_like_gone(page, spin_cap)
             return
         except Exception:
             continue
@@ -1201,11 +1254,11 @@ def _grafana_wait_loading_like_gone(page: Any, budget_ms: int) -> None:
             last_c = c
         if c == 0:
             stable += 1
-            if stable >= 4:
+            if stable >= 3:
                 return
         else:
             stable = 0
-        page.wait_for_timeout(350)
+        page.wait_for_timeout(240)
     c = _grafana_loading_like_count(page)
     if c > 0:
         logger.warning(
@@ -1475,10 +1528,24 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             page.wait_for_timeout(500)
             _grafana_playwright_dock_nav_only(page, timeout_ms)
             _grafana_click_dashboard_refresh(page, timeout_ms)
+            _grafana_expand_collapsed_dashboard_rows(page)
             _grafana_wait_dashboard_ready(page, timeout_ms)
             _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
             _grafana_stabilize_dashboard_render(page, timeout_ms)
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(250)
+
+            if not _grafana_dashboard_has_visual_content(page):
+                _grafana_expand_collapsed_dashboard_rows(page)
+                _grafana_click_dashboard_refresh(
+                    page,
+                    timeout_ms,
+                    spinner_budget_ms=min(2200, int(GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS)),
+                )
+                _grafana_wait_dashboard_body_populated(
+                    page, min(5000, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
+                )
+                _grafana_scroll_paint_lazy_panels(page)
+                page.wait_for_timeout(200)
 
             if not _grafana_dashboard_has_visual_content(page):
                 logger.warning(
@@ -1490,6 +1557,7 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
                     page.wait_for_timeout(800)
                     _grafana_playwright_dock_nav_only(page, timeout_ms)
                     _grafana_click_dashboard_refresh(page, timeout_ms)
+                    _grafana_expand_collapsed_dashboard_rows(page)
                     _grafana_wait_dashboard_ready(page, min(20000, timeout_ms // 2))
                     _grafana_wait_dashboard_body_populated(
                         page, min(8000, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
