@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime
 import re
 import threading
 import time
@@ -920,11 +921,36 @@ def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
         )
 
 
+def _fmt_ts_short(ts: Any) -> str:
+    try:
+        return datetime.fromtimestamp(int(float(ts))).strftime("%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return str(ts)
+
+
+def _fmt_num(v: Any) -> str:
+    try:
+        f = float(v)
+        if abs(f - round(f)) < 1e-6:
+            return f"{int(round(f)):,}"
+        return f"{f:,.2f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
 def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
+    """
+    除最新点外，按 Prometheus ``values`` 时间序列列出「每步一行」（步长通常 60s ≈ 每分钟一点），
+    便于在 Lark 里直接读数，效果接近 Grafana 里开表 + 图。
+    """
     w = payload.get("window") or {}
+    step_s = int(w.get("stepSeconds") or 60)
     span = int(w.get("endUnix", 0)) - int(w.get("startUnix", 0))
+    # 控制总长：每条线最多打印最近 N 个桶（与 10m + 60s step 对齐时约 10 行）
+    max_rows = 14
+
     lines: List[str] = [
-        f"【{payload.get('panelTitle')}】最近 {span}s（步长 {w.get('stepSeconds')}s）",
+        f"【{payload.get('panelTitle')}】最近 {span}s（步长 {step_s}s，下列为每步数值）",
         f"Dashboard: {GRAFANA_BASE_URL}/d/{payload.get('dashboardUid')}",
     ]
     for s in payload.get("series") or []:
@@ -940,11 +966,17 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
             legend_bits = [f"{k}={v}" for k, v in sorted(m.items()) if k not in ("__name__",)][:4]
             legend = ", ".join(legend_bits) or str(m.get("__name__", ref))
             vals = r.get("values") or []
-            if vals:
-                last = vals[-1]
-                lines.append(f"- {legend}\n  latest: {last[1]} @ {last[0]} ({len(vals)} pts)")
-            else:
+            if not vals:
                 lines.append(f"- {legend}\n  (empty)")
+                continue
+            last = vals[-1]
+            lines.append(
+                f"- {legend}\n  最新 latest: {_fmt_num(last[1])} @ {_fmt_ts_short(last[0])} (共 {len(vals)} 点)"
+            )
+            tail = vals[-max_rows:]
+            lines.append("  time          value")
+            for pair in tail:
+                lines.append(f"  {_fmt_ts_short(pair[0]):<14} {_fmt_num(pair[1])}")
     out = "\n".join(lines)
     if len(out) > 4500:
         out = out[:4490] + "\n…(truncated)"
