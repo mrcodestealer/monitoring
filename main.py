@@ -73,11 +73,15 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_KIOSK": "",
     # 截图前先打开站点根路径再进 dashboard，利于 session 与 SPA bootstrap
     "GRAFANA_SCREENSHOT_BOOT_WARM": "1",
-    # 整页截图稳定：多轮滚动 + 等 Spinner 消失；仍无法保证 Prometheus 返回「No data」的格子有曲线
-    "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 3,
-    "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 420,
-    "GRAFANA_SCREENSHOT_SETTLE_MS": 5500,
-    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 90000,
+    # 截图 URL 用 now-10m / now（与浏览器一致）；0 则用 Prometheus 窗口的绝对毫秒时间戳
+    "GRAFANA_SCREENSHOT_RELATIVE_RANGE": "1",
+    # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
+    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 12000,
+    # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
+    "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 1,
+    "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 220,
+    "GRAFANA_SCREENSHOT_SETTLE_MS": 1200,
+    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 12000,
     # 至少等到 N 个 .react-grid-item（0=不等待；经典大屏可设 4–8；Scenes 布局可能为 0）
     "GRAFANA_SCREENSHOT_MIN_GRID_ITEMS": 0,
     "GRAFANA_USER": "om_duty",
@@ -298,21 +302,25 @@ GRAFANA_SCREENSHOT_WIDTH = _cfg_int("GRAFANA_SCREENSHOT_WIDTH", 1400)
 GRAFANA_SCREENSHOT_HEIGHT = _cfg_int("GRAFANA_SCREENSHOT_HEIGHT", 1080)
 GRAFANA_SCREENSHOT_TIMEOUT_MS = _cfg_int("GRAFANA_SCREENSHOT_TIMEOUT_MS", 90000)
 GRAFANA_SCREENSHOT_STABILIZE_ROUNDS = max(
-    1, min(8, _cfg_int("GRAFANA_SCREENSHOT_STABILIZE_ROUNDS", 3))
+    1, min(8, _cfg_int("GRAFANA_SCREENSHOT_STABILIZE_ROUNDS", 1))
 )
 GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS = max(
-    80, min(3000, _cfg_int("GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS", 420))
+    80, min(3000, _cfg_int("GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS", 220))
 )
 GRAFANA_SCREENSHOT_SETTLE_MS = max(
-    0, min(120_000, _cfg_int("GRAFANA_SCREENSHOT_SETTLE_MS", 5500))
+    0, min(120_000, _cfg_int("GRAFANA_SCREENSHOT_SETTLE_MS", 1200))
 )
 GRAFANA_SCREENSHOT_SPINNER_MAX_MS = max(
-    3000, min(180_000, _cfg_int("GRAFANA_SCREENSHOT_SPINNER_MAX_MS", 90000))
+    2000, min(60_000, _cfg_int("GRAFANA_SCREENSHOT_SPINNER_MAX_MS", 12000))
+)
+GRAFANA_SCREENSHOT_POPULATE_MAX_MS = max(
+    2000, min(90_000, _cfg_int("GRAFANA_SCREENSHOT_POPULATE_MAX_MS", 12000))
 )
 GRAFANA_SCREENSHOT_MIN_GRID_ITEMS = max(
     0, min(200, _cfg_int("GRAFANA_SCREENSHOT_MIN_GRID_ITEMS", 0))
 )
 GRAFANA_SCREENSHOT_KIOSK = _cfg_str("GRAFANA_SCREENSHOT_KIOSK", "").strip()
+GRAFANA_SCREENSHOT_RELATIVE_RANGE = _lark_env_truthy("GRAFANA_SCREENSHOT_RELATIVE_RANGE")
 GRAFANA_USER = (
     _cfg_str("GRAFANA_USER")
     or _cfg_str("GRAFANA_ID")
@@ -1053,6 +1061,24 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
         )
 
 
+# Playwright ``wait_for_function`` / ``evaluate``: true when dashboard body looks mounted (not only header).
+_GRAFANA_JS_REACTROOT_HAS_CHARTS = """() => {
+  const rr = document.getElementById('reactRoot');
+  if (!rr) return false;
+  const n = (sel) => rr.querySelectorAll(sel).length;
+  const grid = n('.react-grid-item');
+  const uplot = n('[data-testid="uplot-main-div"]');
+  const canv = n('canvas');
+  const panels = n('[data-testid^="data-testid Panel"], [class*="PanelChrome"], [class*="panel-content"]');
+  const main = document.querySelector('main');
+  const mh = main ? main.getBoundingClientRect().height : 0;
+  if (grid + uplot + canv >= 1) return true;
+  if (panels >= 1 && mh > 140) return true;
+  if (canv >= 1 && mh > 100) return true;
+  return false;
+}"""
+
+
 def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     """
     Grafana 12：左侧 mega-menu 展开时先点「Dock menu」(#dock-menu-button) 再拍主区；
@@ -1214,20 +1240,15 @@ def _grafana_stabilize_dashboard_render(
     ``rounds`` overrides ``GRAFANA_SCREENSHOT_STABILIZE_ROUNDS`` (e.g. ``1`` on reload retry).
     """
     r = GRAFANA_SCREENSHOT_STABILIZE_ROUNDS if rounds is None else max(1, min(8, int(rounds)))
-    per_round = max(5000, min(35000, GRAFANA_SCREENSHOT_SPINNER_MAX_MS // max(1, r + 1)))
-    final_spin = max(8000, min(45000, GRAFANA_SCREENSHOT_SPINNER_MAX_MS // 2))
+    per_round = max(1200, min(6000, GRAFANA_SCREENSHOT_SPINNER_MAX_MS // max(2, r + 1)))
+    final_spin = max(1500, min(8000, GRAFANA_SCREENSHOT_SPINNER_MAX_MS))
 
     if GRAFANA_SCREENSHOT_MIN_GRID_ITEMS > 0:
         _grafana_wait_min_react_grid_items(
             page,
             GRAFANA_SCREENSHOT_MIN_GRID_ITEMS,
-            min(35000, max(8000, timeout_ms // 2)),
+            min(12000, max(4000, timeout_ms // 3)),
         )
-
-    try:
-        page.wait_for_load_state("networkidle", timeout=min(12000, max(4000, timeout_ms // 6)))
-    except Exception:
-        logger.info("Grafana screenshot: networkidle not reached within budget (continuing)")
 
     for rnd in range(r):
         logger.info("Grafana screenshot: stabilize round %s/%s", rnd + 1, r)
@@ -1239,44 +1260,23 @@ def _grafana_stabilize_dashboard_render(
 
 
 def _grafana_dashboard_has_visual_content(page: Any) -> bool:
-    """True when #reactRoot contains at least one grid cell, uPlot canvas, or chart canvas."""
+    """True when #reactRoot looks like a loaded dashboard (see ``_GRAFANA_JS_REACTROOT_HAS_CHARTS``)."""
     try:
-        return bool(
-            page.evaluate(
-                """() => {
-                  const rr = document.getElementById('reactRoot');
-                  if (!rr) return false;
-                  const grid = rr.querySelectorAll('.react-grid-item').length;
-                  const uplot = rr.querySelectorAll('[data-testid="uplot-main-div"]').length;
-                  const canv = rr.querySelectorAll('canvas').length;
-                  return (grid + uplot + canv) >= 1;
-                }"""
-            )
-        )
+        return bool(page.evaluate(_GRAFANA_JS_REACTROOT_HAS_CHARTS))
     except Exception:
         return False
 
 
 def _grafana_wait_dashboard_body_populated(page: Any, budget_ms: int) -> bool:
-    """Block until panels/charts exist inside reactRoot (stronger than a single CSS locator)."""
-    b = max(4000, min(120000, int(budget_ms)))
+    """Short wait_for_function — budget capped by ``GRAFANA_SCREENSHOT_POPULATE_MAX_MS`` style callers."""
+    b = max(1500, min(int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS), int(budget_ms)))
     try:
-        page.wait_for_function(
-            """() => {
-              const rr = document.getElementById('reactRoot');
-              if (!rr) return false;
-              const grid = rr.querySelectorAll('.react-grid-item').length;
-              const uplot = rr.querySelectorAll('[data-testid="uplot-main-div"]').length;
-              const canv = rr.querySelectorAll('canvas').length;
-              return (grid + uplot + canv) >= 1;
-            }""",
-            timeout=b,
-        )
-        logger.info("Grafana screenshot: reactRoot populated (grid/uplot/canvas)")
+        page.wait_for_function(_GRAFANA_JS_REACTROOT_HAS_CHARTS, timeout=b)
+        logger.info("Grafana screenshot: reactRoot looks populated")
         return True
     except Exception as e:
         logger.warning(
-            "Grafana screenshot: reactRoot still empty after %sms wait_for_function: %s",
+            "Grafana screenshot: populate wait stopped after %sms: %s",
             b,
             e,
         )
@@ -1284,11 +1284,21 @@ def _grafana_wait_dashboard_body_populated(page: Any, budget_ms: int) -> bool:
 
 
 def _grafana_build_screenshot_dashboard_url(start_unix: int, end_unix: int) -> str:
-    params: List[Tuple[str, str]] = [
-        ("orgId", "1"),
-        ("from", str(int(start_unix) * 1000)),
-        ("to", str(int(end_unix) * 1000)),
-    ]
+    params: List[Tuple[str, str]] = [("orgId", "1")]
+    if GRAFANA_SCREENSHOT_RELATIVE_RANGE:
+        params.extend(
+            [
+                ("from", (GRAFANA_DASHBOARD_FROM or "now-10m").strip()),
+                ("to", (GRAFANA_DASHBOARD_TO or "now").strip()),
+            ]
+        )
+    else:
+        params.extend(
+            [
+                ("from", str(int(start_unix) * 1000)),
+                ("to", str(int(end_unix) * 1000)),
+            ]
+        )
     k = (GRAFANA_SCREENSHOT_KIOSK or "").strip().lower()
     if k and k not in ("0", "false", "no", "off"):
         if k in ("1", "true", "yes", "on"):
@@ -1304,9 +1314,9 @@ def _grafana_wait_dashboard_ready(page: Any, timeout_ms: int) -> None:
     SPA 在 ``domcontentloaded`` 时往往还没有 panel；此处在 ``load`` 之后仍要等网格/画布出现。
     与 ``GRAFANA_SCREENSHOT_DOCK_NAV`` 无关：关 dock 时也必须执行，否则截到空白主区。
     """
-    t = min(45000, max(8000, int(timeout_ms)))
+    t = min(20000, max(5000, int(timeout_ms) // 2))
     try:
-        page.locator("#reactRoot").wait_for(state="visible", timeout=min(20000, t))
+        page.locator("#reactRoot").wait_for(state="visible", timeout=min(12000, t))
     except Exception:
         pass
 
@@ -1319,9 +1329,10 @@ def _grafana_wait_dashboard_ready(page: Any, timeout_ms: int) -> None:
         '[class*="PanelChrome"]',
     )
     matched: Optional[str] = None
+    slot = min(7000, max(2500, t // 2))
     for sel in selectors:
         try:
-            page.locator(sel).first.wait_for(state="visible", timeout=min(15000, t))
+            page.locator(sel).first.wait_for(state="visible", timeout=slot)
             matched = sel
             break
         except Exception:
@@ -1332,12 +1343,12 @@ def _grafana_wait_dashboard_ready(page: Any, timeout_ms: int) -> None:
             safe_title = (GRAFANA_PANEL_TITLE or "").replace('"', '\\"')
             if safe_title:
                 page.locator(f'h2[title="{safe_title}"]').first.wait_for(
-                    state="visible", timeout=min(15000, t)
+                    state="visible", timeout=slot
                 )
                 matched = f'h2[title="{safe_title}"]'
         except Exception:
             logger.warning(
-                "Grafana screenshot: no known panel/grid selector matched — capture may be blank "
+                "Grafana screenshot: no known panel/grid selector matched — continuing "
                 "(selectors tried: %s; panel title: %r)",
                 selectors,
                 GRAFANA_PANEL_TITLE,
@@ -1345,7 +1356,7 @@ def _grafana_wait_dashboard_ready(page: Any, timeout_ms: int) -> None:
     else:
         logger.info("Grafana screenshot: dashboard content wait matched %r", matched)
 
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(600)
 
 
 def _playwright_cookie_list(session: requests.Session) -> List[Dict[str, Any]]:
@@ -1382,6 +1393,11 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
     cookies = _playwright_cookie_list(session)
     timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
+    logger.info(
+        "Grafana screenshot: relative_range=%s url=%s",
+        GRAFANA_SCREENSHOT_RELATIVE_RANGE,
+        url[:300] + ("…" if len(url) > 300 else ""),
+    )
 
     with sync_playwright() as p:
         # Linux / systemd 常见：缺 sandbox 时 Chromium 起不来；Docker 也常用这几项
@@ -1420,29 +1436,27 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
                 page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(30000, timeout_ms))
                 page.wait_for_timeout(500)
 
-            # Grafana 为 SPA：先根路径再 dashboard；再等 #reactRoot 内真实图表 DOM + 多轮滚动
+            # Grafana 为 SPA：先根路径再 dashboard；相对时间 URL 与浏览器一致
             page.goto(url, wait_until="load", timeout=timeout_ms)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(500)
             _grafana_playwright_dock_nav_only(page, timeout_ms)
             _grafana_wait_dashboard_ready(page, timeout_ms)
-            _grafana_wait_dashboard_body_populated(
-                page, min(90000, max(15000, int(timeout_ms * 0.65)))
-            )
+            _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
             _grafana_stabilize_dashboard_render(page, timeout_ms)
-            _grafana_wait_dashboard_ready(page, min(20000, max(8000, timeout_ms // 4)))
+            page.wait_for_timeout(400)
 
             if not _grafana_dashboard_has_visual_content(page):
                 logger.warning(
-                    "Grafana screenshot: no chart DOM before PNG — reloading dashboard once (kiosk was %r)",
+                    "Grafana screenshot: chart DOM not detected — reload once (kiosk=%r)",
                     GRAFANA_SCREENSHOT_KIOSK or "(off)",
                 )
                 try:
                     page.reload(wait_until="load", timeout=timeout_ms)
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(800)
                     _grafana_playwright_dock_nav_only(page, timeout_ms)
-                    _grafana_wait_dashboard_ready(page, min(35000, timeout_ms // 2))
+                    _grafana_wait_dashboard_ready(page, min(20000, timeout_ms // 2))
                     _grafana_wait_dashboard_body_populated(
-                        page, min(60000, max(12000, timeout_ms // 2))
+                        page, min(8000, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
                     )
                     _grafana_stabilize_dashboard_render(page, timeout_ms, rounds=1)
                 except Exception as e:
@@ -1450,8 +1464,9 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
 
             if not _grafana_dashboard_has_visual_content(page):
                 logger.error(
-                    "Grafana screenshot: reactRoot still has no .react-grid-item / uplot / canvas — "
-                    "PNG is likely blank (check session cookie, GRAFANA_DASHBOARD_PATH, or set GRAFANA_SCREENSHOT_KIOSK=tv if you require kiosk)."
+                    "Grafana screenshot: still no chart-like DOM — PNG may be blank "
+                    "(session cookie / GRAFANA_DASHBOARD_PATH / try GRAFANA_SCREENSHOT_RELATIVE_RANGE=0 "
+                    "or GRAFANA_SCREENSHOT_KIOSK=tv)."
                 )
 
             if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
