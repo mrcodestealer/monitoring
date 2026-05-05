@@ -45,6 +45,7 @@ _CFG: Dict[str, Any] = {
     "WAITRESS_THREADS": 24,
     "LARK_HOST": "https://open.larksuite.com",
     "LARK_WEBHOOK_PUBLIC_URL": "http://47.84.112.211:5002/webhook/event",
+    "LARK_WEBHOOK_EXTRA_PATHS": "",
     "GRAFANA_BASE_URL": "https://grafana.client8.me",
     "GRAFANA_DASHBOARD_PATH": "/d/281e8816-ccb0-4335-922b-6b248491fd28/core-metrics-arms-aliyun",
     "GRAFANA_DASHBOARD_UID": "281e8816-ccb0-4335-922b-6b248491fd28",
@@ -1565,6 +1566,16 @@ def webhook_event():
             request.content_length,
             (request.headers.get("Content-Type") or "")[:120],
         )
+        # Chatbox style ingress marker for journalctl grepping.
+        print(
+            "[lark] webhook POST len=%s path=%s ct=%s"
+            % (
+                request.content_length,
+                request.path,
+                (request.headers.get("Content-Type") or "")[:80],
+            ),
+            flush=True,
+        )
     # Chatbox: OPTIONS must not 405 — some clients preflight the callback URL.
     if request.method == "OPTIONS":
         return "", 204
@@ -1725,6 +1736,27 @@ def webhook_event():
         list(data.keys())[:20],
     )
     return _lark_feishu_webhook_ack_immediate()
+
+
+def _register_lark_webhook_duplicate_paths() -> None:
+    """
+    Chatbox-compatible legacy callback paths:
+    set ``LARK_WEBHOOK_EXTRA_PATHS=/callback,/open/event`` to map additional POST paths
+    onto the same ``webhook_event`` handler.
+    """
+    extra = _cfg_str("LARK_WEBHOOK_EXTRA_PATHS", "").strip()
+    if not extra:
+        return
+    for i, raw in enumerate(extra.split(",")):
+        path = raw.strip()
+        if not path or path.rstrip("/") == "/webhook/event":
+            continue
+        app.add_url_rule(path, f"lark_webhook_extra_{i}", webhook_event, methods=["POST", "GET", "OPTIONS", "HEAD"])
+        logger.info("Extra webhook route registered: %s", path)
+        print(f"[lark] Extra webhook POST route registered: {path}", flush=True)
+
+
+_register_lark_webhook_duplicate_paths()
 
 
 @app.route("/grafana/ping", methods=["GET"])
