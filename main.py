@@ -1664,12 +1664,28 @@ def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
 
 
 def _compact_http_legend(metric: Dict[str, Any], ref: str) -> str:
-    """Prefer a single ``callType=http``-style token when a label value is ``http``."""
+    """
+    Prefer a ``callType=http``-style token when a label value is ``http``,
+    but **append other labels** so multiple http streams (different instance/job/…)
+    do not look like duplicate lines with mysteriously different values.
+    """
+    http_pair: Optional[str] = None
+    other_bits: List[str] = []
     for k, v in sorted(metric.items()):
         if k == "__name__":
             continue
         if str(v).strip().lower() == "http":
-            return f"{k}=http"
+            if http_pair is None:
+                http_pair = f"{k}=http"
+        else:
+            other_bits.append(f"{k}={v}")
+    if http_pair:
+        if not other_bits:
+            return http_pair
+        tail = ", ".join(other_bits[:5])
+        if len(other_bits) > 5:
+            tail += ", …"
+        return f"{http_pair} | {tail}"
     bits = [f"{k}={v}" for k, v in sorted(metric.items()) if k != "__name__"]
     return ", ".join(bits[:4]) or str(metric.get("__name__", ref))
 
@@ -1914,7 +1930,7 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
             if not vals:
                 lines.append(f"- {legend}\n  (empty)")
                 continue
-            lines.append(f"- {legend}")
+            lines.append(f"- [{ref}] {legend}")
             tail = vals[-max_rows:]
             lines.append("  time          value")
             for pair in tail:
