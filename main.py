@@ -1214,16 +1214,15 @@ def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
     return False
 
 
-def _count_http_prometheus_result_rows(payload: Dict[str, Any]) -> int:
-    """How many Prometheus matrix rows are HTTP legs (used to avoid duplicate merged table)."""
-    n = 0
-    for s in payload.get("series") or []:
-        prom = s.get("prometheus") or {}
-        pdata = prom.get("data") or {}
-        for r in pdata.get("result") or []:
-            if _metric_series_is_http_leg(r.get("metric") or {}):
-                n += 1
-    return n
+def _compact_http_legend(metric: Dict[str, Any], ref: str) -> str:
+    """Prefer a single ``callType=http``-style token when a label value is ``http``."""
+    for k, v in sorted(metric.items()):
+        if k == "__name__":
+            continue
+        if str(v).strip().lower() == "http":
+            return f"{k}=http"
+    bits = [f"{k}={v}" for k, v in sorted(metric.items()) if k != "__name__"]
+    return ", ".join(bits[:4]) or str(metric.get("__name__", ref))
 
 
 def _merge_http_timeseries_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
@@ -1403,81 +1402,47 @@ def _fmt_num(v: Any) -> str:
 
 
 def _format_http_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
-    """English-only summary for Lark (HTTP merged series + windows + consecutive streaks)."""
-    lines: List[str] = []
-    pc = int(analysis.get("point_count") or 0)
+    """
+    Compact footer: max drop/spike from best consecutive monotonic run (first→last bucket %).
+    Threshold line matches product copy; @mention is still driven by ``hit_alert`` (mean windows).
+    """
     thr = float(analysis.get("alert_threshold_pct") or MONITORING_HTTP_DROP_ALERT_PCT)
-    lines.append(
-        f"[HTTP merged] {pc} points; mean-drop windows N=1..10 vs threshold {thr:g}%; "
-        "max drop/spike = best **consecutive** weakly monotonic run (first→last bucket %)."
-    )
+    lines: List[str] = [
+        "",
+        f"【HTTP only 】ALERT will trigger when drop/spike >= {thr:g}%",
+    ]
 
     cd = analysis.get("consecutive_max_drop") or analysis.get("adjacent_max_drop")
     cs = analysis.get("consecutive_max_spike") or analysis.get("adjacent_max_spike")
     if isinstance(cd, dict) and cd.get("from_ts") is not None:
-        bk = int(cd.get("buckets") or 0)
+        p = cd.get("pct")
         lines.append(
-            f"- Largest consecutive drop: {_fmt_ts_short(cd['from_ts'])} → {_fmt_ts_short(cd['to_ts'])}  "
-            f"({bk} buckets)  {cd.get('pct')}% vs start of run"
+            f"- max drop : {_fmt_ts_short(cd['from_ts'])} → {_fmt_ts_short(cd['to_ts'])}  -{p}%"
         )
     else:
-        lines.append("- Largest consecutive drop: n/a (no multi-bucket down run or zero baseline)")
+        lines.append("- max drop : n/a")
 
     if isinstance(cs, dict) and cs.get("from_ts") is not None:
-        bk = int(cs.get("buckets") or 0)
-        lines.append(
-            f"- Largest consecutive spike: {_fmt_ts_short(cs['from_ts'])} → {_fmt_ts_short(cs['to_ts'])}  "
-            f"({bk} buckets)  +{cs.get('pct')}% vs start of run"
-        )
+        p = cs.get("pct")
+        lines.append(f"- max spike: {_fmt_ts_short(cs['from_ts'])} → {_fmt_ts_short(cs['to_ts'])}  +{p}%")
     else:
-        lines.append("- Largest consecutive spike: n/a")
+        lines.append("- max spike: n/a")
 
-    wworst = analysis.get("worst_avg_drop_window")
-    if isinstance(wworst, dict) and wworst.get("n_minutes"):
-        lines.append(
-            f"- Worst mean-drop window (N={wworst['n_minutes']}m): "
-            f"baseline {_fmt_ts_short(wworst['baseline_from_ts'])}..{_fmt_ts_short(wworst['baseline_to_ts'])} → "
-            f"recent {_fmt_ts_short(wworst['recent_from_ts'])}..{_fmt_ts_short(wworst['recent_to_ts'])}  "
-            f"drop {wworst.get('avg_drop_pct')}%"
-        )
-    else:
-        lines.append("- Worst mean-drop window: not enough points for any N=1..10")
-
-    if analysis.get("hit_alert"):
-        lines.append(
-            f"- ALERT: some N in 1..10 has mean(prev N) vs mean(last N) drop ≥ {thr:g}%"
-        )
-    else:
-        lines.append(
-            f"- No alert: all computed N windows have mean drop < {thr:g}%"
-        )
     return lines
 
 
 def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
     """
-    除最新点外，按 Prometheus ``values`` 时间序列列出「每步一行」（步长通常 60s ≈ 每分钟一点），
-    便于在 Lark 里直接读数，效果接近 Grafana 里开表 + 图。
-
-    「请求总数/1m」类面板：明细只展示 **标签值为 http** 的序列；跌幅/告警仅基于 HTTP 合并序列。
+    Lark-friendly compact layout: ``【panel】graph`` + short ``Dashboard: …/d/{uid}`` + HTTP table + footer.
     """
-    w = payload.get("window") or {}
-    step_s = int(w.get("stepSeconds") or 60)
-    span = int(w.get("endUnix", 0)) - int(w.get("startUnix", 0))
-    # 控制总长：每条线最多打印最近 N 个桶（与 10m + 60s step 对齐时约 10 行）
-    max_rows = 14
-    lag_note = ""
-    if GRAFANA_QUERY_END_LAG_SECONDS > 0:
-        lag_note = f"；查询 end 推迟 {GRAFANA_QUERY_END_LAG_SECONDS}s（略过最近未完成分钟桶）"
-
+    max_rows = 11
+    uid = str(payload.get("dashboardUid") or GRAFANA_DASHBOARD_UID)
+    base = str(GRAFANA_BASE_URL).rstrip("/")
     http_ex = _http_analysis_for_payload(payload)
-    merged_pts: List[List[float]] = http_ex.get("merged_points") or []
-    n_http_rows = _count_http_prometheus_result_rows(payload)
 
     lines: List[str] = [
-        f"【{payload.get('panelTitle')}】最近 {span}s（步长 {step_s}s，下列为每步数值）{lag_note}",
-        "明细仅 HTTP 序列 / detail: HTTP-labeled series only；合并用于告警 / merged used for alert",
-        f"Dashboard: {GRAFANA_BASE_URL}/d/{payload.get('dashboardUid')}",
+        f"【{payload.get('panelTitle')}】graph",
+        f"Dashboard: {base}/d/{uid}",
     ]
     for s in payload.get("series") or []:
         prom = s.get("prometheus") or {}
@@ -1485,53 +1450,27 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
         results = pdata.get("result") or []
         ref = s.get("refId") or "?"
         if not results:
-            lines.append(f"- [{ref}] 无数据 / no data")
+            lines.append(f"- [{ref}] no data")
             continue
         http_results = [
             r for r in results[:24] if _metric_series_is_http_leg(r.get("metric") or {})
         ]
         if not http_results:
-            lines.append(
-                f"- [{ref}] 无「标签值为 http」的序列 / no series with label value http (skipped {len(results)} rows)"
-            )
+            lines.append(f"- [{ref}] no http-labeled series (skipped {len(results)} rows)")
             continue
         for r in http_results[:12]:
             m = r.get("metric") or {}
-            legend_bits = [f"{k}={v}" for k, v in sorted(m.items()) if k not in ("__name__",)][:4]
-            legend = ", ".join(legend_bits) or str(m.get("__name__", ref))
+            legend = _compact_http_legend(m, str(ref))
             vals = r.get("values") or []
             if not vals:
                 lines.append(f"- {legend}\n  (empty)")
                 continue
-            last = vals[-1]
-            lines.append(
-                f"- {legend}\n  最新 latest: {_fmt_num(last[1])} @ {_fmt_ts_short(last[0])} (共 {len(vals)} 点)"
-            )
+            lines.append(f"- {legend}")
             tail = vals[-max_rows:]
             lines.append("  time          value")
             for pair in tail:
                 lines.append(f"  {_fmt_ts_short(pair[0]):<14} {_fmt_num(pair[1])}")
 
-    lines.append("")
-    if merged_pts:
-        if n_http_rows <= 1:
-            lines.append(
-                "- HTTP merged (sum / 合并): 仅 1 条 HTTP 序列，与上表完全相同，省略重复表。"
-                " / single HTTP series — identical to detail above; duplicate table omitted."
-            )
-        else:
-            last = merged_pts[-1]
-            lines.append(
-                f"- HTTP merged (sum / 合并, {n_http_rows} 条)\n  最新 latest: {_fmt_num(last[1])} @ {_fmt_ts_short(last[0])} (共 {len(merged_pts)} 点)"
-            )
-            tail = merged_pts[-max_rows:]
-            lines.append("  time          value")
-            for pair in tail:
-                lines.append(f"  {_fmt_ts_short(pair[0]):<14} {_fmt_num(pair[1])}")
-    else:
-        lines.append("- HTTP merged (sum / 合并): 无数据 — 未匹配到任何 label 值为 http 的序列")
-
-    lines.append("")
     if http_ex.get("hit_alert") and TARGET_USER_OPEN_ID:
         lines.append(f'<at user_id="{TARGET_USER_OPEN_ID}"> </at>')
     lines.extend(_format_http_analysis_lines(http_ex))
