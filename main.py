@@ -1408,13 +1408,52 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             if cookies:
                 context.add_cookies(cookies)
             page = context.new_page()
-            # Grafana 为 SPA：需 load + 等 grid + 多轮滚动与 Spinner 消失后再截
+            try:
+                page.add_init_script(
+                    "try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});}catch(e){}"
+                )
+            except Exception:
+                pass
+
+            base = str(GRAFANA_BASE_URL).rstrip("/")
+            if _lark_env_truthy("GRAFANA_SCREENSHOT_BOOT_WARM"):
+                page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(30000, timeout_ms))
+                page.wait_for_timeout(500)
+
+            # Grafana 为 SPA：先根路径再 dashboard；再等 #reactRoot 内真实图表 DOM + 多轮滚动
             page.goto(url, wait_until="load", timeout=timeout_ms)
             page.wait_for_timeout(1000)
             _grafana_playwright_dock_nav_only(page, timeout_ms)
             _grafana_wait_dashboard_ready(page, timeout_ms)
+            _grafana_wait_dashboard_body_populated(
+                page, min(90000, max(15000, int(timeout_ms * 0.65)))
+            )
             _grafana_stabilize_dashboard_render(page, timeout_ms)
             _grafana_wait_dashboard_ready(page, min(20000, max(8000, timeout_ms // 4)))
+
+            if not _grafana_dashboard_has_visual_content(page):
+                logger.warning(
+                    "Grafana screenshot: no chart DOM before PNG — reloading dashboard once (kiosk was %r)",
+                    GRAFANA_SCREENSHOT_KIOSK or "(off)",
+                )
+                try:
+                    page.reload(wait_until="load", timeout=timeout_ms)
+                    page.wait_for_timeout(2000)
+                    _grafana_playwright_dock_nav_only(page, timeout_ms)
+                    _grafana_wait_dashboard_ready(page, min(35000, timeout_ms // 2))
+                    _grafana_wait_dashboard_body_populated(
+                        page, min(60000, max(12000, timeout_ms // 2))
+                    )
+                    _grafana_stabilize_dashboard_render(page, timeout_ms, rounds=1)
+                except Exception as e:
+                    logger.warning("Grafana screenshot: reload retry failed: %s", e)
+
+            if not _grafana_dashboard_has_visual_content(page):
+                logger.error(
+                    "Grafana screenshot: reactRoot still has no .react-grid-item / uplot / canvas — "
+                    "PNG is likely blank (check session cookie, GRAFANA_DASHBOARD_PATH, or set GRAFANA_SCREENSHOT_KIOSK=tv if you require kiosk)."
+                )
+
             if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
                 page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
             png = page.screenshot(type="png", full_page=full_page)
