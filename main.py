@@ -599,15 +599,26 @@ def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
 
 def _is_simple_hi_greeting(raw_text: str, clean: str, mentions: Any) -> bool:
     """
-    Reply `hi` only when user clearly pings the bot (mention present) with a short greeting.
+    Reply `hi` when user pings the bot and message contains a simple greeting token.
     """
     normalized = (clean or raw_text or "").strip().lower()
     normalized = re.sub(r"[!,.。！？]+", "", normalized).strip()
-    if normalized not in ("hi", "hello", "hey"):
-        return False
+
+    has_mention = False
     if isinstance(mentions, list) and len(mentions) > 0:
-        return True
-    return "<at" in (raw_text or "").lower()
+        has_mention = True
+    low_raw = (raw_text or "").lower()
+    if "<at" in low_raw:
+        has_mention = True
+    if re.search(r"(^|\s)@[^\s]+", (raw_text or "")):
+        has_mention = True
+    if not has_mention:
+        return False
+
+    # Remove plain-text @mentions before token matching, e.g. "@Monitoring bot hi".
+    normalized = re.sub(r"(^|\s)@[^\s]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return bool(re.search(r"\b(hi|hello|hey)\b", normalized))
 
 
 def _reserve_message_id_once(mid: str) -> bool:
