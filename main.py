@@ -54,6 +54,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 600,
+    # Prometheus 最后一分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，避免假下跌 / false drop
+    "GRAFANA_QUERY_END_LAG_SECONDS": 120,
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
     "VERIFICATION_TOKEN": "QlZMYp7rogAS914dxxMVNgboUKxQP7jc",
@@ -254,6 +256,7 @@ GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 # Prometheus query_range step (seconds); 60 → up to 10 buckets in 10m
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
 GRAFANA_QUERY_LOOKBACK_SECONDS = _cfg_int("GRAFANA_QUERY_LOOKBACK_SECONDS", 600)
+GRAFANA_QUERY_END_LAG_SECONDS = _cfg_int("GRAFANA_QUERY_END_LAG_SECONDS", 120)
 GRAFANA_USER = (
     _cfg_str("GRAFANA_USER")
     or _cfg_str("GRAFANA_ID")
@@ -824,9 +827,12 @@ def _prometheus_query_range(
 def fetch_request_total_1m_series() -> Dict[str, Any]:
     """
     Same data as Grafana panel「请求总数/1m」: last GRAFANA_QUERY_LOOKBACK_SECONDS, step GRAFANA_QUERY_STEP.
+    ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
+    avoiding incomplete last-minute series that look like a false drop.
     Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
     """
-    end = int(time.time())
+    lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
+    end = int(time.time()) - lag
     start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
     session = grafana_login_session()
     dash = _fetch_dashboard_model(session, GRAFANA_DASHBOARD_UID)
@@ -948,9 +954,12 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
     span = int(w.get("endUnix", 0)) - int(w.get("startUnix", 0))
     # 控制总长：每条线最多打印最近 N 个桶（与 10m + 60s step 对齐时约 10 行）
     max_rows = 14
+    lag_note = ""
+    if GRAFANA_QUERY_END_LAG_SECONDS > 0:
+        lag_note = f"；查询 end 推迟 {GRAFANA_QUERY_END_LAG_SECONDS}s（略过最近未完成分钟桶）"
 
     lines: List[str] = [
-        f"【{payload.get('panelTitle')}】最近 {span}s（步长 {step_s}s，下列为每步数值）",
+        f"【{payload.get('panelTitle')}】最近 {span}s（步长 {step_s}s，下列为每步数值）{lag_note}",
         f"Dashboard: {GRAFANA_BASE_URL}/d/{payload.get('dashboardUid')}",
     ]
     for s in payload.get("series") or []:
