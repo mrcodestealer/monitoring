@@ -603,6 +603,9 @@ def _is_simple_hi_greeting(raw_text: str, clean: str, mentions: Any) -> bool:
     """
     normalized = (clean or raw_text or "").strip().lower()
     normalized = re.sub(r"[!,.。！？]+", "", normalized).strip()
+    # If platform already stripped @mention into "text_without_at_bot", keep simple one-word greeting working.
+    if normalized in ("hi", "hello", "hey"):
+        return True
 
     has_mention = False
     if isinstance(mentions, list) and len(mentions) > 0:
