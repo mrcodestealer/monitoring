@@ -18,6 +18,7 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 群/at 机器人发 /monitoring → Grafana 摘要。HTTP 回调先返回 ``{}`` 再后台处理。
 
 可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：在文字后追加无头 Chromium 截图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
+默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` 截整页滚动区域（长 dashboard 全部图表）；设为 ``0`` 则仅视口大小（易只拍到上半屏）。
 """
 
 import base64
@@ -64,7 +65,7 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_WIDTH": 1400,
     "GRAFANA_SCREENSHOT_HEIGHT": 900,
     "GRAFANA_SCREENSHOT_TIMEOUT_MS": 90000,
-    "GRAFANA_SCREENSHOT_FULL_PAGE": "0",
+    "GRAFANA_SCREENSHOT_FULL_PAGE": "1",
     # 截图前点 Grafana「Dock menu」收起左侧导航（Grafana 12 mega-menu）；0=跳过
     "GRAFANA_SCREENSHOT_DOCK_NAV": "1",
     "GRAFANA_USER": "om_duty",
@@ -1091,6 +1092,9 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
     """
     Headless Chromium (Playwright) opens the same dashboard URL as the UI, with session cookies.
     Requires: ``pip install playwright`` and ``playwright install chromium`` on the server.
+
+    ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` (default): ``page.screenshot(full_page=True)`` — full scroll height
+    so KPI rows below the fold are included. ``0`` captures only the viewport (``WIDTH``×``HEIGHT``).
     """
     try:
         from playwright.sync_api import sync_playwright
