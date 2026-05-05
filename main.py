@@ -1235,6 +1235,7 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Response:
 def _on_ws_p2_im_message_receive_v1(data: Any) -> None:
     """Official WS handler for ``im.message.receive_v1`` (Feishu long-connection sample code)."""
     try:
+        logger.info("WS_HANDLER_HIT type=im.message.receive_v1")
         payload = _lark_ws_sdk_event_to_dict(data)
         mid, mtype, chat = _ws_log_message_snip(payload)
         logger.info("ws im.message.receive_v1 mid=%r mtype=%r chat=%r", mid, mtype, chat)
@@ -1250,6 +1251,7 @@ def _on_ws_im_message_p2_customized(ce: Any) -> None:
     """
     try:
         et = getattr(getattr(ce, "header", None), "event_type", None) or "?"
+        logger.info("WS_HANDLER_HIT type=%s", et)
         data = _lark_ws_sdk_event_to_dict(ce)
         mid, mtype, chat = _ws_log_message_snip(data)
         logger.info("ws im.message %s mid=%r mtype=%r chat=%r", et, mid, mtype, chat)
@@ -1555,6 +1557,14 @@ def health():
 
 @app.route("/webhook/event", methods=["GET", "POST", "OPTIONS", "HEAD"], strict_slashes=False)
 def webhook_event():
+    if request.method == "POST":
+        logger.info(
+            "WEBHOOK_HIT method=POST path=%s remote=%s len=%s ct=%r",
+            request.path,
+            request.remote_addr,
+            request.content_length,
+            (request.headers.get("Content-Type") or "")[:120],
+        )
     # Chatbox: OPTIONS must not 405 — some clients preflight the callback URL.
     if request.method == "OPTIONS":
         return "", 204
