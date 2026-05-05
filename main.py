@@ -65,6 +65,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_HEIGHT": 900,
     "GRAFANA_SCREENSHOT_TIMEOUT_MS": 90000,
     "GRAFANA_SCREENSHOT_FULL_PAGE": "0",
+    # 截图前点 Grafana「Dock menu」收起左侧导航（Grafana 12 mega-menu）；0=跳过
+    "GRAFANA_SCREENSHOT_DOCK_NAV": "1",
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
     "VERIFICATION_TOKEN": "QlZMYp7rogAS914dxxMVNgboUKxQP7jc",
@@ -1005,6 +1007,57 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
         )
 
 
+def _grafana_playwright_dock_nav_and_wait_charts(page: Any, timeout_ms: int) -> None:
+    """
+    Grafana 12：左侧 mega-menu 展开时先点「Dock menu」(#dock-menu-button) 再拍主区；
+    若未展开则先点 #mega-menu-toggle 再 Dock。随后等 uPlot 画布出现。
+    """
+    if not _lark_env_truthy("GRAFANA_SCREENSHOT_DOCK_NAV"):
+        return
+    t = min(25000, max(5000, int(timeout_ms)))
+    try:
+        page.locator("#reactRoot").wait_for(state="visible", timeout=t)
+    except Exception:
+        pass
+
+    def _try_dock() -> bool:
+        loc = page.locator("#dock-menu-button")
+        if loc.count() == 0:
+            return False
+        try:
+            loc.first.click(timeout=2500)
+            return True
+        except Exception:
+            return False
+
+    try:
+        if not _try_dock():
+            mt = page.locator("#mega-menu-toggle")
+            if mt.count() > 0:
+                try:
+                    mt.first.click(timeout=2000)
+                    page.wait_for_timeout(600)
+                except Exception:
+                    pass
+            _try_dock()
+    except Exception as e:
+        logger.info("Grafana screenshot: dock nav optional step failed: %s", e)
+
+    page.wait_for_timeout(800)
+    try:
+        page.locator('[data-testid="uplot-main-div"]').first.wait_for(state="visible", timeout=t)
+    except Exception:
+        try:
+            safe_title = (GRAFANA_PANEL_TITLE or "").replace('"', '\\"')
+            if safe_title:
+                page.locator(f'h2[title="{safe_title}"]').first.wait_for(state="visible", timeout=t)
+        except Exception:
+            logger.info(
+                "Grafana screenshot: no uplot/panel heading yet — continuing with screenshot anyway"
+            )
+    page.wait_for_timeout(2000)
+
+
 def _playwright_cookie_list(session: requests.Session) -> List[Dict[str, Any]]:
     """
     Use per-cookie ``url`` (Grafana origin) so ``add_cookies`` matches Playwright rules;
@@ -1061,7 +1114,8 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
                 context.add_cookies(cookies)
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(1500)
+            _grafana_playwright_dock_nav_and_wait_charts(page, timeout_ms)
             png = page.screenshot(type="png", full_page=full_page)
             return png
         finally:
