@@ -19,6 +19,7 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 
 可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：在文字后追加无头 Chromium 截图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
 默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` 截整页滚动区域（长 dashboard 全部图表）；设为 ``0`` 则仅视口大小（易只拍到上半屏）。
+多轮滚动 + Spinner 轮询见 ``GRAFANA_SCREENSHOT_STABILIZE_ROUNDS`` 等键；Prometheus 无数据/报错的格子无法被脚本「画出曲线」。
 """
 
 import base64
@@ -63,11 +64,18 @@ _CFG: Dict[str, Any] = {
     # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
     "GRAFANA_SCREENSHOT_ENABLE": "1",
     "GRAFANA_SCREENSHOT_WIDTH": 1400,
-    "GRAFANA_SCREENSHOT_HEIGHT": 900,
+    "GRAFANA_SCREENSHOT_HEIGHT": 1080,
     "GRAFANA_SCREENSHOT_TIMEOUT_MS": 90000,
     "GRAFANA_SCREENSHOT_FULL_PAGE": "1",
     # 截图前点 Grafana「Dock menu」收起左侧导航（Grafana 12 mega-menu）；0=跳过
     "GRAFANA_SCREENSHOT_DOCK_NAV": "1",
+    # 整页截图稳定：多轮滚动 + 等 Spinner 消失；仍无法保证 Prometheus 返回「No data」的格子有曲线
+    "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 3,
+    "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 420,
+    "GRAFANA_SCREENSHOT_SETTLE_MS": 5500,
+    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 90000,
+    # 至少等到 N 个 .react-grid-item（0=不等待；经典大屏可设 4–8；Scenes 布局可能为 0）
+    "GRAFANA_SCREENSHOT_MIN_GRID_ITEMS": 0,
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
     "VERIFICATION_TOKEN": "QlZMYp7rogAS914dxxMVNgboUKxQP7jc",
@@ -283,8 +291,23 @@ GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
 GRAFANA_QUERY_LOOKBACK_SECONDS = _cfg_int("GRAFANA_QUERY_LOOKBACK_SECONDS", 600)
 GRAFANA_QUERY_END_LAG_SECONDS = _cfg_int("GRAFANA_QUERY_END_LAG_SECONDS", 120)
 GRAFANA_SCREENSHOT_WIDTH = _cfg_int("GRAFANA_SCREENSHOT_WIDTH", 1400)
-GRAFANA_SCREENSHOT_HEIGHT = _cfg_int("GRAFANA_SCREENSHOT_HEIGHT", 900)
+GRAFANA_SCREENSHOT_HEIGHT = _cfg_int("GRAFANA_SCREENSHOT_HEIGHT", 1080)
 GRAFANA_SCREENSHOT_TIMEOUT_MS = _cfg_int("GRAFANA_SCREENSHOT_TIMEOUT_MS", 90000)
+GRAFANA_SCREENSHOT_STABILIZE_ROUNDS = max(
+    1, min(8, _cfg_int("GRAFANA_SCREENSHOT_STABILIZE_ROUNDS", 3))
+)
+GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS = max(
+    80, min(3000, _cfg_int("GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS", 420))
+)
+GRAFANA_SCREENSHOT_SETTLE_MS = max(
+    0, min(120_000, _cfg_int("GRAFANA_SCREENSHOT_SETTLE_MS", 5500))
+)
+GRAFANA_SCREENSHOT_SPINNER_MAX_MS = max(
+    3000, min(180_000, _cfg_int("GRAFANA_SCREENSHOT_SPINNER_MAX_MS", 90000))
+)
+GRAFANA_SCREENSHOT_MIN_GRID_ITEMS = max(
+    0, min(200, _cfg_int("GRAFANA_SCREENSHOT_MIN_GRID_ITEMS", 0))
+)
 GRAFANA_USER = (
     _cfg_str("GRAFANA_USER")
     or _cfg_str("GRAFANA_ID")
@@ -1064,24 +1087,150 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     page.wait_for_timeout(800)
 
 
-def _grafana_scroll_paint_lazy_panels(page: Any) -> None:
-    """Headless 下图表常在视口外不绘制；整页截图前滚一遍触发 uPlot/canvas 绘制。"""
+def _grafana_loading_like_count(page: Any) -> int:
+    """Rough count of visible Grafana-style loading elements (deduped by element)."""
     try:
+        return int(
+            page.evaluate(
+                """() => {
+                  const q = [
+                    '[data-testid="Spinner"]',
+                    '[data-testid="data-testid Panel loading bar"]',
+                    '.panel-loading',
+                    '[class*="PanelLoader"]',
+                    '[class*="panel-loading"]',
+                    '.fa-spin',
+                    '.gf-spin',
+                  ];
+                  const seen = new Set();
+                  for (const s of q) {
+                    document.querySelectorAll(s).forEach((el) => {
+                      const r = el.getBoundingClientRect();
+                      const st = window.getComputedStyle(el);
+                      if (r.width < 2 || r.height < 2) return;
+                      if (st && st.visibility === "hidden") return;
+                      if (st && st.display === "none") return;
+                      seen.add(el);
+                    });
+                  }
+                  return seen.size;
+                }"""
+            )
+            or 0
+        )
+    except Exception:
+        return 0
+
+
+def _grafana_wait_loading_like_gone(page: Any, budget_ms: int) -> None:
+    """Poll until loading-like elements stay at 0 for a few ticks (queries + canvas paint)."""
+    if budget_ms <= 0:
+        return
+    deadline = time.monotonic() + budget_ms / 1000.0
+    stable = 0
+    last_c = -1
+    while time.monotonic() < deadline:
+        c = _grafana_loading_like_count(page)
+        if c != last_c:
+            logger.debug("Grafana screenshot: loading-like count=%s", c)
+            last_c = c
+        if c == 0:
+            stable += 1
+            if stable >= 4:
+                return
+        else:
+            stable = 0
+        page.wait_for_timeout(350)
+    c = _grafana_loading_like_count(page)
+    if c > 0:
+        logger.warning(
+            "Grafana screenshot: after %sms loading-like elements still present (count≈%s) — capture may be partial",
+            budget_ms,
+            c,
+        )
+
+
+def _grafana_wait_min_react_grid_items(page: Any, min_items: int, budget_ms: int) -> None:
+    """Classic dashboards use ``.react-grid-item``; scenes may skip (set MIN_GRID_ITEMS=0)."""
+    if min_items <= 0 or budget_ms <= 0:
+        return
+    deadline = time.monotonic() + budget_ms / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            n = page.locator(".react-grid-item").count()
+            if n >= min_items:
+                logger.info("Grafana screenshot: react-grid-item count=%s (>= %s)", n, min_items)
+                return
+        except Exception:
+            pass
+        page.wait_for_timeout(450)
+    try:
+        n = page.locator(".react-grid-item").count()
+    except Exception:
+        n = -1
+    logger.warning(
+        "Grafana screenshot: react-grid-item count=%s did not reach %s within %sms",
+        n,
+        min_items,
+        budget_ms,
+    )
+
+
+def _grafana_scroll_paint_lazy_panels(page: Any) -> None:
+    """Scroll by ~viewport steps so off-screen panels mount and uPlot/canvas paint."""
+    pause = int(GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS)
+    try:
+        vh = int(page.evaluate("() => window.innerHeight || 900") or 900)
+        vh = max(400, min(vh, 2400))
+        step = max(220, int(vh * 0.72))
         h = page.evaluate(
             "() => Math.max(document.body.scrollHeight, (document.scrollingElement || document.documentElement).scrollHeight)"
         )
         h = int(h or 0)
-        h = min(max(h, 800), 25000)
-        step = 450
+        h = min(max(h, 800), 48000)
         y = 0
         while y <= h:
             page.evaluate("(yy) => window.scrollTo(0, yy)", y)
-            page.wait_for_timeout(120)
+            page.wait_for_timeout(pause)
             y += step
+        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(pause)
         page.evaluate("() => window.scrollTo(0, 0)")
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(max(200, pause // 2))
     except Exception as e:
         logger.info("Grafana screenshot: scroll paint step skipped: %s", e)
+
+
+def _grafana_stabilize_dashboard_render(page: Any, timeout_ms: int) -> None:
+    """
+    Multiple scroll passes + spinner polling so lower panels finish Prometheus queries before PNG.
+    """
+    per_round = max(5000, min(35000, GRAFANA_SCREENSHOT_SPINNER_MAX_MS // max(1, GRAFANA_SCREENSHOT_STABILIZE_ROUNDS + 1)))
+    final_spin = max(8000, min(45000, GRAFANA_SCREENSHOT_SPINNER_MAX_MS // 2))
+
+    if GRAFANA_SCREENSHOT_MIN_GRID_ITEMS > 0:
+        _grafana_wait_min_react_grid_items(
+            page,
+            GRAFANA_SCREENSHOT_MIN_GRID_ITEMS,
+            min(35000, max(8000, timeout_ms // 2)),
+        )
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=min(12000, max(4000, timeout_ms // 6)))
+    except Exception:
+        logger.info("Grafana screenshot: networkidle not reached within budget (continuing)")
+
+    for rnd in range(GRAFANA_SCREENSHOT_STABILIZE_ROUNDS):
+        logger.info(
+            "Grafana screenshot: stabilize round %s/%s",
+            rnd + 1,
+            GRAFANA_SCREENSHOT_STABILIZE_ROUNDS,
+        )
+        _grafana_scroll_paint_lazy_panels(page)
+        _grafana_wait_loading_like_gone(page, per_round)
+
+    _grafana_scroll_paint_lazy_panels(page)
+    _grafana_wait_loading_like_gone(page, final_spin)
 
 
 def _grafana_wait_dashboard_ready(page: Any, timeout_ms: int) -> None:
@@ -1130,7 +1279,7 @@ def _grafana_wait_dashboard_ready(page: Any, timeout_ms: int) -> None:
     else:
         logger.info("Grafana screenshot: dashboard content wait matched %r", matched)
 
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(2000)
 
 
 def _playwright_cookie_list(session: requests.Session) -> List[Dict[str, Any]]:
@@ -1152,6 +1301,9 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
 
     ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` (default): ``page.screenshot(full_page=True)`` — full scroll height
     so KPI rows below the fold are included. ``0`` captures only the viewport (``WIDTH``×``HEIGHT``).
+
+    Stabilization: ``GRAFANA_SCREENSHOT_STABILIZE_ROUNDS`` full scrolls + spinner polling; cannot force
+    panels whose datasource returns empty / errors to draw a curve.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -1186,18 +1338,25 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
                 viewport={
                     "width": max(400, int(GRAFANA_SCREENSHOT_WIDTH)),
                     "height": max(300, int(GRAFANA_SCREENSHOT_HEIGHT)),
-                }
+                },
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
             )
             if cookies:
                 context.add_cookies(cookies)
             page = context.new_page()
-            # Grafana 为 SPA：domcontentloaded 时主区常为空白，需 load + 等 grid/canvas + 滚动触发绘制
+            # Grafana 为 SPA：需 load + 等 grid + 多轮滚动与 Spinner 消失后再截
             page.goto(url, wait_until="load", timeout=timeout_ms)
-            page.wait_for_timeout(600)
+            page.wait_for_timeout(1000)
             _grafana_playwright_dock_nav_only(page, timeout_ms)
             _grafana_wait_dashboard_ready(page, timeout_ms)
-            _grafana_scroll_paint_lazy_panels(page)
-            page.wait_for_timeout(800)
+            _grafana_stabilize_dashboard_render(page, timeout_ms)
+            _grafana_wait_dashboard_ready(page, min(20000, max(8000, timeout_ms // 4)))
+            if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
+                page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
             png = page.screenshot(type="png", full_page=full_page)
             return png
         finally:
