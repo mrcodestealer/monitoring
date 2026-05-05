@@ -1165,15 +1165,26 @@ def _grafana_expand_collapsed_dashboard_rows(page: Any) -> None:
         return
 
 
+def _grafana_close_open_menus(page: Any) -> None:
+    """Escape stray overlays (e.g. auto-refresh interval picker opened by a mis-click)."""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(100)
+    except Exception:
+        pass
+
+
 def _grafana_click_dashboard_refresh(
     page: Any, timeout_ms: int, spinner_budget_ms: Optional[int] = None
 ) -> None:
     """
-    Same as a user hitting Grafana's **Refresh** (re-runs queries). If no control matches,
-    fall back to ``page.reload`` once — fixes stuck shells that only show header / row titles (e.g. ``KPI``).
+    Run **Refresh dashboard** (re-query). Order matters: Grafana often exposes a **refresh interval**
+    control whose name also contains \"Refresh\" — clicking it only opens the **5s/10s/off** menu and
+    **does not** load panels (blank main area + open dropdown in screenshots).
     """
     if not _lark_env_truthy("GRAFANA_SCREENSHOT_REFRESH"):
         return
+    _grafana_close_open_menus(page)
     tclick = min(3500, max(1200, int(timeout_ms) // 35))
     spin_cap = (
         int(spinner_budget_ms)
@@ -1181,24 +1192,34 @@ def _grafana_click_dashboard_refresh(
         else int(GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS)
     )
     spin_cap = max(600, min(25_000, spin_cap))
+    # Exact \"Refresh dashboard\" first; avoid broad ``aria-label*=\"Refresh\"`` (interval picker).
     locators: List[Any] = [
-        page.get_by_role("button", name=re.compile(r"refresh", re.I)).first,
+        page.locator('button[aria-label="Refresh dashboard"]').first,
         page.locator('[aria-label="Refresh dashboard"]').first,
-        page.locator('[aria-label*="Refresh"]').first,
-        page.locator("button").filter(has_text="Refresh").first,
-        page.locator('[data-testid*="refresh"]').first,
+        page.get_by_role("button", name=re.compile(r"refresh\s+dashboard", re.I)).first,
+        page.locator('[data-testid="refresh-dashboard-button"]').first,
+        page.locator('[data-testid*="RefreshPicker"][data-testid*="run"]').first,
+        page.locator('[data-testid*="refresh"][data-testid*="Run"]').first,
+        page.get_by_role("button", name=re.compile(r"^run query$", re.I)).first,
     ]
     for idx, loc in enumerate(locators):
         try:
+            if loc.count() == 0:
+                continue
+        except Exception:
+            continue
+        try:
             loc.click(timeout=tclick)
-            logger.info("Grafana screenshot: clicked dashboard Refresh (locator #%s)", idx)
+            logger.info("Grafana screenshot: clicked Refresh/run control (locator #%s)", idx)
             page.wait_for_timeout(220)
+            _grafana_close_open_menus(page)
             _grafana_wait_loading_like_gone(page, spin_cap)
             return
         except Exception:
+            _grafana_close_open_menus(page)
             continue
     try:
-        logger.info("Grafana screenshot: Refresh button not found — using full page reload instead")
+        logger.info("Grafana screenshot: no explicit Refresh control — using full page reload instead")
         page.reload(wait_until="load", timeout=timeout_ms)
         page.wait_for_timeout(380)
     except Exception as e:
@@ -1576,6 +1597,7 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
 
             if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
                 page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
+            _grafana_close_open_menus(page)
             png = page.screenshot(type="png", full_page=full_page)
             return png
         finally:
