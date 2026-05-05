@@ -40,7 +40,7 @@ from flask import Flask, Response, g, jsonify, request
 _CFG: Dict[str, Any] = {
     "PORT": 5002,
     "HTTP_SERVER": "flask",
-    "LARK_EVENT_MODE": "ws",
+    "LARK_EVENT_MODE": "http",
     "ENABLE_HTTP": "1",
     "WAITRESS_THREADS": 24,
     "LARK_HOST": "https://open.larksuite.com",
