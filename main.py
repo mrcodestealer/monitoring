@@ -59,8 +59,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 600,
     # Prometheus 最近分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，最新点落在「约前两分钟」
     "GRAFANA_QUERY_END_LAG_SECONDS": 120,
-    # 无头截图（Playwright）：1=在 /monitoring 文字后追加发一张 Grafana 仪表盘 PNG（需 ``playwright install chromium``）
-    "GRAFANA_SCREENSHOT_ENABLE": "0",
+    # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
+    "GRAFANA_SCREENSHOT_ENABLE": "1",
     "GRAFANA_SCREENSHOT_WIDTH": 1400,
     "GRAFANA_SCREENSHOT_HEIGHT": 900,
     "GRAFANA_SCREENSHOT_TIMEOUT_MS": 90000,
@@ -1177,6 +1177,17 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
                 "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
             )
 
+        # 无条件打一行，便于对照 journal：是否读到 ENABLE、是否有 session/payload（缺任一则不会走截图）
+        _raw_ss = _cfg_raw("GRAFANA_SCREENSHOT_ENABLE")
+        logger.info(
+            "monitoring screenshot gate sent=%s session=%s payload=%s ENABLE_raw=%r ENABLE_truthy=%s",
+            sent,
+            grafana_session is not None,
+            payload is not None,
+            _raw_ss,
+            _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"),
+        )
+
         if sent and grafana_session is not None and payload is not None:
             if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                 logger.info(
@@ -1216,6 +1227,10 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
                         logger.exception(
                             "monitoring Grafana screenshot or Lark image upload failed (text was already sent)"
                         )
+        elif sent:
+            logger.warning(
+                "monitoring screenshot skipped: sent text but grafana_session or payload is missing (unexpected)"
+            )
     except Exception as e:
         logger.exception("monitoring lark text/image failed (background): %s", e)
 
