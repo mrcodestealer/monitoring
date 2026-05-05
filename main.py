@@ -589,7 +589,7 @@ def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
 
 def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
     tri = MONITORING_TRIGGER
-    raw = raw or ""
+    raw = raw_text or ""
     clean = clean or ""
     if tri in raw or tri in clean:
         return True
