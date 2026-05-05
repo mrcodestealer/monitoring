@@ -15,7 +15,8 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at 机器人发 /monitoring → Grafana 摘要。HTTP 回调先返回 ``{}`` 再后台处理。
+群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（最近 10 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``now-10m`` 一致）。
+HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
 
 可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：在文字后追加无头 Chromium 截图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
 默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` 截整页滚动区域（长 dashboard 全部图表）；设为 ``0`` 则仅视口大小（易只拍到上半屏）。
@@ -96,6 +97,11 @@ _CFG: Dict[str, Any] = {
     "APP_ID": "cli_a97fcc6df7615ed1",
     "APP_SECRET": "NwAi6xJxMYDHMFAQcTG8ZfJxpeTOibvy",
     "MONITORING_TRIGGER": "/monitoring",
+    # 1=仅 @ 机器人且无其它正文也触发（与 /monitoring 同）；1+下面 ANY=1 则 @ 且带任意文字也触发
+    "MONITORING_AT_MENTION_ENABLE": "1",
+    "MONITORING_AT_MENTION_ANY_TEXT": "0",
+    # HTTP 均值告警命中时，除原群外再发一份文字到该群（chat_id，常为 oc_…）；空=关闭
+    "MONITORING_ALERT_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -354,6 +360,9 @@ LARK_ENCRYPT_KEY = (
     or ""
 ).strip()
 LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
+MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
+MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
+MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
 
 # 群聊里富媒体等类型仍可能带可解析文本；仅跳过明显无 /monitoring 的类型。
 _SKIP_IM_MESSAGE_TYPES = frozenset(
@@ -678,6 +687,45 @@ def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
     return tl in clean.lower() or tl in raw.lower()
 
 
+def _lark_message_mentions_bot(mentions: Any) -> bool:
+    """True when the message ``mentions`` list includes this app bot (``LARK_BOT_OPEN_ID``)."""
+    bot = (LARK_BOT_OPEN_ID or "").strip()
+    if not bot or not isinstance(mentions, list):
+        return False
+    for m in mentions:
+        if not isinstance(m, dict):
+            continue
+        ido = m.get("id")
+        if isinstance(ido, str) and ido.strip() == bot:
+            return True
+        if isinstance(ido, dict):
+            for k in ("open_id", "openId", "user_id", "userId", "union_id", "unionId"):
+                v = ido.get(k)
+                if v and str(v).strip() == bot:
+                    return True
+        for k in ("open_id", "openId", "user_id", "userId"):
+            v = m.get(k)
+            if v and str(v).strip() == bot:
+                return True
+    return False
+
+
+def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> bool:
+    """
+    Run the same job as ``/monitoring`` when the command is present, or when the user @mentions
+    the bot (see ``MONITORING_AT_MENTION_ENABLE`` / ``MONITORING_AT_MENTION_ANY_TEXT``).
+    """
+    if _text_has_monitoring_trigger(raw_text, clean):
+        return True
+    if not MONITORING_AT_MENTION_ENABLE:
+        return False
+    if not _lark_message_mentions_bot(mentions):
+        return False
+    if MONITORING_AT_MENTION_ANY_TEXT:
+        return True
+    return not (clean or "").strip()
+
+
 def grafana_login_session() -> requests.Session:
     if not GRAFANA_USER or not GRAFANA_PASSWORD:
         raise ValueError("Set GRAFANA_USER and GRAFANA_PASSWORD in .env")
@@ -903,7 +951,8 @@ def _prometheus_query_range(
 
 def fetch_request_total_1m_series(session: Optional[requests.Session] = None) -> Dict[str, Any]:
     """
-    Same data as Grafana panel「请求总数/1m」: last GRAFANA_QUERY_LOOKBACK_SECONDS, step GRAFANA_QUERY_STEP.
+    Same data as Grafana panel「请求总数/1m」: last ``GRAFANA_QUERY_LOOKBACK_SECONDS`` (default **600 = 10m**),
+    step ``GRAFANA_QUERY_STEP``. Align with dashboard ``GRAFANA_DASHBOARD_FROM`` / ``now-10m`` for screenshots.
     ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
     avoiding incomplete recent-minute series that look like a false drop.
     Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
@@ -1896,15 +1945,18 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
     logger.info("monitoring background job start mid=%r chat=%r open=%r", mid, bool(chat_id), bool(open_id))
     grafana_session: Optional[requests.Session] = None
     payload: Optional[Dict[str, Any]] = None
+    http_ex: Optional[Dict[str, Any]] = None
     try:
         grafana_session = grafana_login_session()
         payload = fetch_request_total_1m_series(session=grafana_session)
+        http_ex = _http_analysis_for_payload(payload)
         reply = _format_monitoring_reply(payload)
     except Exception as e:
         logger.exception("monitoring fetch failed (background)")
         reply = f"监控数据拉取失败：{e}"
         grafana_session = None
         payload = None
+        http_ex = None
 
     sent = False
     try:
@@ -1924,6 +1976,25 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
             logger.warning(
                 "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
             )
+
+        if (
+            http_ex
+            and http_ex.get("hit_alert")
+            and MONITORING_ALERT_CHAT_ID
+            and MONITORING_ALERT_CHAT_ID != (chat_id or "").strip()
+        ):
+            try:
+                _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
+                logger.info(
+                    "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
+                    MONITORING_ALERT_CHAT_ID[:16],
+                    len(reply),
+                )
+            except Exception:
+                logger.exception(
+                    "monitoring alert forward failed (background) alert_chat_id=%r",
+                    MONITORING_ALERT_CHAT_ID[:24],
+                )
 
         # 无条件打一行，便于对照 journal：是否读到 ENABLE、是否有 session/payload（缺任一则不会走截图）
         _raw_ss = _cfg_raw("GRAFANA_SCREENSHOT_ENABLE")
@@ -2083,9 +2154,9 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     mentions = mentions_raw if isinstance(mentions_raw, list) else []
     clean = _lark_clean_command_text(raw_text, mentions)
 
-    if not _text_has_monitoring_trigger(raw_text, clean):
+    if not _text_should_run_monitoring(raw_text, clean, mentions):
         logger.info(
-            "im.message no trigger raw=%r clean=%r (need %r)",
+            "im.message no trigger raw=%r clean=%r (need %r or @bot per MONITORING_AT_MENTION_*)",
             (raw_text or "")[:160],
             (clean or "")[:160],
             MONITORING_TRIGGER,
@@ -2673,6 +2744,15 @@ def run_monitoring_bot() -> None:
     Uses :data:`app`, :data:`logger`, :func:`start_lark_ws_client_blocking` from this module.
     """
     port = _cfg_listen_port(5002)
+    if MONITORING_AT_MENTION_ENABLE and not (LARK_BOT_OPEN_ID or "").strip():
+        logger.warning(
+            "MONITORING_AT_MENTION_ENABLE is on but LARK_BOT_OPEN_ID is empty — @-only triggers will not match; set LARK_BOT_OPEN_ID to this bot's open_id."
+        )
+    if int(GRAFANA_QUERY_LOOKBACK_SECONDS) != 600:
+        logger.warning(
+            "GRAFANA_QUERY_LOOKBACK_SECONDS=%s (default 600 = 10m) — /monitoring Prometheus window is not 10 minutes",
+            GRAFANA_QUERY_LOOKBACK_SECONDS,
+        )
     raw_mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower()
     mode = raw_mode if raw_mode else "ws"
 
