@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 import os
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 from datetime import datetime
 import re
 import threading
@@ -1006,23 +1006,14 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
 
 
 def _playwright_cookie_list(session: requests.Session) -> List[Dict[str, Any]]:
-    host = urlparse(GRAFANA_BASE_URL).hostname or ""
-    is_https = str(GRAFANA_BASE_URL).lower().startswith("https://")
+    """
+    Use per-cookie ``url`` (Grafana origin) so ``add_cookies`` matches Playwright rules;
+    ``domain``+``path`` alone often fails on Linux headless before first navigation.
+    """
+    base = str(GRAFANA_BASE_URL).rstrip("/")
     out: List[Dict[str, Any]] = []
     for c in session.cookies:
-        dom = (c.domain or "").strip().lstrip(".") or host
-        entry: Dict[str, Any] = {
-            "name": c.name,
-            "value": c.value,
-            "domain": dom,
-            "path": c.path or "/",
-        }
-        if is_https:
-            entry["secure"] = True
-        rest = getattr(c, "_rest", None) or getattr(c, "rest", None)
-        if isinstance(rest, dict) and rest.get("HttpOnly"):
-            entry["httpOnly"] = True
-        out.append(entry)
+        out.append({"name": c.name, "value": c.value, "url": base})
     return out
 
 
@@ -1050,7 +1041,15 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Linux / systemd 常见：缺 sandbox 时 Chromium 起不来；Docker 也常用这几项
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         try:
             context = browser.new_context(
                 viewport={
@@ -1178,25 +1177,45 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
                 "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
             )
 
-        if (
-            sent
-            and grafana_session is not None
-            and payload is not None
-            and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
-        ):
-            w = payload.get("window") or {}
-            su = int(w.get("startUnix") or 0)
-            eu = int(w.get("endUnix") or 0)
-            if su <= 0 or eu <= 0:
-                logger.warning("monitoring screenshot skipped: invalid window start=%s end=%s", su, eu)
+        if sent and grafana_session is not None and payload is not None:
+            if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+                logger.info(
+                    "monitoring screenshot skipped: set GRAFANA_SCREENSHOT_ENABLE=1 (and install playwright + chromium)"
+                )
             else:
-                png = _grafana_headless_screenshot_png(grafana_session, su, eu)
-                key = _lark_upload_png_image_key(png)
-                if chat_id:
-                    _lark_send_image_message("chat_id", chat_id, key)
-                elif open_id:
-                    _lark_send_image_message("open_id", open_id, key)
-                logger.info("monitoring Grafana screenshot sent (background)")
+                w = payload.get("window") or {}
+                su = int(w.get("startUnix") or 0)
+                eu = int(w.get("endUnix") or 0)
+                if su <= 0 or eu <= 0:
+                    logger.warning("monitoring screenshot skipped: invalid window start=%s end=%s", su, eu)
+                else:
+                    try:
+                        jar = grafana_session.cookies.get_dict()
+                        if "grafana_session" not in jar:
+                            logger.warning(
+                                "monitoring screenshot: no grafana_session cookie — expect login wall in PNG"
+                            )
+                        n_cookies = len(_playwright_cookie_list(grafana_session))
+                        logger.info(
+                            "monitoring screenshot start cookies=%s window=%s..%s",
+                            n_cookies,
+                            su,
+                            eu,
+                        )
+                        png = _grafana_headless_screenshot_png(grafana_session, su, eu)
+                        key = _lark_upload_png_image_key(png)
+                        if chat_id:
+                            _lark_send_image_message("chat_id", chat_id, key)
+                        else:
+                            _lark_send_image_message("open_id", open_id, key)
+                        logger.info(
+                            "monitoring Grafana screenshot sent (background) bytes=%s",
+                            len(png),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "monitoring Grafana screenshot or Lark image upload failed (text was already sent)"
+                        )
     except Exception as e:
         logger.exception("monitoring lark text/image failed (background): %s", e)
 
