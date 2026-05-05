@@ -1720,6 +1720,12 @@ def webhook_event():
 
     et = _lark_header_event_type(data)
     et_l = (et or "").lower()
+    logger.info(
+        "WEBHOOK_EVENT event_type=%r schema=%r keys=%s",
+        et,
+        data.get("schema"),
+        list(data.keys())[:20],
+    )
     # Card interactions also require a fast 200; business logic should update the card asynchronously via Open API.
     if et_l.startswith("card.action"):
         return _lark_feishu_webhook_ack_immediate()
@@ -1730,7 +1736,7 @@ def webhook_event():
     if et in ("im.message.receive_v1", "im.message.receive_v2"):
         return _handle_im_message_receive(data)
 
-    logger.debug(
+    logger.info(
         "event ignored: event_type=%r keys=%s (subscribe 消息与群组 → 接收消息 v2.0)",
         et,
         list(data.keys())[:20],
