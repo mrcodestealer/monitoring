@@ -1025,10 +1025,10 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
         )
 
 
-def _grafana_playwright_dock_nav_and_wait_charts(page: Any, timeout_ms: int) -> None:
+def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     """
     Grafana 12：左侧 mega-menu 展开时先点「Dock menu」(#dock-menu-button) 再拍主区；
-    若未展开则先点 #mega-menu-toggle 再 Dock。随后等 uPlot 画布出现。
+    若未展开则先点 #mega-menu-toggle 再 Dock。仅负责点击，不负责等图（见 ``_grafana_wait_dashboard_ready``）。
     """
     if not _lark_env_truthy("GRAFANA_SCREENSHOT_DOCK_NAV"):
         return
@@ -1062,18 +1062,75 @@ def _grafana_playwright_dock_nav_and_wait_charts(page: Any, timeout_ms: int) -> 
         logger.info("Grafana screenshot: dock nav optional step failed: %s", e)
 
     page.wait_for_timeout(800)
+
+
+def _grafana_scroll_paint_lazy_panels(page: Any) -> None:
+    """Headless 下图表常在视口外不绘制；整页截图前滚一遍触发 uPlot/canvas 绘制。"""
     try:
-        page.locator('[data-testid="uplot-main-div"]').first.wait_for(state="visible", timeout=t)
+        h = page.evaluate(
+            "() => Math.max(document.body.scrollHeight, (document.scrollingElement || document.documentElement).scrollHeight)"
+        )
+        h = int(h or 0)
+        h = min(max(h, 800), 25000)
+        step = 450
+        y = 0
+        while y <= h:
+            page.evaluate("(yy) => window.scrollTo(0, yy)", y)
+            page.wait_for_timeout(120)
+            y += step
+        page.evaluate("() => window.scrollTo(0, 0)")
+        page.wait_for_timeout(400)
+    except Exception as e:
+        logger.info("Grafana screenshot: scroll paint step skipped: %s", e)
+
+
+def _grafana_wait_dashboard_ready(page: Any, timeout_ms: int) -> None:
+    """
+    SPA 在 ``domcontentloaded`` 时往往还没有 panel；此处在 ``load`` 之后仍要等网格/画布出现。
+    与 ``GRAFANA_SCREENSHOT_DOCK_NAV`` 无关：关 dock 时也必须执行，否则截到空白主区。
+    """
+    t = min(45000, max(8000, int(timeout_ms)))
+    try:
+        page.locator("#reactRoot").wait_for(state="visible", timeout=min(20000, t))
     except Exception:
+        pass
+
+    selectors = (
+        '[data-testid="uplot-main-div"]',
+        ".react-grid-item",
+        '[data-testid="dashboard-panel-content"]',
+        '[data-testid="panel-content"]',
+        "main canvas",
+        '[class*="PanelChrome"]',
+    )
+    matched: Optional[str] = None
+    for sel in selectors:
+        try:
+            page.locator(sel).first.wait_for(state="visible", timeout=min(15000, t))
+            matched = sel
+            break
+        except Exception:
+            continue
+
+    if not matched:
         try:
             safe_title = (GRAFANA_PANEL_TITLE or "").replace('"', '\\"')
             if safe_title:
-                page.locator(f'h2[title="{safe_title}"]').first.wait_for(state="visible", timeout=t)
+                page.locator(f'h2[title="{safe_title}"]').first.wait_for(
+                    state="visible", timeout=min(15000, t)
+                )
+                matched = f'h2[title="{safe_title}"]'
         except Exception:
-            logger.info(
-                "Grafana screenshot: no uplot/panel heading yet — continuing with screenshot anyway"
+            logger.warning(
+                "Grafana screenshot: no known panel/grid selector matched — capture may be blank "
+                "(selectors tried: %s; panel title: %r)",
+                selectors,
+                GRAFANA_PANEL_TITLE,
             )
-    page.wait_for_timeout(2000)
+    else:
+        logger.info("Grafana screenshot: dashboard content wait matched %r", matched)
+
+    page.wait_for_timeout(2500)
 
 
 def _playwright_cookie_list(session: requests.Session) -> List[Dict[str, Any]]:
@@ -1134,9 +1191,13 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             if cookies:
                 context.add_cookies(cookies)
             page = context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(1500)
-            _grafana_playwright_dock_nav_and_wait_charts(page, timeout_ms)
+            # Grafana 为 SPA：domcontentloaded 时主区常为空白，需 load + 等 grid/canvas + 滚动触发绘制
+            page.goto(url, wait_until="load", timeout=timeout_ms)
+            page.wait_for_timeout(600)
+            _grafana_playwright_dock_nav_only(page, timeout_ms)
+            _grafana_wait_dashboard_ready(page, timeout_ms)
+            _grafana_scroll_paint_lazy_panels(page)
+            page.wait_for_timeout(800)
             png = page.screenshot(type="png", full_page=full_page)
             return png
         finally:
