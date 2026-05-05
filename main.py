@@ -597,6 +597,30 @@ def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
     return tl in clean.lower() or tl in raw.lower()
 
 
+def _is_simple_hi_greeting(raw_text: str, clean: str, mentions: Any) -> bool:
+    """
+    Reply `hi` only when user clearly pings the bot (mention present) with a short greeting.
+    """
+    normalized = (clean or raw_text or "").strip().lower()
+    normalized = re.sub(r"[!,.。！？]+", "", normalized).strip()
+    if normalized not in ("hi", "hello", "hey"):
+        return False
+    if isinstance(mentions, list) and len(mentions) > 0:
+        return True
+    return "<at" in (raw_text or "").lower()
+
+
+def _reserve_message_id_once(mid: str) -> bool:
+    if not mid:
+        return True
+    with _monitoring_reply_dispatch_lock:
+        if mid in _processed_lark_message_ids:
+            logger.info("duplicate message_id=%s — skip (already dispatched)", mid)
+            return False
+        _processed_lark_message_ids.add(mid)
+        return True
+
+
 def grafana_login_session() -> requests.Session:
     if not GRAFANA_USER or not GRAFANA_PASSWORD:
         raise ValueError("Set GRAFANA_USER and GRAFANA_PASSWORD in .env")
@@ -997,6 +1021,25 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
         _processed_lark_message_ids.clear()
 
 
+def _hi_reply_background_worker(chat_id: str, open_id: str, mid: str) -> None:
+    """Best-effort quick greeting reply used for '@bot hi'."""
+    try:
+        if chat_id:
+            _lark_send_text("chat_id", chat_id, "hi")
+            logger.info("hi reply sent receive_id_type=chat_id chat_id_prefix=%s...", chat_id[:16])
+            return
+        if open_id:
+            _lark_send_text("open_id", open_id, "hi")
+            logger.info("hi reply sent receive_id_type=open_id open_id_prefix=%s...", open_id[:16])
+            return
+        logger.warning("hi reply skipped: no chat_id/open_id")
+    except Exception as e:
+        logger.exception("hi reply failed: %s", e)
+    finally:
+        if mid and len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
+            _processed_lark_message_ids.clear()
+
+
 def _serialize_lark_user_id(uid: Any) -> Dict[str, Any]:
     if uid is None:
         return {}
@@ -1092,6 +1135,25 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     mentions_raw = msg.get("mentions") or []
     mentions = mentions_raw if isinstance(mentions_raw, list) else []
     clean = _lark_clean_command_text(raw_text, mentions)
+    chat_id = chat_resolved
+    open_id = sender_open
+
+    if _is_simple_hi_greeting(raw_text, clean, mentions):
+        if not _reserve_message_id_once(mid):
+            return
+        logger.info(
+            "hi greeting matched — background hi reply mid=%r chat_id=%r open_id_prefix=%r",
+            mid,
+            bool(chat_id),
+            (open_id[:12] + "…") if len(open_id) > 12 else open_id,
+        )
+        threading.Thread(
+            target=_hi_reply_background_worker,
+            args=(chat_id, open_id, mid),
+            daemon=True,
+            name="hi-reply",
+        ).start()
+        return
 
     if not _text_has_monitoring_trigger(raw_text, clean):
         logger.info(
@@ -1102,9 +1164,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         return
 
-    chat_id = chat_resolved
-    open_id = sender_open
-
     logger.info(
         "monitoring trigger matched — background job mid=%r chat_id=%r open_id_prefix=%r",
         mid,
@@ -1112,12 +1171,8 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         (open_id[:12] + "…") if len(open_id) > 12 else open_id,
     )
 
-    with _monitoring_reply_dispatch_lock:
-        if mid and mid in _processed_lark_message_ids:
-            logger.info("duplicate message_id=%s — skip (already dispatched)", mid)
-            return
-        if mid:
-            _processed_lark_message_ids.add(mid)
+    if not _reserve_message_id_once(mid):
+        return
 
     threading.Thread(
         target=_monitoring_background_worker,
