@@ -1250,6 +1250,56 @@ def _merge_http_timeseries_points(payload: Dict[str, Any]) -> List[Tuple[float, 
     return sorted(by_ts.items(), key=lambda x: x[0])
 
 
+def _best_consecutive_drop_run(vals: List[float], ts: List[float]) -> Optional[Dict[str, Any]]:
+    """
+    Longest weakly-decreasing runs (each step ``vals[k+1] <= vals[k]``); score each run by
+    ``(start - end) / start * 100`` over the whole span (not single-minute deltas).
+    Returns the run with the largest such percentage (tie: more buckets wins).
+    """
+    L = len(vals)
+    if L < 2:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    i = 0
+    while i < L:
+        j = i
+        while j + 1 < L and vals[j + 1] <= vals[j]:
+            j += 1
+        if j > i and vals[i] > 0 and vals[j] < vals[i]:
+            pct = (vals[i] - vals[j]) / vals[i] * 100.0
+            buckets = j - i + 1
+            cand = {"pct": round(pct, 2), "from_ts": ts[i], "to_ts": ts[j], "buckets": buckets}
+            if best is None or pct > float(best["pct"]) or (
+                pct == float(best["pct"]) and buckets > int(best["buckets"])
+            ):
+                best = cand
+        i = j + 1
+    return best
+
+
+def _best_consecutive_spike_run(vals: List[float], ts: List[float]) -> Optional[Dict[str, Any]]:
+    """Weakly-increasing runs; score ``(end - start) / start * 100`` over the span."""
+    L = len(vals)
+    if L < 2:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    i = 0
+    while i < L:
+        j = i
+        while j + 1 < L and vals[j + 1] >= vals[j]:
+            j += 1
+        if j > i and vals[i] > 0 and vals[j] > vals[i]:
+            pct = (vals[j] - vals[i]) / vals[i] * 100.0
+            buckets = j - i + 1
+            cand = {"pct": round(pct, 2), "from_ts": ts[i], "to_ts": ts[j], "buckets": buckets}
+            if best is None or pct > float(best["pct"]) or (
+                pct == float(best["pct"]) and buckets > int(best["buckets"])
+            ):
+                best = cand
+        i = j + 1
+    return best
+
+
 def _http_drop_spike_analysis(
     points: List[Tuple[float, float]], alert_threshold_pct: float
 ) -> Dict[str, Any]:
@@ -1257,7 +1307,8 @@ def _http_drop_spike_analysis(
     For N=1..10 minutes (N buckets at panel step): compare mean(previous N) vs mean(last N).
     ``hit_alert`` if any N has average drop ≥ ``alert_threshold_pct``.
 
-    Also scan adjacent buckets for largest drop (most negative %) and largest spike (most positive %).
+    Max drop / max spike use **whole consecutive** weakly monotonic segments (multi-minute),
+    scored from first to last bucket of each segment — not single adjacent-minute comparisons.
     """
     out: Dict[str, Any] = {
         "pointCount": len(points),
@@ -1265,8 +1316,8 @@ def _http_drop_spike_analysis(
         "alert_threshold_pct": alert_threshold_pct,
         "windows": [],
         "worst_avg_drop_window": None,
-        "adjacent_max_drop": None,
-        "adjacent_max_spike": None,
+        "consecutive_max_drop": None,
+        "consecutive_max_spike": None,
     }
     if len(points) < 2:
         return out
@@ -1275,38 +1326,21 @@ def _http_drop_spike_analysis(
     ts = [p[0] for p in points]
     L = len(points)
 
-    worst_drop_pct: Optional[float] = None
-    worst_drop_t0: Optional[float] = None
-    worst_drop_t1: Optional[float] = None
-    best_spike_pct: Optional[float] = None
-    best_spike_t0: Optional[float] = None
-    best_spike_t1: Optional[float] = None
-
-    for i in range(1, L):
-        prev_v, cur_v = vals[i - 1], vals[i]
-        if prev_v <= 0:
-            continue
-        pct = (cur_v - prev_v) / prev_v * 100.0
-        if worst_drop_pct is None or pct < worst_drop_pct:
-            worst_drop_pct = pct
-            worst_drop_t0 = ts[i - 1]
-            worst_drop_t1 = ts[i]
-        if best_spike_pct is None or pct > best_spike_pct:
-            best_spike_pct = pct
-            best_spike_t0 = ts[i - 1]
-            best_spike_t1 = ts[i]
-
-    if worst_drop_pct is not None:
-        out["adjacent_max_drop"] = {
-            "pct": round(worst_drop_pct, 2),
-            "from_ts": worst_drop_t0,
-            "to_ts": worst_drop_t1,
+    drop_run = _best_consecutive_drop_run(vals, ts)
+    if drop_run is not None:
+        out["consecutive_max_drop"] = {
+            "pct": drop_run["pct"],
+            "from_ts": drop_run["from_ts"],
+            "to_ts": drop_run["to_ts"],
+            "buckets": drop_run["buckets"],
         }
-    if best_spike_pct is not None:
-        out["adjacent_max_spike"] = {
-            "pct": round(best_spike_pct, 2),
-            "from_ts": best_spike_t0,
-            "to_ts": best_spike_t1,
+    spike_run = _best_consecutive_spike_run(vals, ts)
+    if spike_run is not None:
+        out["consecutive_max_spike"] = {
+            "pct": spike_run["pct"],
+            "from_ts": spike_run["from_ts"],
+            "to_ts": spike_run["to_ts"],
+            "buckets": spike_run["buckets"],
         }
 
     worst_avg_drop_pct: Optional[float] = None
@@ -1369,50 +1403,53 @@ def _fmt_num(v: Any) -> str:
 
 
 def _format_http_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
-    """Human-readable block (CN + EN) for Lark."""
+    """English-only summary for Lark (HTTP merged series + windows + consecutive streaks)."""
     lines: List[str] = []
     pc = int(analysis.get("point_count") or 0)
     thr = float(analysis.get("alert_threshold_pct") or MONITORING_HTTP_DROP_ALERT_PCT)
     lines.append(
-        f"【HTTP only / 仅 HTTP】合并序列 {pc} 点；相邻桶涨跌幅 + 1–10 分钟「前 N vs 后 N」均值跌幅（阈值 ≥{thr:g}%）"
+        f"[HTTP merged] {pc} points; mean-drop windows N=1..10 vs threshold {thr:g}%; "
+        "max drop/spike = best **consecutive** weakly monotonic run (first→last bucket %)."
     )
 
-    adj_d = analysis.get("adjacent_max_drop")
-    adj_s = analysis.get("adjacent_max_spike")
-    if isinstance(adj_d, dict) and adj_d.get("from_ts") is not None:
+    cd = analysis.get("consecutive_max_drop") or analysis.get("adjacent_max_drop")
+    cs = analysis.get("consecutive_max_spike") or analysis.get("adjacent_max_spike")
+    if isinstance(cd, dict) and cd.get("from_ts") is not None:
+        bk = int(cd.get("buckets") or 0)
         lines.append(
-            f"- 相邻分钟最大跌幅 max adjacent drop: {_fmt_ts_short(adj_d['from_ts'])} → {_fmt_ts_short(adj_d['to_ts'])}  "
-            f"{adj_d.get('pct')}%"
+            f"- Largest consecutive drop: {_fmt_ts_short(cd['from_ts'])} → {_fmt_ts_short(cd['to_ts'])}  "
+            f"({bk} buckets)  {cd.get('pct')}% vs start of run"
         )
     else:
-        lines.append("- 相邻分钟最大跌幅 max adjacent drop: (n/a — baseline 0 or missing)")
+        lines.append("- Largest consecutive drop: n/a (no multi-bucket down run or zero baseline)")
 
-    if isinstance(adj_s, dict) and adj_s.get("from_ts") is not None:
+    if isinstance(cs, dict) and cs.get("from_ts") is not None:
+        bk = int(cs.get("buckets") or 0)
         lines.append(
-            f"- 相邻分钟最大涨幅 max adjacent spike: {_fmt_ts_short(adj_s['from_ts'])} → {_fmt_ts_short(adj_s['to_ts'])}  "
-            f"+{adj_s.get('pct')}%"
+            f"- Largest consecutive spike: {_fmt_ts_short(cs['from_ts'])} → {_fmt_ts_short(cs['to_ts'])}  "
+            f"({bk} buckets)  +{cs.get('pct')}% vs start of run"
         )
     else:
-        lines.append("- 相邻分钟最大涨幅 max adjacent spike: (n/a)")
+        lines.append("- Largest consecutive spike: n/a")
 
     wworst = analysis.get("worst_avg_drop_window")
     if isinstance(wworst, dict) and wworst.get("n_minutes"):
         lines.append(
-            f"- 均值跌幅最大窗口 worst mean-drop window (N={wworst['n_minutes']}m): "
+            f"- Worst mean-drop window (N={wworst['n_minutes']}m): "
             f"baseline {_fmt_ts_short(wworst['baseline_from_ts'])}..{_fmt_ts_short(wworst['baseline_to_ts'])} → "
             f"recent {_fmt_ts_short(wworst['recent_from_ts'])}..{_fmt_ts_short(wworst['recent_to_ts'])}  "
             f"drop {wworst.get('avg_drop_pct')}%"
         )
     else:
-        lines.append("- 均值跌幅窗口 worst mean-drop window: (not enough points for any N=1..10)")
+        lines.append("- Worst mean-drop window: not enough points for any N=1..10")
 
     if analysis.get("hit_alert"):
         lines.append(
-            f"- 告警 ALERT: 存在 N∈[1,10] 使得「前 N 分钟均值 vs 后 N 分钟均值」跌幅 ≥ {thr:g}%"
+            f"- ALERT: some N in 1..10 has mean(prev N) vs mean(last N) drop ≥ {thr:g}%"
         )
     else:
         lines.append(
-            f"- 无阈值告警 no alert: 所有可算窗口 N 的均值跌幅均 < {thr:g}%"
+            f"- No alert: all computed N windows have mean drop < {thr:g}%"
         )
     return lines
 
