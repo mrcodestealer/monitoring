@@ -16,6 +16,8 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
 群/at 机器人发 /monitoring → Grafana 摘要。HTTP 回调先返回 ``{}`` 再后台处理。
+
+可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：在文字后追加无头 Chromium 截图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
 """
 
 import base64
@@ -24,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+from urllib.parse import urlencode, urlparse
 from datetime import datetime
 import re
 import threading
@@ -56,6 +59,12 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 600,
     # Prometheus 最近分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，最新点落在「约前两分钟」
     "GRAFANA_QUERY_END_LAG_SECONDS": 120,
+    # 无头截图（Playwright）：1=在 /monitoring 文字后追加发一张 Grafana 仪表盘 PNG（需 ``playwright install chromium``）
+    "GRAFANA_SCREENSHOT_ENABLE": "0",
+    "GRAFANA_SCREENSHOT_WIDTH": 1400,
+    "GRAFANA_SCREENSHOT_HEIGHT": 900,
+    "GRAFANA_SCREENSHOT_TIMEOUT_MS": 90000,
+    "GRAFANA_SCREENSHOT_FULL_PAGE": "0",
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
     "VERIFICATION_TOKEN": "QlZMYp7rogAS914dxxMVNgboUKxQP7jc",
@@ -257,6 +266,9 @@ GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
 GRAFANA_QUERY_LOOKBACK_SECONDS = _cfg_int("GRAFANA_QUERY_LOOKBACK_SECONDS", 600)
 GRAFANA_QUERY_END_LAG_SECONDS = _cfg_int("GRAFANA_QUERY_END_LAG_SECONDS", 120)
+GRAFANA_SCREENSHOT_WIDTH = _cfg_int("GRAFANA_SCREENSHOT_WIDTH", 1400)
+GRAFANA_SCREENSHOT_HEIGHT = _cfg_int("GRAFANA_SCREENSHOT_HEIGHT", 900)
+GRAFANA_SCREENSHOT_TIMEOUT_MS = _cfg_int("GRAFANA_SCREENSHOT_TIMEOUT_MS", 90000)
 GRAFANA_USER = (
     _cfg_str("GRAFANA_USER")
     or _cfg_str("GRAFANA_ID")
@@ -824,7 +836,7 @@ def _prometheus_query_range(
     return r.json()
 
 
-def fetch_request_total_1m_series() -> Dict[str, Any]:
+def fetch_request_total_1m_series(session: Optional[requests.Session] = None) -> Dict[str, Any]:
     """
     Same data as Grafana panel「请求总数/1m」: last GRAFANA_QUERY_LOOKBACK_SECONDS, step GRAFANA_QUERY_STEP.
     ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
@@ -834,8 +846,8 @@ def fetch_request_total_1m_series() -> Dict[str, Any]:
     lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
     end = int(time.time()) - lag
     start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
-    session = grafana_login_session()
-    dash = _fetch_dashboard_model(session, GRAFANA_DASHBOARD_UID)
+    sess = session or grafana_login_session()
+    dash = _fetch_dashboard_model(sess, GRAFANA_DASHBOARD_UID)
     panel = _find_panel(dash, GRAFANA_PANEL_TITLE)
     if not panel:
         raise ValueError(f'Panel titled "{GRAFANA_PANEL_TITLE}" not found on dashboard {GRAFANA_DASHBOARD_UID}')
@@ -850,7 +862,7 @@ def fetch_request_total_1m_series() -> Dict[str, Any]:
         if not ds_uid:
             logger.warning("skip target without datasource uid: %s", t.get("refId"))
             continue
-        raw = _prometheus_query_range(session, ds_uid, expr, start, end, GRAFANA_QUERY_STEP)
+        raw = _prometheus_query_range(sess, ds_uid, expr, start, end, GRAFANA_QUERY_STEP)
         series_out.append(
             {
                 "refId": t.get("refId"),
@@ -925,6 +937,136 @@ def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
         raise RuntimeError(
             f"Lark send failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
         )
+
+
+def _lark_tenant_access_token_string() -> str:
+    """Same tenant token as SDK; used for multipart image upload (``requests``)."""
+    if not APP_ID or not APP_SECRET:
+        raise ValueError("APP_ID and APP_SECRET required")
+    url = f"{_lark_api_domain()}/open-apis/auth/v3/tenant_access_token/internal"
+    r = requests.post(
+        url,
+        json={"app_id": str(APP_ID).strip(), "app_secret": str(APP_SECRET).strip()},
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if int(j.get("code", -1)) != 0:
+        raise RuntimeError(f"tenant_token: {j}")
+    tok = j.get("tenant_access_token")
+    if not tok:
+        raise RuntimeError(f"no tenant_access_token: {j}")
+    return str(tok)
+
+
+def _lark_upload_png_image_key(png: bytes) -> str:
+    tok = _lark_tenant_access_token_string()
+    url = f"{_lark_api_domain()}/open-apis/im/v1/images"
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {tok}"},
+        files={"image": ("grafana.png", png, "image/png")},
+        data={"image_type": "message"},
+        timeout=120,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if int(j.get("code", -1)) != 0:
+        raise RuntimeError(f"image upload: {j}")
+    key = (j.get("data") or {}).get("image_key")
+    if not key:
+        raise RuntimeError(f"no image_key: {j}")
+    return str(key)
+
+
+def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: str) -> None:
+    from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
+    from lark_oapi.api.im.v1.model.create_message_request_body import CreateMessageRequestBody
+
+    client = _get_lark_oapi_client()
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(receive_id)
+        .msg_type("image")
+        .content(json.dumps({"image_key": image_key}))
+        .build()
+    )
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type(receive_id_type)
+        .request_body(body)
+        .build()
+    )
+    resp = client.im.v1.message.create(req)
+    if not resp.success():
+        raise RuntimeError(
+            f"Lark image send failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
+        )
+
+
+def _playwright_cookie_list(session: requests.Session) -> List[Dict[str, Any]]:
+    host = urlparse(GRAFANA_BASE_URL).hostname or ""
+    is_https = str(GRAFANA_BASE_URL).lower().startswith("https://")
+    out: List[Dict[str, Any]] = []
+    for c in session.cookies:
+        dom = (c.domain or "").strip().lstrip(".") or host
+        entry: Dict[str, Any] = {
+            "name": c.name,
+            "value": c.value,
+            "domain": dom,
+            "path": c.path or "/",
+        }
+        if is_https:
+            entry["secure"] = True
+        rest = getattr(c, "_rest", None) or getattr(c, "rest", None)
+        if isinstance(rest, dict) and rest.get("HttpOnly"):
+            entry["httpOnly"] = True
+        out.append(entry)
+    return out
+
+
+def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int, end_unix: int) -> bytes:
+    """
+    Headless Chromium (Playwright) opens the same dashboard URL as the UI, with session cookies.
+    Requires: ``pip install playwright`` and ``playwright install chromium`` on the server.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as e:
+        raise ImportError(
+            "Playwright not installed — pip install playwright && playwright install chromium"
+        ) from e
+
+    params = {
+        "orgId": "1",
+        "from": str(int(start_unix) * 1000),
+        "to": str(int(end_unix) * 1000),
+        "kiosk": "tv",
+    }
+    url = f"{GRAFANA_BASE_URL}{GRAFANA_DASHBOARD_PATH}?{urlencode(params)}"
+    cookies = _playwright_cookie_list(session)
+    timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
+    full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(
+                viewport={
+                    "width": max(400, int(GRAFANA_SCREENSHOT_WIDTH)),
+                    "height": max(300, int(GRAFANA_SCREENSHOT_HEIGHT)),
+                }
+            )
+            if cookies:
+                context.add_cookies(cookies)
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(2500)
+            png = page.screenshot(type="png", full_page=full_page)
+            return png
+        finally:
+            browser.close()
 
 
 def _fmt_ts_short(ts: Any) -> str:
@@ -1005,12 +1147,17 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
     Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
     """
     logger.info("monitoring background job start mid=%r chat=%r open=%r", mid, bool(chat_id), bool(open_id))
+    grafana_session: Optional[requests.Session] = None
+    payload: Optional[Dict[str, Any]] = None
     try:
-        payload = fetch_request_total_1m_series()
+        grafana_session = grafana_login_session()
+        payload = fetch_request_total_1m_series(session=grafana_session)
         reply = _format_monitoring_reply(payload)
     except Exception as e:
         logger.exception("monitoring fetch failed (background)")
         reply = f"监控数据拉取失败：{e}"
+        grafana_session = None
+        payload = None
 
     sent = False
     try:
@@ -1030,8 +1177,28 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
             logger.warning(
                 "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
             )
+
+        if (
+            sent
+            and grafana_session is not None
+            and payload is not None
+            and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
+        ):
+            w = payload.get("window") or {}
+            su = int(w.get("startUnix") or 0)
+            eu = int(w.get("endUnix") or 0)
+            if su <= 0 or eu <= 0:
+                logger.warning("monitoring screenshot skipped: invalid window start=%s end=%s", su, eu)
+            else:
+                png = _grafana_headless_screenshot_png(grafana_session, su, eu)
+                key = _lark_upload_png_image_key(png)
+                if chat_id:
+                    _lark_send_image_message("chat_id", chat_id, key)
+                elif open_id:
+                    _lark_send_image_message("open_id", open_id, key)
+                logger.info("monitoring Grafana screenshot sent (background)")
     except Exception as e:
-        logger.exception("lark send failed (background): %s", e)
+        logger.exception("monitoring lark text/image failed (background): %s", e)
 
     # ``mid`` was reserved on the webhook thread before ACK to avoid duplicate workers (HTTP returns {} immediately).
     if sent and mid and len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
