@@ -1149,6 +1149,18 @@ def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
     return False
 
 
+def _count_http_prometheus_result_rows(payload: Dict[str, Any]) -> int:
+    """How many Prometheus matrix rows are HTTP legs (used to avoid duplicate merged table)."""
+    n = 0
+    for s in payload.get("series") or []:
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            if _metric_series_is_http_leg(r.get("metric") or {}):
+                n += 1
+    return n
+
+
 def _merge_http_timeseries_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
     """Sum all HTTP-leg series per Unix timestamp (ascending)."""
     by_ts: Dict[float, float] = {}
@@ -1358,6 +1370,7 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
 
     http_ex = _http_analysis_for_payload(payload)
     merged_pts: List[List[float]] = http_ex.get("merged_points") or []
+    n_http_rows = _count_http_prometheus_result_rows(payload)
 
     lines: List[str] = [
         f"【{payload.get('panelTitle')}】最近 {span}s（步长 {step_s}s，下列为每步数值）{lag_note}",
@@ -1399,14 +1412,20 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
 
     lines.append("")
     if merged_pts:
-        last = merged_pts[-1]
-        lines.append(
-            f"- HTTP merged (sum / 合并)\n  最新 latest: {_fmt_num(last[1])} @ {_fmt_ts_short(last[0])} (共 {len(merged_pts)} 点)"
-        )
-        tail = merged_pts[-max_rows:]
-        lines.append("  time          value")
-        for pair in tail:
-            lines.append(f"  {_fmt_ts_short(pair[0]):<14} {_fmt_num(pair[1])}")
+        if n_http_rows <= 1:
+            lines.append(
+                "- HTTP merged (sum / 合并): 仅 1 条 HTTP 序列，与上表完全相同，省略重复表。"
+                " / single HTTP series — identical to detail above; duplicate table omitted."
+            )
+        else:
+            last = merged_pts[-1]
+            lines.append(
+                f"- HTTP merged (sum / 合并, {n_http_rows} 条)\n  最新 latest: {_fmt_num(last[1])} @ {_fmt_ts_short(last[0])} (共 {len(merged_pts)} 点)"
+            )
+            tail = merged_pts[-max_rows:]
+            lines.append("  time          value")
+            for pair in tail:
+                lines.append(f"  {_fmt_ts_short(pair[0]):<14} {_fmt_num(pair[1])}")
     else:
         lines.append("- HTTP merged (sum / 合并): 无数据 — 未匹配到任何 label 值为 http 的序列")
 
