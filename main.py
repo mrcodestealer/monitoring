@@ -54,8 +54,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 600,
-    # Prometheus 当前分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，最新点落在「前一分钟」
-    "GRAFANA_QUERY_END_LAG_SECONDS": 60,
+    # Prometheus 最近分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，最新点落在「约前两分钟」
+    "GRAFANA_QUERY_END_LAG_SECONDS": 120,
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
     "VERIFICATION_TOKEN": "QlZMYp7rogAS914dxxMVNgboUKxQP7jc",
@@ -256,7 +256,7 @@ GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 # Prometheus query_range step (seconds); 60 → up to 10 buckets in 10m
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
 GRAFANA_QUERY_LOOKBACK_SECONDS = _cfg_int("GRAFANA_QUERY_LOOKBACK_SECONDS", 600)
-GRAFANA_QUERY_END_LAG_SECONDS = _cfg_int("GRAFANA_QUERY_END_LAG_SECONDS", 60)
+GRAFANA_QUERY_END_LAG_SECONDS = _cfg_int("GRAFANA_QUERY_END_LAG_SECONDS", 120)
 GRAFANA_USER = (
     _cfg_str("GRAFANA_USER")
     or _cfg_str("GRAFANA_ID")
@@ -827,8 +827,8 @@ def _prometheus_query_range(
 def fetch_request_total_1m_series() -> Dict[str, Any]:
     """
     Same data as Grafana panel「请求总数/1m」: last GRAFANA_QUERY_LOOKBACK_SECONDS, step GRAFANA_QUERY_STEP.
-    ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 60) so the newest bucket is ~1 minute old,
-    avoiding incomplete current-minute series that look like a false drop.
+    ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
+    avoiding incomplete recent-minute series that look like a false drop.
     Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
     """
     lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
