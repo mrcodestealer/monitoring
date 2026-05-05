@@ -84,6 +84,9 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_SDK_DEBUG": "0",
     "LARK_WEBHOOK_WSGI_LOG": "0",
     "LARK_WEBHOOK_TIMING_LOG": "0",
+    # 请求总数/1m：仅 HTTP 序列参与跌幅判断；平均跌幅 ≥ 该阈值时 @ 下面 open_id（可用环境变量覆盖）
+    "TARGET_USER_OPEN_ID": "",
+    "MONITORING_HTTP_DROP_ALERT_PCT": 10,
 }
 
 
@@ -108,6 +111,16 @@ def _cfg_int(key: str, default: int) -> int:
         return default
     try:
         return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _cfg_float(key: str, default: float) -> float:
+    v = _cfg_raw(key)
+    if v is None or (isinstance(v, str) and not str(v).strip()):
+        return default
+    try:
+        return float(v)
     except (TypeError, ValueError):
         return default
 
@@ -284,6 +297,10 @@ APP_SECRET = _cfg_str("APP_SECRET", "").strip() or None
 # Default matches ``lark_oapi.core.const.FEISHU_DOMAIN`` — 国际 Lark 用 ``https://open.larksuite.com``（见 ``_CFG``）
 LARK_HOST = _cfg_str("LARK_HOST", "https://open.feishu.cn").rstrip("/")
 MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/monitoring")
+TARGET_USER_OPEN_ID = _cfg_str(
+    "TARGET_USER_OPEN_ID", "ou_d7bc33724e2d6ced4050c944c2ca5650"
+).strip()
+MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
 LARK_ENCRYPT_KEY = (
     _cfg_str("LARK_ENCRYPT_KEY")
     or _cfg_str("ENCRYPT_KEY")
@@ -1122,6 +1139,141 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             browser.close()
 
 
+def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
+    """Pick Prometheus rows that correspond to the HTTP series (legend ``http`` / label value ``http``)."""
+    for k, v in metric.items():
+        if k == "__name__":
+            continue
+        if str(v).strip().lower() == "http":
+            return True
+    return False
+
+
+def _merge_http_timeseries_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
+    """Sum all HTTP-leg series per Unix timestamp (ascending)."""
+    by_ts: Dict[float, float] = {}
+    for s in payload.get("series") or []:
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            m = r.get("metric") or {}
+            if not _metric_series_is_http_leg(m):
+                continue
+            for pair in r.get("values") or []:
+                if len(pair) < 2:
+                    continue
+                try:
+                    ts = float(pair[0])
+                    val = float(pair[1])
+                except (TypeError, ValueError):
+                    continue
+                by_ts[ts] = by_ts.get(ts, 0.0) + val
+    if not by_ts:
+        return []
+    return sorted(by_ts.items(), key=lambda x: x[0])
+
+
+def _http_drop_spike_analysis(
+    points: List[Tuple[float, float]], alert_threshold_pct: float
+) -> Dict[str, Any]:
+    """
+    For N=1..10 minutes (N buckets at panel step): compare mean(previous N) vs mean(last N).
+    ``hit_alert`` if any N has average drop ≥ ``alert_threshold_pct``.
+
+    Also scan adjacent buckets for largest drop (most negative %) and largest spike (most positive %).
+    """
+    out: Dict[str, Any] = {
+        "pointCount": len(points),
+        "hit_alert": False,
+        "alert_threshold_pct": alert_threshold_pct,
+        "windows": [],
+        "worst_avg_drop_window": None,
+        "adjacent_max_drop": None,
+        "adjacent_max_spike": None,
+    }
+    if len(points) < 2:
+        return out
+
+    vals = [p[1] for p in points]
+    ts = [p[0] for p in points]
+    L = len(points)
+
+    worst_drop_pct: Optional[float] = None
+    worst_drop_t0: Optional[float] = None
+    worst_drop_t1: Optional[float] = None
+    best_spike_pct: Optional[float] = None
+    best_spike_t0: Optional[float] = None
+    best_spike_t1: Optional[float] = None
+
+    for i in range(1, L):
+        prev_v, cur_v = vals[i - 1], vals[i]
+        if prev_v <= 0:
+            continue
+        pct = (cur_v - prev_v) / prev_v * 100.0
+        if worst_drop_pct is None or pct < worst_drop_pct:
+            worst_drop_pct = pct
+            worst_drop_t0 = ts[i - 1]
+            worst_drop_t1 = ts[i]
+        if best_spike_pct is None or pct > best_spike_pct:
+            best_spike_pct = pct
+            best_spike_t0 = ts[i - 1]
+            best_spike_t1 = ts[i]
+
+    if worst_drop_pct is not None:
+        out["adjacent_max_drop"] = {
+            "pct": round(worst_drop_pct, 2),
+            "from_ts": worst_drop_t0,
+            "to_ts": worst_drop_t1,
+        }
+    if best_spike_pct is not None:
+        out["adjacent_max_spike"] = {
+            "pct": round(best_spike_pct, 2),
+            "from_ts": best_spike_t0,
+            "to_ts": best_spike_t1,
+        }
+
+    worst_avg_drop_pct: Optional[float] = None
+    windows: List[Dict[str, Any]] = []
+
+    for n in range(1, 11):
+        if L < 2 * n:
+            continue
+        pre = vals[L - 2 * n : L - n]
+        cur = vals[L - n : L]
+        avg_pre = sum(pre) / n
+        avg_cur = sum(cur) / n
+        if avg_pre <= 0:
+            continue
+        drop_pct = (avg_pre - avg_cur) / avg_pre * 100.0
+        row = {
+            "n_minutes": n,
+            "avg_drop_pct": round(drop_pct, 2),
+            "avg_baseline": avg_pre,
+            "avg_recent": avg_cur,
+            "baseline_from_ts": ts[L - 2 * n],
+            "baseline_to_ts": ts[L - n - 1],
+            "recent_from_ts": ts[L - n],
+            "recent_to_ts": ts[L - 1],
+        }
+        windows.append(row)
+        if drop_pct >= alert_threshold_pct:
+            out["hit_alert"] = True
+        if worst_avg_drop_pct is None or drop_pct > worst_avg_drop_pct:
+            worst_avg_drop_pct = drop_pct
+            out["worst_avg_drop_window"] = dict(row)
+
+    out["windows"] = windows
+    return out
+
+
+def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    pts = _merge_http_timeseries_points(payload)
+    a = _http_drop_spike_analysis(pts, MONITORING_HTTP_DROP_ALERT_PCT)
+    a["point_count"] = len(pts)
+    a["merged_points"] = [[t, v] for t, v in pts]
+    return a
+
+
 def _fmt_ts_short(ts: Any) -> str:
     try:
         return datetime.fromtimestamp(int(float(ts))).strftime("%m-%d %H:%M")
@@ -1139,10 +1291,61 @@ def _fmt_num(v: Any) -> str:
         return str(v)
 
 
+def _format_http_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
+    """Human-readable block (CN + EN) for Lark."""
+    lines: List[str] = []
+    pc = int(analysis.get("point_count") or 0)
+    thr = float(analysis.get("alert_threshold_pct") or MONITORING_HTTP_DROP_ALERT_PCT)
+    lines.append(
+        f"【HTTP only / 仅 HTTP】合并序列 {pc} 点；相邻桶涨跌幅 + 1–10 分钟「前 N vs 后 N」均值跌幅（阈值 ≥{thr:g}%）"
+    )
+
+    adj_d = analysis.get("adjacent_max_drop")
+    adj_s = analysis.get("adjacent_max_spike")
+    if isinstance(adj_d, dict) and adj_d.get("from_ts") is not None:
+        lines.append(
+            f"- 相邻分钟最大跌幅 max adjacent drop: {_fmt_ts_short(adj_d['from_ts'])} → {_fmt_ts_short(adj_d['to_ts'])}  "
+            f"{adj_d.get('pct')}%"
+        )
+    else:
+        lines.append("- 相邻分钟最大跌幅 max adjacent drop: (n/a — baseline 0 or missing)")
+
+    if isinstance(adj_s, dict) and adj_s.get("from_ts") is not None:
+        lines.append(
+            f"- 相邻分钟最大涨幅 max adjacent spike: {_fmt_ts_short(adj_s['from_ts'])} → {_fmt_ts_short(adj_s['to_ts'])}  "
+            f"+{adj_s.get('pct')}%"
+        )
+    else:
+        lines.append("- 相邻分钟最大涨幅 max adjacent spike: (n/a)")
+
+    wworst = analysis.get("worst_avg_drop_window")
+    if isinstance(wworst, dict) and wworst.get("n_minutes"):
+        lines.append(
+            f"- 均值跌幅最大窗口 worst mean-drop window (N={wworst['n_minutes']}m): "
+            f"baseline {_fmt_ts_short(wworst['baseline_from_ts'])}..{_fmt_ts_short(wworst['baseline_to_ts'])} → "
+            f"recent {_fmt_ts_short(wworst['recent_from_ts'])}..{_fmt_ts_short(wworst['recent_to_ts'])}  "
+            f"drop {wworst.get('avg_drop_pct')}%"
+        )
+    else:
+        lines.append("- 均值跌幅窗口 worst mean-drop window: (not enough points for any N=1..10)")
+
+    if analysis.get("hit_alert"):
+        lines.append(
+            f"- 告警 ALERT: 存在 N∈[1,10] 使得「前 N 分钟均值 vs 后 N 分钟均值」跌幅 ≥ {thr:g}%"
+        )
+    else:
+        lines.append(
+            f"- 无阈值告警 no alert: 所有可算窗口 N 的均值跌幅均 < {thr:g}%"
+        )
+    return lines
+
+
 def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
     """
     除最新点外，按 Prometheus ``values`` 时间序列列出「每步一行」（步长通常 60s ≈ 每分钟一点），
     便于在 Lark 里直接读数，效果接近 Grafana 里开表 + 图。
+
+    「请求总数/1m」类面板：明细只展示 **标签值为 http** 的序列；跌幅/告警仅基于 HTTP 合并序列。
     """
     w = payload.get("window") or {}
     step_s = int(w.get("stepSeconds") or 60)
@@ -1153,8 +1356,12 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
     if GRAFANA_QUERY_END_LAG_SECONDS > 0:
         lag_note = f"；查询 end 推迟 {GRAFANA_QUERY_END_LAG_SECONDS}s（略过最近未完成分钟桶）"
 
+    http_ex = _http_analysis_for_payload(payload)
+    merged_pts: List[List[float]] = http_ex.get("merged_points") or []
+
     lines: List[str] = [
         f"【{payload.get('panelTitle')}】最近 {span}s（步长 {step_s}s，下列为每步数值）{lag_note}",
+        "明细仅 HTTP 序列 / detail: HTTP-labeled series only；合并用于告警 / merged used for alert",
         f"Dashboard: {GRAFANA_BASE_URL}/d/{payload.get('dashboardUid')}",
     ]
     for s in payload.get("series") or []:
@@ -1165,7 +1372,15 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
         if not results:
             lines.append(f"- [{ref}] 无数据 / no data")
             continue
-        for r in results[:12]:
+        http_results = [
+            r for r in results[:24] if _metric_series_is_http_leg(r.get("metric") or {})
+        ]
+        if not http_results:
+            lines.append(
+                f"- [{ref}] 无「标签值为 http」的序列 / no series with label value http (skipped {len(results)} rows)"
+            )
+            continue
+        for r in http_results[:12]:
             m = r.get("metric") or {}
             legend_bits = [f"{k}={v}" for k, v in sorted(m.items()) if k not in ("__name__",)][:4]
             legend = ", ".join(legend_bits) or str(m.get("__name__", ref))
@@ -1181,6 +1396,25 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
             lines.append("  time          value")
             for pair in tail:
                 lines.append(f"  {_fmt_ts_short(pair[0]):<14} {_fmt_num(pair[1])}")
+
+    lines.append("")
+    if merged_pts:
+        last = merged_pts[-1]
+        lines.append(
+            f"- HTTP merged (sum / 合并)\n  最新 latest: {_fmt_num(last[1])} @ {_fmt_ts_short(last[0])} (共 {len(merged_pts)} 点)"
+        )
+        tail = merged_pts[-max_rows:]
+        lines.append("  time          value")
+        for pair in tail:
+            lines.append(f"  {_fmt_ts_short(pair[0]):<14} {_fmt_num(pair[1])}")
+    else:
+        lines.append("- HTTP merged (sum / 合并): 无数据 — 未匹配到任何 label 值为 http 的序列")
+
+    lines.append("")
+    if http_ex.get("hit_alert") and TARGET_USER_OPEN_ID:
+        lines.append(f'<at user_id="{TARGET_USER_OPEN_ID}"> </at>')
+    lines.extend(_format_http_analysis_lines(http_ex))
+
     out = "\n".join(lines)
     if len(out) > 4500:
         out = out[:4490] + "\n…(truncated)"
@@ -1966,6 +2200,7 @@ def metrics_request_total_1m():
     """Last 10 minutes of「请求总数/1m」panel (1-minute step). Poll every 1m from cron or Lark."""
     try:
         data = fetch_request_total_1m_series()
+        data["httpAnalysis"] = _http_analysis_for_payload(data)
         return jsonify(data)
     except Exception as e:
         logger.exception("request-total-1m failed")
