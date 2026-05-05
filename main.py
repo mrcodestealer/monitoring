@@ -73,6 +73,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_KIOSK": "",
     # 截图前先打开站点根路径再进 dashboard，利于 session 与 SPA bootstrap
     "GRAFANA_SCREENSHOT_BOOT_WARM": "1",
+    # 1=尝试点 Grafana 时间栏「Refresh」触发拉数；找不到按钮则整页 reload 一次
+    "GRAFANA_SCREENSHOT_REFRESH": "1",
     # 截图 URL 用 now-10m / now（与浏览器一致）；0 则用 Prometheus 窗口的绝对毫秒时间戳
     "GRAFANA_SCREENSHOT_RELATIVE_RANGE": "1",
     # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
@@ -1118,6 +1120,38 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     page.wait_for_timeout(800)
 
 
+def _grafana_click_dashboard_refresh(page: Any, timeout_ms: int) -> None:
+    """
+    Same as a user hitting Grafana's **Refresh** (re-runs queries). If no control matches,
+    fall back to ``page.reload`` once — fixes stuck shells that only show header / row titles (e.g. ``KPI``).
+    """
+    if not _lark_env_truthy("GRAFANA_SCREENSHOT_REFRESH"):
+        return
+    tclick = min(5000, max(2000, int(timeout_ms) // 20))
+    locators: List[Any] = [
+        page.get_by_role("button", name=re.compile(r"refresh", re.I)).first,
+        page.locator('[aria-label="Refresh dashboard"]').first,
+        page.locator('[aria-label*="Refresh"]').first,
+        page.locator("button").filter(has_text="Refresh").first,
+        page.locator('[data-testid*="refresh"]').first,
+    ]
+    for idx, loc in enumerate(locators):
+        try:
+            loc.click(timeout=tclick)
+            logger.info("Grafana screenshot: clicked dashboard Refresh (locator #%s)", idx)
+            page.wait_for_timeout(450)
+            _grafana_wait_loading_like_gone(page, min(12000, max(2500, int(timeout_ms // 5))))
+            return
+        except Exception:
+            continue
+    try:
+        logger.info("Grafana screenshot: Refresh button not found — using full page reload instead")
+        page.reload(wait_until="load", timeout=timeout_ms)
+        page.wait_for_timeout(600)
+    except Exception as e:
+        logger.info("Grafana screenshot: refresh fallback reload failed: %s", e)
+
+
 def _grafana_loading_like_count(page: Any) -> int:
     """Rough count of visible Grafana-style loading elements (deduped by element)."""
     try:
@@ -1440,6 +1474,7 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             page.goto(url, wait_until="load", timeout=timeout_ms)
             page.wait_for_timeout(500)
             _grafana_playwright_dock_nav_only(page, timeout_ms)
+            _grafana_click_dashboard_refresh(page, timeout_ms)
             _grafana_wait_dashboard_ready(page, timeout_ms)
             _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
             _grafana_stabilize_dashboard_render(page, timeout_ms)
@@ -1454,6 +1489,7 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
                     page.reload(wait_until="load", timeout=timeout_ms)
                     page.wait_for_timeout(800)
                     _grafana_playwright_dock_nav_only(page, timeout_ms)
+                    _grafana_click_dashboard_refresh(page, timeout_ms)
                     _grafana_wait_dashboard_ready(page, min(20000, timeout_ms // 2))
                     _grafana_wait_dashboard_body_populated(
                         page, min(8000, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
