@@ -40,7 +40,7 @@ from flask import Flask, Response, g, jsonify, request
 _CFG: Dict[str, Any] = {
     "PORT": 5002,
     "HTTP_SERVER": "flask",
-    "LARK_EVENT_MODE": "http",
+    "LARK_EVENT_MODE": "ws",
     "ENABLE_HTTP": "1",
     "WAITRESS_THREADS": 24,
     "LARK_HOST": "https://open.larksuite.com",
@@ -55,10 +55,10 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_QUERY_STEP": 60,
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 600,
     "GRAFANA_USER": "om_duty",
-    "GRAFANA_PASSWORD": "",
-    "VERIFICATION_TOKEN": "",
+    "GRAFANA_PASSWORD": "5tgb%TGB094",
+    "VERIFICATION_TOKEN": "QlZMYp7rogAS914dxxMVNgboUKxQP7jc",
     "APP_ID": "cli_a97fcc6df7615ed1",
-    "APP_SECRET": "",
+    "APP_SECRET": "NwAi6xJxMYDHMFAQcTG8ZfJxpeTOibvy",
     "MONITORING_TRIGGER": "/monitoring",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
@@ -638,7 +638,7 @@ def _reserve_message_id_once(mid: str) -> bool:
 
 def grafana_login_session() -> requests.Session:
     if not GRAFANA_USER or not GRAFANA_PASSWORD:
-        raise ValueError("Set GRAFANA_USER and GRAFANA_PASSWORD in .env")
+        raise ValueError("Set GRAFANA_USER and GRAFANA_PASSWORD in _CFG (top of main.py)")
 
     session = requests.Session()
     login_url = f"{GRAFANA_BASE_URL}/login"
