@@ -7,7 +7,7 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 **配置**：编辑本文件顶部 ``_CFG`` 字典（不再读取 ``.env``）。也可用 **systemd ``Environment=KEY=value``** 覆盖同名键。
 
 **默认 ``LARK_EVENT_MODE=ws``** — 长连接；可选 ``ENABLE_HTTP=1`` 并行 HTTP。
-若同一条用户消息出现 **两条回复 / 两张图**：常见为 ``im.message.receive_v1`` 与 ``receive_v2`` 双投 — 默认 ``LARK_WS_REGISTER_IM_MESSAGE_V2=0`` 只处理 v1，并启用 ``MONITORING_IM_DEBOUNCE_SECONDS``（秒）去抖。
+若同一条用户消息出现 **两条回复 / 两张图**：① ``LARK_EVENT_MODE=ws`` 且仍配置了 HTTP Request URL → 同一条 IM 会 **WS + HTTP 各收一次**，默认 ``LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS=1`` 在 HTTP 上忽略 im.message；② ``receive_v1``+``receive_v2`` 双投 — 默认 ``LARK_WS_REGISTER_IM_MESSAGE_V2=0``；③ ``MONITORING_IM_DEBOUNCE_SECONDS`` 去抖。
 
 **``LARK_EVENT_MODE=http``** — 监听 ``PORT``（本仓库默认 **5002**，与同机运行的 ``Chatbox/main.py``（常用 **5000**）错开端口），事件走 ``POST /webhook/event``。
 默认 HTTP 栈为 **Flask ``threaded=True``**（实现方式对齐 Chatbox）；生产可设 ``HTTP_SERVER=waitress``。
@@ -138,6 +138,8 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_REGISTER_IM_MESSAGE_V2": "0",
     # 同一聊天内相同触发正文在 N 秒内的第二次投递视为重复（双通道/空 message_id 兜底）；0=关闭
     "MONITORING_IM_DEBOUNCE_SECONDS": "2",
+    # 1=且 LARK_EVENT_MODE=ws 时 **忽略** POST /webhook/event 上的 im.message（避免与长连接各处理一次 → 重复回复）
+    "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -455,6 +457,28 @@ def _lark_im_message_dedupe_id(msg: Dict[str, Any]) -> str:
     return _lark_dict_pick_str(
         msg, "message_id", "messageId", "open_message_id", "openMessageId"
     )
+
+
+def _lark_skip_http_im_message_when_ws_mode() -> bool:
+    """
+    If the app runs ``LARK_EVENT_MODE=ws`` but ``ENABLE_HTTP=1`` still exposes ``/webhook/event``, Feishu may
+    **also** POST ``im.message.*`` to the Request URL while the same event is pushed on the WebSocket — two workers.
+    When this returns True, HTTP skips IM (WS remains the source of truth).
+    """
+    if not _lark_env_truthy("LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS"):
+        return False
+    return _cfg_str("LARK_EVENT_MODE", "ws").strip().lower() == "ws"
+
+
+def _lark_im_sender_debounce_token(sender: Dict[str, Any], open_id: str) -> str:
+    """Stable sender token for debounce when ``open_id`` is missing in one of two duplicate deliveries."""
+    u = _lark_dict_pick_str(sender, "union_id", "unionId")
+    if u:
+        return u
+    o = (open_id or "").strip()
+    if o:
+        return o
+    return _lark_dict_pick_str(sender, "user_id", "userId")
 
 
 def _lark_message_chat_id(msg: Dict[str, Any]) -> str:
@@ -3203,6 +3227,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     chat_id = chat_resolved
     open_id = sender_open
+    sender_debounce = _lark_im_sender_debounce_token(sender, open_id)
 
     logger.info(
         "monitoring trigger matched — background job mid=%r chat_id=%r open_id_prefix=%r",
@@ -3218,7 +3243,8 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             debounce_sec = float(raw_db)
         except (TypeError, ValueError):
             debounce_sec = 2.0
-    debounce_key = f"{chat_id or ''}\n{open_id or ''}\n{(clean or '').strip()[:320]}"
+    # Use union_id / open_id / user_id so HTTP vs WS envelopes that disagree on open_id still share one debounce key.
+    debounce_key = f"{(chat_id or '').strip()}\n{sender_debounce}\n{(clean or '').strip()[:320]}"
     now_m = time.monotonic()
     with _monitoring_reply_dispatch_lock:
         if mid and mid in _processed_lark_message_ids:
@@ -3803,6 +3829,13 @@ def webhook_event():
         return _lark_feishu_webhook_ack_immediate()
 
     if et in ("im.message.receive_v1", "im.message.receive_v2"):
+        if _lark_skip_http_im_message_when_ws_mode():
+            logger.info(
+                "webhook: skip %s — HTTP IM ignored while LARK_EVENT_MODE=ws "
+                "(duplicate with WebSocket; set LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS=0 to force HTTP IM).",
+                et,
+            )
+            return _lark_feishu_webhook_ack_immediate()
         return _handle_im_message_receive(data)
 
     logger.debug(
