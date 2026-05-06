@@ -1727,6 +1727,7 @@ def _grafana_click_dashboard_refresh(
         logger.info("Grafana screenshot: no explicit Refresh control — using full page reload instead")
         page.reload(wait_until="load", timeout=timeout_ms)
         page.wait_for_timeout(380)
+        _grafana_wait_loading_like_gone(page, spin_cap)
     except Exception as e:
         logger.info("Grafana screenshot: refresh fallback reload failed: %s", e)
 
@@ -1766,6 +1767,40 @@ def _grafana_loading_like_count(page: Any) -> int:
         return 0
 
 
+def _grafana_refresh_toolbar_busy(page: Any) -> bool:
+    """
+    Detect top-right query state: while loading, Grafana often shows a visible "Cancel" button;
+    when idle it returns to "Refresh".
+    """
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                  const visible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 2 || r.height < 2) return false;
+                    const st = window.getComputedStyle(el);
+                    if (!st || st.display === "none" || st.visibility === "hidden") return false;
+                    return true;
+                  };
+                  let hasCancel = false;
+                  let hasRefresh = false;
+                  for (const b of Array.from(document.querySelectorAll('button'))) {
+                    if (!visible(b)) continue;
+                    const t = (b.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    if (!t) continue;
+                    if (t.includes('cancel') || t.includes('取消')) hasCancel = true;
+                    if (t.includes('refresh') || t.includes('刷新')) hasRefresh = true;
+                  }
+                  return hasCancel && !hasRefresh;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 def _grafana_wait_loading_like_gone(page: Any, budget_ms: int) -> None:
     """Poll until loading-like elements stay at 0 for a few ticks (queries + canvas paint)."""
     if budget_ms <= 0:
@@ -1773,12 +1808,15 @@ def _grafana_wait_loading_like_gone(page: Any, budget_ms: int) -> None:
     deadline = time.monotonic() + budget_ms / 1000.0
     stable = 0
     last_c = -1
+    last_busy: Optional[bool] = None
     while time.monotonic() < deadline:
         c = _grafana_loading_like_count(page)
-        if c != last_c:
-            logger.debug("Grafana screenshot: loading-like count=%s", c)
+        busy = _grafana_refresh_toolbar_busy(page)
+        if c != last_c or busy != last_busy:
+            logger.debug("Grafana screenshot: loading-like count=%s toolbar_busy=%s", c, busy)
             last_c = c
-        if c == 0:
+            last_busy = busy
+        if c == 0 and not busy:
             stable += 1
             if stable >= 2:
                 return
@@ -1786,11 +1824,13 @@ def _grafana_wait_loading_like_gone(page: Any, budget_ms: int) -> None:
             stable = 0
         page.wait_for_timeout(160)
     c = _grafana_loading_like_count(page)
-    if c > 0:
+    busy = _grafana_refresh_toolbar_busy(page)
+    if c > 0 or busy:
         logger.warning(
-            "Grafana screenshot: after %sms loading-like elements still present (count≈%s) — capture may be partial",
+            "Grafana screenshot: after %sms still busy (loading_count≈%s toolbar_busy=%s) — capture may be partial",
             budget_ms,
             c,
+            busy,
         )
 
 
