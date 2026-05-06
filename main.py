@@ -142,6 +142,11 @@ _CFG: Dict[str, Any] = {
     # 请求总数/1m：仅 HTTP 序列参与跌幅判断；平均跌幅 ≥ 该阈值时 @ 下面 open_id（可用环境变量覆盖）
     "TARGET_USER_OPEN_ID": "",
     "MONITORING_HTTP_DROP_ALERT_PCT": 10,
+    # 1=常驻后台监控（按周期自动拉 Grafana）；命中阈值则自动发到 MONITORING_ALERT_CHAT_ID
+    "MONITORING_WATCH_ENABLE": "1",
+    "MONITORING_WATCH_INTERVAL_SECONDS": "60",
+    # 自动告警最短间隔（防刷屏）
+    "MONITORING_WATCH_ALERT_COOLDOWN_SECONDS": "300",
 }
 
 
@@ -319,6 +324,8 @@ _monitoring_user_send_in_progress: set = set()
 _monitoring_chat_reply_sent_at: Dict[str, float] = {}
 _monitoring_chat_send_in_progress: set = set()
 _monitoring_card_action_event_ids: set = set()
+_monitoring_watch_last_alert_at: float = 0.0
+_monitoring_watch_started: bool = False
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
@@ -2426,6 +2433,106 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
     ).start()
 
 
+def _monitoring_watchdog_loop() -> None:
+    """Periodic Grafana check; alert chat on >= threshold drop/spike."""
+    global _monitoring_watch_last_alert_at
+    sec = max(15.0, _cfg_float("MONITORING_WATCH_INTERVAL_SECONDS", 60.0))
+    cool = max(0.0, _cfg_float("MONITORING_WATCH_ALERT_COOLDOWN_SECONDS", 300.0))
+    logger.info(
+        "monitoring watchdog started interval=%.0fs cooldown=%.0fs alert_chat=%r target_user=%r",
+        sec,
+        cool,
+        bool((MONITORING_ALERT_CHAT_ID or "").strip()),
+        bool((TARGET_USER_OPEN_ID or "").strip()),
+    )
+    while True:
+        try:
+            alert_chat = (MONITORING_ALERT_CHAT_ID or "").strip()
+            if not alert_chat:
+                logger.warning("monitoring watchdog: MONITORING_ALERT_CHAT_ID empty — skip this cycle")
+                time.sleep(sec)
+                continue
+
+            sess = grafana_login_session()
+            payload = fetch_request_total_1m_series(session=sess)
+            http_ex = _http_analysis_for_payload(payload)
+            if not bool(http_ex.get("hit_alert")):
+                time.sleep(sec)
+                continue
+
+            now_m = time.monotonic()
+            with _monitoring_reply_dispatch_lock:
+                prev = _monitoring_watch_last_alert_at
+                if cool > 0 and prev > 0 and (now_m - prev) < cool:
+                    logger.info(
+                        "monitoring watchdog alert skipped by cooldown (%.0fs left)",
+                        cool - (now_m - prev),
+                    )
+                    time.sleep(sec)
+                    continue
+                _monitoring_watch_last_alert_at = now_m
+
+            reply = _format_monitoring_reply(payload)
+            pre_key: Optional[str] = None
+            if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+                w0 = payload.get("window") or {}
+                su0 = int(w0.get("startUnix") or 0)
+                eu0 = int(w0.get("endUnix") or 0)
+                if su0 > 0 and eu0 > 0:
+                    try:
+                        pre_key = _lark_upload_png_image_key(_grafana_headless_screenshot_png(sess, su0, eu0))
+                    except Exception:
+                        logger.exception("monitoring watchdog pre-screenshot failed")
+
+            used_card, embedded = _lark_send_monitoring_user_message(
+                "chat_id",
+                alert_chat,
+                reply,
+                pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
+            )
+            logger.info(
+                "monitoring watchdog alert sent chat_prefix=%s... card=%s embedded_png=%s",
+                alert_chat[:16],
+                used_card,
+                embedded,
+            )
+
+            if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE") and not embedded:
+                if pre_key:
+                    try:
+                        _lark_send_image_message("chat_id", alert_chat, pre_key)
+                        logger.info("monitoring watchdog screenshot sent via pre_key")
+                    except Exception:
+                        logger.exception("monitoring watchdog pre_key image send failed")
+                else:
+                    w = payload.get("window") or {}
+                    su = int(w.get("startUnix") or 0)
+                    eu = int(w.get("endUnix") or 0)
+                    if su > 0 and eu > 0:
+                        try:
+                            png = _grafana_headless_screenshot_png(sess, su, eu)
+                            key = _lark_upload_png_image_key(png)
+                            _lark_send_image_message("chat_id", alert_chat, key)
+                            logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
+                        except Exception:
+                            logger.exception("monitoring watchdog screenshot send failed")
+        except Exception:
+            logger.exception("monitoring watchdog cycle failed")
+        time.sleep(sec)
+
+
+def _start_monitoring_watchdog_if_enabled() -> None:
+    global _monitoring_watch_started
+    if not _lark_env_truthy("MONITORING_WATCH_ENABLE"):
+        logger.info("monitoring watchdog disabled (MONITORING_WATCH_ENABLE=0)")
+        return
+    with _monitoring_reply_dispatch_lock:
+        if _monitoring_watch_started:
+            return
+        _monitoring_watch_started = True
+    threading.Thread(target=_monitoring_watchdog_loop, daemon=True, name="monitoring-watchdog").start()
+
+
 def _run_monitoring_background_job(
     chat_id: str,
     open_id: str,
@@ -3432,6 +3539,7 @@ def run_monitoring_bot() -> None:
         "monitoring bot pid=%s — duplicate replies: check two processes (same APP_ID) or IM dedupe logs.",
         os.getpid(),
     )
+    _start_monitoring_watchdog_if_enabled()
     port = _cfg_listen_port(5002)
     if MONITORING_AT_MENTION_ENABLE and not (LARK_BOT_OPEN_ID or "").strip():
         logger.warning(
