@@ -16,7 +16,7 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
 群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（最近 10 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``now-10m`` 一致）。
-默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：摘要用飞书 **交互卡片** +「重新截图」按钮（需订阅 ``card.action.trigger``）；设 ``0`` 则纯文本。
+默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：摘要用飞书 **交互卡片** +「重新截图」按钮（需订阅 ``card.action.trigger``）；``GRAFANA_SCREENSHOT_ENABLE=1`` 时 PNG 先上传为 ``image_key`` 并 **嵌入卡片**（不再跟一条独立图片消息，除非卡片发送失败回退为纯文本）。设 ``0`` 则纯文本。
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
 
 可选 ``GRAFANA_PERSISTENT_WORKER_ENABLE=1``：**单线程常驻** Playwright + Grafana 页，每分钟 Refresh / 必要时 reload，Prometheus 读数与告警；``/monitoring`` 走热页截图（少重复登录）。见 ``MONITORING_DAEMON_*``。
@@ -1423,9 +1423,36 @@ def _monitoring_card_body_md_strip_title(reply: str) -> str:
     return _monitoring_reply_to_card_md(r)
 
 
-def _monitoring_interactive_card_dict(reply: str, receive_id_type: str, receive_id: str) -> Dict[str, Any]:
+def _monitoring_interactive_card_dict(
+    reply: str,
+    receive_id_type: str,
+    receive_id: str,
+    lark_img_key: Optional[str] = None,
+) -> Dict[str, Any]:
     btn_val = {"m": "shot", "t": (receive_id_type or "chat_id").strip(), "i": (receive_id or "").strip()}
     title = _monitoring_card_title_plain()
+    elements: List[Dict[str, Any]] = [
+        {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
+    ]
+    ik = (lark_img_key or "").strip()
+    if ik:
+        elements.append(
+            {
+                "tag": "img",
+                "img_key": ik,
+                "alt": {"tag": "plain_text", "content": "Grafana"},
+                "preview": True,
+                "transparent": False,
+            }
+        )
+    elements.append(
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "📷 重新截图"},
+            "type": "primary",
+            "behaviors": [{"type": "callback", "value": btn_val}],
+        }
+    )
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "wide_screen_mode": True},
@@ -1434,17 +1461,7 @@ def _monitoring_interactive_card_dict(reply: str, receive_id_type: str, receive_
             "title": {"tag": "plain_text", "content": title},
             "subtitle": {"tag": "plain_text", "content": "Grafana · 下方按钮可重新截图"},
         },
-        "body": {
-            "elements": [
-                {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "📷 重新截图"},
-                    "type": "primary",
-                    "behaviors": [{"type": "callback", "value": btn_val}],
-                },
-            ],
-        },
+        "body": {"elements": elements},
     }
 
 
@@ -1483,21 +1500,32 @@ def _lark_send_interactive_card(receive_id_type: str, receive_id: str, card: Dic
     )
 
 
-def _lark_send_monitoring_user_message(receive_id_type: str, receive_id: str, reply: str) -> None:
-    """Plain text or interactive card (``MONITORING_MESSAGE_CARD_ENABLE``)."""
+def _lark_send_monitoring_user_message(
+    receive_id_type: str,
+    receive_id: str,
+    reply: str,
+    lark_img_key: Optional[str] = None,
+) -> bool:
+    """
+    Plain text or interactive card (``MONITORING_MESSAGE_CARD_ENABLE``).
+    ``lark_img_key``: optional ``im/v1/images`` key — when card mode is on, PNG is **embedded** in the card ``img`` element.
+
+    Returns ``True`` if a **successful** interactive card was sent; ``False`` if plain text was used.
+    """
     rid = (receive_id or "").strip()
     if not rid:
         raise ValueError("empty receive_id for monitoring message")
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
-            card = _monitoring_interactive_card_dict(reply, receive_id_type, rid)
+            card = _monitoring_interactive_card_dict(reply, receive_id_type, rid, lark_img_key)
             _lark_send_interactive_card(receive_id_type, rid, card)
             logger.info(
-                "monitoring reply sent as **interactive card** (msg_type=interactive) rt=%s len=%s",
+                "monitoring reply sent as **interactive card** rt=%s len=%s embedded_img=%s",
                 receive_id_type,
                 len(reply),
+                bool((lark_img_key or "").strip()),
             )
-            return
+            return True
         except Exception as e:
             logger.warning(
                 "monitoring interactive card failed (%s) — falling back to plain text; "
@@ -1505,6 +1533,7 @@ def _lark_send_monitoring_user_message(receive_id_type: str, receive_id: str, re
                 e,
             )
     _lark_send_text(receive_id_type, rid, reply)
+    return False
 
 
 def _screenshot_only_cold_worker(receive_id_type: str, receive_id: str) -> None:
@@ -2260,13 +2289,20 @@ def _send_monitoring_reply_and_alert_copy(
     open_id: str,
     reply: str,
     http_ex: Optional[Dict[str, Any]],
-) -> bool:
+    lark_img_key: Optional[str] = None,
+) -> Tuple[bool, bool]:
+    """
+    Send the user-visible summary (text or interactive card, optionally with embedded screenshot).
+
+    Returns ``(sent, embedded_png_in_card)`` — when ``embedded_png_in_card`` is True, do not send a follow-up image message.
+    """
     sent = False
+    ok_card = False
     if chat_id:
-        _lark_send_monitoring_user_message("chat_id", chat_id, reply)
+        ok_card = _lark_send_monitoring_user_message("chat_id", chat_id, reply, lark_img_key)
         sent = True
     elif open_id:
-        _lark_send_monitoring_user_message("open_id", open_id, reply)
+        ok_card = _lark_send_monitoring_user_message("open_id", open_id, reply, lark_img_key)
         sent = True
     if (
         sent
@@ -2282,7 +2318,10 @@ def _send_monitoring_reply_and_alert_copy(
                 "monitoring alert forward failed persistent alert_chat_id=%r",
                 MONITORING_ALERT_CHAT_ID[:24],
             )
-    return sent
+    embedded = bool(
+        ok_card and MONITORING_MESSAGE_CARD_ENABLE and (lark_img_key or "").strip()
+    )
+    return sent, embedded
 
 
 def _persistent_alert_edge_notify(reply: str, http_ex: Optional[Dict[str, Any]], skip_chat: str) -> None:
@@ -2400,8 +2439,39 @@ def _persistent_grafana_worker_main() -> None:
                     payload = _fetch_request_total_with_relogin(session)
                     http_ex = _http_analysis_for_payload(payload)
                     reply = _format_monitoring_reply(payload)
-                    sent = _send_monitoring_reply_and_alert_copy(chat_id, open_id, reply, http_ex)
-                    _persistent_send_png_if_enabled(chat_id, open_id, page, sent, timeout_ms)
+                    pre_key: Optional[str] = None
+                    if (
+                        (chat_id or open_id)
+                        and MONITORING_MESSAGE_CARD_ENABLE
+                        and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
+                    ):
+                        try:
+                            _persistent_prepare_dom_before_png(page, timeout_ms)
+                            png0 = _grafana_persistent_page_screenshot_png(page)
+                            pre_key = _lark_upload_png_image_key(png0)
+                        except Exception:
+                            logger.exception(
+                                "persistent worker: pre-screenshot for card embed failed"
+                            )
+                    sent, emb = _send_monitoring_reply_and_alert_copy(
+                        chat_id, open_id, reply, http_ex, lark_img_key=pre_key
+                    )
+                    if sent and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+                        if not emb:
+                            if pre_key:
+                                try:
+                                    if chat_id:
+                                        _lark_send_image_message("chat_id", chat_id, pre_key)
+                                    else:
+                                        _lark_send_image_message("open_id", open_id, pre_key)
+                                except Exception:
+                                    logger.exception(
+                                        "persistent worker: follow-up image after card fallback failed"
+                                    )
+                            else:
+                                _persistent_send_png_if_enabled(
+                                    chat_id, open_id, page, sent, timeout_ms
+                                )
                     _persistent_prev_hit_alert = bool(http_ex.get("hit_alert"))
                 except Exception:
                     logger.exception("persistent worker: user /monitoring job failed")
@@ -2441,8 +2511,36 @@ def _persistent_grafana_worker_main() -> None:
                 http_ex = _http_analysis_for_payload(payload)
                 reply = _format_monitoring_reply(payload)
                 if daemon_chat:
-                    sent = _send_monitoring_reply_and_alert_copy(daemon_chat, "", reply, None)
-                    _persistent_send_png_if_enabled(daemon_chat, "", page, sent, timeout_ms)
+                    pre_key_d: Optional[str] = None
+                    if MONITORING_MESSAGE_CARD_ENABLE and _lark_env_truthy(
+                        "GRAFANA_SCREENSHOT_ENABLE"
+                    ):
+                        try:
+                            _persistent_prepare_dom_before_png(page, timeout_ms)
+                            png_d = _grafana_persistent_page_screenshot_png(page)
+                            pre_key_d = _lark_upload_png_image_key(png_d)
+                        except Exception:
+                            logger.exception(
+                                "persistent daemon: pre-screenshot for card embed failed"
+                            )
+                    sent, emb = _send_monitoring_reply_and_alert_copy(
+                        daemon_chat, "", reply, None, lark_img_key=pre_key_d
+                    )
+                    if sent and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+                        if not emb:
+                            if pre_key_d:
+                                try:
+                                    _lark_send_image_message(
+                                        "chat_id", daemon_chat, pre_key_d
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "persistent daemon: follow-up image after card fallback failed"
+                                    )
+                            else:
+                                _persistent_send_png_if_enabled(
+                                    daemon_chat, "", page, sent, timeout_ms
+                                )
                     _persistent_alert_edge_notify(reply, http_ex, skip_chat=daemon_chat)
                 else:
                     _persistent_alert_edge_notify(reply, http_ex, skip_chat="")
@@ -2836,49 +2934,66 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
         payload = None
         http_ex = None
 
+    pre_key: Optional[str] = None
+    if (
+        (chat_id or open_id)
+        and MONITORING_MESSAGE_CARD_ENABLE
+        and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
+        and grafana_session is not None
+        and payload is not None
+    ):
+        w0 = payload.get("window") or {}
+        su0 = int(w0.get("startUnix") or 0)
+        eu0 = int(w0.get("endUnix") or 0)
+        if su0 > 0 and eu0 > 0:
+            try:
+                jar = grafana_session.cookies.get_dict()
+                if "grafana_session" not in jar:
+                    logger.warning(
+                        "monitoring pre-screenshot: no grafana_session cookie — expect login wall in PNG"
+                    )
+                n_cookies = len(_playwright_cookie_list(grafana_session))
+                logger.info(
+                    "monitoring **cold** pre-screenshot for card: cookies=%s window=%s..%s",
+                    n_cookies,
+                    su0,
+                    eu0,
+                )
+                png0 = _grafana_headless_screenshot_png(grafana_session, su0, eu0)
+                pre_key = _lark_upload_png_image_key(png0)
+            except Exception:
+                logger.exception("monitoring pre-screenshot for card embed failed")
+
     sent = False
+    emb = False
     try:
-        if chat_id:
-            _lark_send_monitoring_user_message("chat_id", chat_id, reply)
-            sent = True
+        sent, emb = _send_monitoring_reply_and_alert_copy(
+            chat_id, open_id, reply, http_ex, lark_img_key=pre_key
+        )
+        if sent and chat_id:
             logger.info(
-                "monitoring reply sent (background) receive_id_type=chat_id chat_id_prefix=%s... len=%s",
+                "monitoring reply sent (background) receive_id_type=chat_id chat_id_prefix=%s... len=%s embedded_png=%s",
                 chat_id[:16],
                 len(reply),
+                emb,
             )
-        elif open_id:
-            _lark_send_monitoring_user_message("open_id", open_id, reply)
-            sent = True
-            logger.info("monitoring reply sent (background) receive_id_type=open_id len=%s", len(reply))
+        elif sent and open_id:
+            logger.info(
+                "monitoring reply sent (background) receive_id_type=open_id len=%s embedded_png=%s",
+                len(reply),
+                emb,
+            )
         else:
             logger.warning(
                 "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
             )
 
-        if (
-            http_ex
-            and http_ex.get("hit_alert")
-            and MONITORING_ALERT_CHAT_ID
-            and MONITORING_ALERT_CHAT_ID != (chat_id or "").strip()
-        ):
-            try:
-                _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
-                logger.info(
-                    "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
-                    MONITORING_ALERT_CHAT_ID[:16],
-                    len(reply),
-                )
-            except Exception:
-                logger.exception(
-                    "monitoring alert forward failed (background) alert_chat_id=%r",
-                    MONITORING_ALERT_CHAT_ID[:24],
-                )
-
-        # 无条件打一行，便于对照 journal：是否读到 ENABLE、是否有 session/payload（缺任一则不会走截图）
         _raw_ss = _cfg_raw("GRAFANA_SCREENSHOT_ENABLE")
         logger.info(
-            "monitoring screenshot gate sent=%s session=%s payload=%s ENABLE_raw=%r ENABLE_truthy=%s",
+            "monitoring screenshot gate sent=%s emb=%s pre_key=%s session=%s payload=%s ENABLE_raw=%r ENABLE_truthy=%s",
             sent,
+            emb,
+            bool(pre_key),
             grafana_session is not None,
             payload is not None,
             _raw_ss,
@@ -2890,12 +3005,31 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
                 logger.info(
                     "monitoring screenshot skipped: set GRAFANA_SCREENSHOT_ENABLE=1 (and install playwright + chromium)"
                 )
+            elif emb:
+                logger.info(
+                    "monitoring: PNG embedded in interactive card — no separate image message"
+                )
+            elif pre_key:
+                try:
+                    if chat_id:
+                        _lark_send_image_message("chat_id", chat_id, pre_key)
+                    else:
+                        _lark_send_image_message("open_id", open_id, pre_key)
+                    logger.info(
+                        "monitoring Grafana screenshot sent (background, card fallback) image_key set"
+                    )
+                except Exception:
+                    logger.exception(
+                        "monitoring Grafana image send failed after card text fallback"
+                    )
             else:
                 w = payload.get("window") or {}
                 su = int(w.get("startUnix") or 0)
                 eu = int(w.get("endUnix") or 0)
                 if su <= 0 or eu <= 0:
-                    logger.warning("monitoring screenshot skipped: invalid window start=%s end=%s", su, eu)
+                    logger.warning(
+                        "monitoring screenshot skipped: invalid window start=%s end=%s", su, eu
+                    )
                 else:
                     try:
                         jar = grafana_session.cookies.get_dict()
