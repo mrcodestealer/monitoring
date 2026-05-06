@@ -1723,8 +1723,10 @@ _GRAFANA_JS_REACTROOT_HAS_CHARTS = """() => {
 
 def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     """
-    Grafana 12：左侧 mega-menu 展开时先点「Dock menu」(#dock-menu-button) 再拍主区；
-    若未展开则先点 #mega-menu-toggle 再 Dock。仅负责点击，不负责等图（见 ``_grafana_wait_dashboard_ready``）。
+    Grafana 12+：收起左侧 mega-menu，让主 dashboard 占满宽度。
+    ``#dock-menu-button``（aria-label Dock menu）常在 ``[data-testid='data-testid navigation mega-menu']``
+    对话框内；使用 ``visible`` 等待 + ``force=True`` 避免被遮罩/动画挡住导致 silent 失败。
+    若仍无按钮则尝试打开 #mega-menu-toggle 后再点 Dock。
     """
     if not _lark_env_truthy("GRAFANA_SCREENSHOT_DOCK_NAV"):
         return
@@ -1734,30 +1736,64 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     except Exception:
         pass
 
-    def _try_dock() -> bool:
-        loc = page.locator("#dock-menu-button")
-        if loc.count() == 0:
-            return False
+    def _click_dock() -> bool:
+        selectors = (
+            '[data-testid="data-testid navigation mega-menu"] #dock-menu-button',
+            '[data-testid="data-testid navigation mega-menu"] button[aria-label="Dock menu"]',
+            "#dock-menu-button",
+            'button[id="dock-menu-button"]',
+            'button[aria-label="Dock menu"]',
+        )
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                if loc.count() == 0:
+                    continue
+                loc.wait_for(state="visible", timeout=4000)
+                loc.click(timeout=5000, force=True)
+                logger.info("Grafana screenshot: clicked Dock menu via %r", sel)
+                return True
+            except Exception:
+                continue
         try:
-            loc.first.click(timeout=2500)
-            return True
+            alt = page.get_by_role("button", name=re.compile(r"^\s*Dock menu\s*$", re.I)).first
+            if alt.count() > 0:
+                alt.wait_for(state="visible", timeout=3000)
+                alt.click(timeout=5000, force=True)
+                logger.info("Grafana screenshot: clicked Dock menu (role=name)")
+                return True
         except Exception:
-            return False
+            pass
+        return False
 
     try:
-        if not _try_dock():
-            mt = page.locator("#mega-menu-toggle")
-            if mt.count() > 0:
-                try:
-                    mt.first.click(timeout=2000)
-                    page.wait_for_timeout(350)
-                except Exception:
-                    pass
-            _try_dock()
+        if _click_dock():
+            page.wait_for_timeout(320)
+            return
+        for open_sel in (
+            "#mega-menu-toggle",
+            '[data-testid="mega-menu-toggle"]',
+            "button[aria-label*='Open menu']",
+        ):
+            mt = page.locator(open_sel).first
+            try:
+                if mt.count() == 0:
+                    continue
+                mt.click(timeout=2500, force=True)
+                page.wait_for_timeout(450)
+            except Exception:
+                continue
+            if _click_dock():
+                page.wait_for_timeout(320)
+                return
+        logger.warning(
+            "Grafana screenshot: could not click Dock menu — left nav may stay open "
+            "(selectors tried: mega-menu #dock-menu-button, #dock-menu-button, aria-label)"
+        )
     except Exception as e:
         logger.info("Grafana screenshot: dock nav optional step failed: %s", e)
 
-    page.wait_for_timeout(280)
+    page.wait_for_timeout(200)
 
 
 def _grafana_expand_collapsed_dashboard_rows(page: Any) -> None:
@@ -2302,6 +2338,8 @@ def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms
     page.wait_for_timeout(200)
     _grafana_playwright_dock_nav_only(page, timeout_ms)
     _grafana_click_dashboard_refresh(page, timeout_ms)
+    # Refresh 有时会重新弹出 mega-menu；再收一次侧栏
+    _grafana_playwright_dock_nav_only(page, timeout_ms)
     _grafana_expand_collapsed_dashboard_rows(page)
     _grafana_wait_dashboard_ready(page, timeout_ms)
     _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
@@ -2316,6 +2354,7 @@ def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms
             timeout_ms,
             spinner_budget_ms=min(1400, int(GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS)),
         )
+        _grafana_playwright_dock_nav_only(page, timeout_ms)
         _grafana_wait_dashboard_body_populated(
             page, min(3200, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
         )
@@ -2333,6 +2372,7 @@ def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms
             page.wait_for_timeout(450)
             _grafana_playwright_dock_nav_only(page, timeout_ms)
             _grafana_click_dashboard_refresh(page, timeout_ms)
+            _grafana_playwright_dock_nav_only(page, timeout_ms)
             _grafana_expand_collapsed_dashboard_rows(page)
             _grafana_wait_dashboard_ready(page, min(20000, timeout_ms // 2))
             _grafana_wait_dashboard_body_populated(
@@ -2353,6 +2393,7 @@ def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms
     if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
         page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
     _grafana_close_open_menus(page)
+    _grafana_playwright_dock_nav_only(page, timeout_ms)
     _grafana_playwright_pre_screenshot_paint_flush(page)
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
     try:
