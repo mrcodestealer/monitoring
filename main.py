@@ -61,6 +61,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_DASHBOARD_PATH": "/d/281e8816-ccb0-4335-922b-6b248491fd28/core-metrics-arms-aliyun",
     "GRAFANA_DASHBOARD_UID": "281e8816-ccb0-4335-922b-6b248491fd28",
     "GRAFANA_PANEL_TITLE": "请求总数/1m",
+    "GRAFANA_PANEL_TITLE_9280": "9280 Connection",
+    "MONITORING_9280_SERIES_KEYWORD": "9280 + Push",
     "GRAFANA_DASHBOARD_FROM": "now-10m",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
@@ -138,7 +140,8 @@ _CFG: Dict[str, Any] = {
     "LARK_WEBHOOK_WSGI_LOG": "0",
     "LARK_WEBHOOK_TIMING_LOG": "0",
     "MONITORING_HTTP_DROP_ALERT_PCT": 10,
-    # 1=常驻后台监控（按周期自动拉 Grafana）；命中阈值则自动发到 MONITORING_ALERT_CHAT_ID
+    "MONITORING_9280_ENABLE": "1",
+    "MONITORING_9280_ALERT_PCT": 10,
     "MONITORING_WATCH_ENABLE": "1",
     "MONITORING_WATCH_INTERVAL_SECONDS": "60",
     # 自动告警最短间隔（防刷屏）
@@ -347,6 +350,8 @@ GRAFANA_DASHBOARD_UID = _cfg_str(
     "GRAFANA_DASHBOARD_UID", "281e8816-ccb0-4335-922b-6b248491fd28"
 )
 GRAFANA_PANEL_TITLE = _cfg_str("GRAFANA_PANEL_TITLE", "请求总数/1m")
+GRAFANA_PANEL_TITLE_9280 = _cfg_str("GRAFANA_PANEL_TITLE_9280", "9280 Connection")
+MONITORING_9280_SERIES_KEYWORD = _cfg_str("MONITORING_9280_SERIES_KEYWORD", "9280 + Push").strip()
 # Browser URL time range: last 10 minutes (matches “latest 10 mins”). Override e.g. now-1m if you want.
 GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-10m")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
@@ -397,6 +402,7 @@ TARGET_USER_OPEN_ID = _cfg_str(
     "TARGET_USER_OPEN_ID", "ou_d7bc33724e2d6ced4050c944c2ca5650"
 ).strip()
 MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
+MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 10.0)
 LARK_ENCRYPT_KEY = (
     _cfg_str("LARK_ENCRYPT_KEY")
     or _cfg_str("ENCRYPT_KEY")
@@ -1177,22 +1183,17 @@ def _prometheus_query_range(
     return r.json()
 
 
-def fetch_request_total_1m_series(session: Optional[requests.Session] = None) -> Dict[str, Any]:
-    """
-    Same data as Grafana panel「请求总数/1m」: last ``GRAFANA_QUERY_LOOKBACK_SECONDS`` (default **600 = 10m**),
-    step ``GRAFANA_QUERY_STEP``. Align with dashboard ``GRAFANA_DASHBOARD_FROM`` / ``now-10m`` for screenshots.
-    ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
-    avoiding incomplete recent-minute series that look like a false drop.
-    Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
-    """
+def _fetch_panel_series_by_title(
+    panel_title: str, session: Optional[requests.Session] = None
+) -> Dict[str, Any]:
     lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
     end = int(time.time()) - lag
     start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
     sess = session or grafana_login_session()
     dash = _fetch_dashboard_model(sess, GRAFANA_DASHBOARD_UID)
-    panel = _find_panel(dash, GRAFANA_PANEL_TITLE)
+    panel = _find_panel(dash, panel_title)
     if not panel:
-        raise ValueError(f'Panel titled "{GRAFANA_PANEL_TITLE}" not found on dashboard {GRAFANA_DASHBOARD_UID}')
+        raise ValueError(f'Panel titled "{panel_title}" not found on dashboard {GRAFANA_DASHBOARD_UID}')
 
     panel_ds = _datasource_uid(panel.get("datasource"))
     series_out: List[Dict[str, Any]] = []
@@ -1214,16 +1215,37 @@ def fetch_request_total_1m_series(session: Optional[requests.Session] = None) ->
                 "prometheus": raw,
             }
         )
-
     if not series_out:
-        raise ValueError("No Prometheus expr targets on panel (check panel JSON / datasource)")
-
+        raise ValueError(f'No Prometheus expr targets on panel "{panel_title}"')
     return {
-        "panelTitle": GRAFANA_PANEL_TITLE,
+        "panelTitle": panel_title,
         "dashboardUid": GRAFANA_DASHBOARD_UID,
         "window": {"startUnix": start, "endUnix": end, "stepSeconds": GRAFANA_QUERY_STEP},
         "series": series_out,
     }
+
+
+def fetch_request_total_1m_series(session: Optional[requests.Session] = None) -> Dict[str, Any]:
+    """
+    Same data as Grafana panel「请求总数/1m」: last ``GRAFANA_QUERY_LOOKBACK_SECONDS`` (default **600 = 10m**),
+    step ``GRAFANA_QUERY_STEP``. Align with dashboard ``GRAFANA_DASHBOARD_FROM`` / ``now-10m`` for screenshots.
+    ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
+    avoiding incomplete recent-minute series that look like a false drop.
+    Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
+    """
+    return _fetch_panel_series_by_title(GRAFANA_PANEL_TITLE, session=session)
+
+
+def fetch_monitoring_payload(session: Optional[requests.Session] = None) -> Dict[str, Any]:
+    sess = session or grafana_login_session()
+    primary = fetch_request_total_1m_series(session=sess)
+    if _lark_env_truthy("MONITORING_9280_ENABLE"):
+        try:
+            p9280 = _fetch_panel_series_by_title(GRAFANA_PANEL_TITLE_9280, session=sess)
+            primary["extraPanels"] = [{"kind": "9280_push", "payload": p9280}]
+        except Exception:
+            logger.exception("fetch 9280 panel failed (optional monitor)")
+    return primary
 
 
 def _lark_api_domain() -> str:
@@ -2089,6 +2111,34 @@ def _merge_http_timeseries_points(payload: Dict[str, Any]) -> List[Tuple[float, 
     return sorted(by_ts.items(), key=lambda x: x[0])
 
 
+def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
+    """Pick/merge points for '9280 + Push' from panel targets/results."""
+    kw = (MONITORING_9280_SERIES_KEYWORD or "9280 + Push").strip().casefold()
+    by_ts: Dict[float, float] = {}
+    for s in payload.get("series") or []:
+        lg = str(s.get("legendFormat") or "").casefold()
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            metric = r.get("metric") or {}
+            metric_blob = " ".join([str(v) for v in metric.values()]).casefold()
+            # Primary: legendFormat matches keyword; fallback: metric labels include keyword.
+            if kw and not (kw in lg or kw in metric_blob):
+                continue
+            for pair in r.get("values") or []:
+                if len(pair) < 2:
+                    continue
+                try:
+                    ts = float(pair[0])
+                    val = float(pair[1])
+                except (TypeError, ValueError):
+                    continue
+                by_ts[ts] = by_ts.get(ts, 0.0) + val
+    if not by_ts:
+        return []
+    return sorted(by_ts.items(), key=lambda x: x[0])
+
+
 def _best_consecutive_drop_run(vals: List[float], ts: List[float]) -> Optional[Dict[str, Any]]:
     """
     Longest weakly-decreasing runs (each step ``vals[k+1] <= vals[k]``); score each run by
@@ -2224,6 +2274,46 @@ def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return a
 
 
+def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    pts = _merge_9280_push_points(payload)
+    a = _http_drop_spike_analysis(pts, MONITORING_9280_ALERT_PCT)
+    a["point_count"] = len(pts)
+    a["merged_points"] = [[t, v] for t, v in pts]
+    return a
+
+
+def _format_9280_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
+    thr = float(analysis.get("alert_threshold_pct") or MONITORING_9280_ALERT_PCT)
+    lines: List[str] = [
+        "",
+        f"[9280 + Push] alert threshold: drop/spike >= {thr:g}%",
+    ]
+    cd = analysis.get("consecutive_max_drop") or analysis.get("adjacent_max_drop")
+    cs = analysis.get("consecutive_max_spike") or analysis.get("adjacent_max_spike")
+    if isinstance(cd, dict) and cd.get("from_ts") is not None:
+        lines.append(f"max drop : {_fmt_ts_short(cd['from_ts'])} -> {_fmt_ts_short(cd['to_ts'])}  -{cd.get('pct')}%")
+    else:
+        lines.append("max drop : n/a")
+    if isinstance(cs, dict) and cs.get("from_ts") is not None:
+        lines.append(f"max spike: {_fmt_ts_short(cs['from_ts'])} -> {_fmt_ts_short(cs['to_ts'])}  +{cs.get('pct')}%")
+    else:
+        lines.append("max spike: n/a")
+    return lines
+
+
+def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
+    if bool(_http_analysis_for_payload(payload).get("hit_alert")):
+        return True
+    for ex in payload.get("extraPanels") or []:
+        if not isinstance(ex, dict):
+            continue
+        if (ex.get("kind") or "") == "9280_push":
+            p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+            if bool(_analysis_for_9280_payload(p2).get("hit_alert")):
+                return True
+    return False
+
+
 def _fmt_ts_short(ts: Any) -> str:
     try:
         return datetime.fromtimestamp(int(float(ts))).strftime("%m-%d %H:%M")
@@ -2313,7 +2403,29 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
             lines.extend(rows)
             lines.append("```")
 
-    if http_ex.get("hit_alert") and TARGET_USER_OPEN_ID:
+    for ex in payload.get("extraPanels") or []:
+        if not isinstance(ex, dict):
+            continue
+        if (ex.get("kind") or "") != "9280_push":
+            continue
+        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+        a2 = _analysis_for_9280_payload(p2)
+        pts2 = a2.get("merged_points") or []
+        lines.append("")
+        lines.append(f"[{GRAFANA_PANEL_TITLE_9280}] series: {MONITORING_9280_SERIES_KEYWORD}")
+        if pts2:
+            tail2 = pts2[-max_rows:]
+            rows2: List[str] = ["time           value", "-------------  ------------"]
+            for pair in tail2:
+                rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+            lines.append("```text")
+            lines.extend(rows2)
+            lines.append("```")
+        else:
+            lines.append("(no 9280 + Push points matched)")
+        lines.extend(_format_9280_analysis_lines(a2))
+
+    if _monitoring_payload_hit_alert(payload) and TARGET_USER_OPEN_ID:
         lines.append(f'<at user_id="{TARGET_USER_OPEN_ID}"> </at>')
     lines.extend(_format_http_analysis_lines(http_ex))
 
@@ -2455,9 +2567,8 @@ def _monitoring_watchdog_loop() -> None:
                 continue
 
             sess = grafana_login_session()
-            payload = fetch_request_total_1m_series(session=sess)
-            http_ex = _http_analysis_for_payload(payload)
-            if not bool(http_ex.get("hit_alert")):
+            payload = fetch_monitoring_payload(session=sess)
+            if not _monitoring_payload_hit_alert(payload):
                 time.sleep(sec)
                 continue
 
@@ -2578,18 +2689,18 @@ def _monitoring_background_worker(
     try:
         grafana_session: Optional[requests.Session] = None
         payload: Optional[Dict[str, Any]] = None
-        http_ex: Optional[Dict[str, Any]] = None
+        alert_hit = False
         try:
             grafana_session = grafana_login_session()
-            payload = fetch_request_total_1m_series(session=grafana_session)
-            http_ex = _http_analysis_for_payload(payload)
+            payload = fetch_monitoring_payload(session=grafana_session)
+            alert_hit = _monitoring_payload_hit_alert(payload)
             reply = _format_monitoring_reply(payload)
         except Exception as e:
             logger.exception("monitoring fetch failed (background)")
             reply = f"监控数据拉取失败：{e}"
             grafana_session = None
             payload = None
-            http_ex = None
+            alert_hit = False
 
         sent = False
         used_interactive_card = False
@@ -2650,7 +2761,7 @@ def _monitoring_background_worker(
             if (chat_id or "").strip():
                 src_alias.add((chat_id or "").strip())
             suppress_alert_copy = alert_chat_id in src_alias
-            if http_ex and http_ex.get("hit_alert") and alert_chat_id and not suppress_alert_copy:
+            if alert_hit and alert_chat_id and not suppress_alert_copy:
                 try:
                     _lark_send_text("chat_id", alert_chat_id, reply)
                     logger.info(
@@ -2663,7 +2774,7 @@ def _monitoring_background_worker(
                         "monitoring alert forward failed (background) alert_chat_id=%r",
                         alert_chat_id[:24],
                     )
-            elif http_ex and http_ex.get("hit_alert") and alert_chat_id and suppress_alert_copy:
+            elif alert_hit and alert_chat_id and suppress_alert_copy:
                 logger.info(
                     "monitoring alert copy skipped: source chat matches MONITORING_ALERT_CHAT_ID alias"
                 )
