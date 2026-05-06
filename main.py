@@ -63,6 +63,10 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_PANEL_TITLE": "请求总数/1m",
     "GRAFANA_PANEL_TITLE_9280": "9280 Connection",
     "MONITORING_9280_SERIES_KEYWORD": "9280 + Push",
+    "GRAFANA_PANEL_TITLE_DEPOSIT": "主站充值 (Main Site Deposit)",
+    "MONITORING_DEPOSIT_SERIES_KEYWORD": "createProposal",
+    "GRAFANA_PANEL_TITLE_WITHDRAW": "提款 (Withdrawal)",
+    "MONITORING_WITHDRAW_SERIES_KEYWORD": "InitiateWithdrawal",
     "GRAFANA_DASHBOARD_FROM": "now-10m",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
@@ -140,8 +144,17 @@ _CFG: Dict[str, Any] = {
     "LARK_WEBHOOK_WSGI_LOG": "0",
     "LARK_WEBHOOK_TIMING_LOG": "0",
     "MONITORING_HTTP_DROP_ALERT_PCT": 10,
+    "MONITORING_HTTP_CONTINUOUS_ALERT_PCT": 20,
     "MONITORING_9280_ENABLE": "1",
     "MONITORING_9280_ALERT_PCT": 15,
+    "MONITORING_9280_CONTINUOUS_ALERT_PCT": 25,
+    "MONITORING_DEPOSIT_ENABLE": "1",
+    "MONITORING_DEPOSIT_ALERT_PCT": 60,
+    "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT": 80,
+    "MONITORING_WITHDRAW_ENABLE": "1",
+    "MONITORING_WITHDRAW_ALERT_PCT": 60,
+    "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 80,
+    "MONITORING_ALERT_WINDOW_SECONDS": 120,
     "MONITORING_WATCH_ENABLE": "1",
     "MONITORING_WATCH_INTERVAL_SECONDS": "60",
     # 自动告警最短间隔（防刷屏）
@@ -352,6 +365,10 @@ GRAFANA_DASHBOARD_UID = _cfg_str(
 GRAFANA_PANEL_TITLE = _cfg_str("GRAFANA_PANEL_TITLE", "请求总数/1m")
 GRAFANA_PANEL_TITLE_9280 = _cfg_str("GRAFANA_PANEL_TITLE_9280", "9280 Connection")
 MONITORING_9280_SERIES_KEYWORD = _cfg_str("MONITORING_9280_SERIES_KEYWORD", "9280 + Push").strip()
+GRAFANA_PANEL_TITLE_DEPOSIT = _cfg_str("GRAFANA_PANEL_TITLE_DEPOSIT", "主站充值 (Main Site Deposit)")
+MONITORING_DEPOSIT_SERIES_KEYWORD = _cfg_str("MONITORING_DEPOSIT_SERIES_KEYWORD", "createProposal").strip()
+GRAFANA_PANEL_TITLE_WITHDRAW = _cfg_str("GRAFANA_PANEL_TITLE_WITHDRAW", "提款 (Withdrawal)")
+MONITORING_WITHDRAW_SERIES_KEYWORD = _cfg_str("MONITORING_WITHDRAW_SERIES_KEYWORD", "InitiateWithdrawal").strip()
 # Browser URL time range: last 10 minutes (matches “latest 10 mins”). Override e.g. now-1m if you want.
 GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-10m")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
@@ -403,6 +420,13 @@ TARGET_USER_OPEN_ID = _cfg_str(
 ).strip()
 MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
 MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 15.0)
+MONITORING_HTTP_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_HTTP_CONTINUOUS_ALERT_PCT", 20.0)
+MONITORING_9280_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_9280_CONTINUOUS_ALERT_PCT", 25.0)
+MONITORING_DEPOSIT_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_ALERT_PCT", 60.0)
+MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT", 80.0)
+MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", 60.0)
+MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", 80.0)
+MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 120))
 LARK_ENCRYPT_KEY = (
     _cfg_str("LARK_ENCRYPT_KEY")
     or _cfg_str("ENCRYPT_KEY")
@@ -1239,12 +1263,27 @@ def fetch_request_total_1m_series(session: Optional[requests.Session] = None) ->
 def fetch_monitoring_payload(session: Optional[requests.Session] = None) -> Dict[str, Any]:
     sess = session or grafana_login_session()
     primary = fetch_request_total_1m_series(session=sess)
+    extra: List[Dict[str, Any]] = []
     if _lark_env_truthy("MONITORING_9280_ENABLE"):
         try:
             p9280 = _fetch_panel_series_by_title(GRAFANA_PANEL_TITLE_9280, session=sess)
-            primary["extraPanels"] = [{"kind": "9280_push", "payload": p9280}]
+            extra.append({"kind": "9280_push", "payload": p9280})
         except Exception:
             logger.exception("fetch 9280 panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_DEPOSIT_ENABLE"):
+        try:
+            pd = _fetch_panel_series_by_title(GRAFANA_PANEL_TITLE_DEPOSIT, session=sess)
+            extra.append({"kind": "deposit", "payload": pd})
+        except Exception:
+            logger.exception("fetch deposit panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
+        try:
+            pw = _fetch_panel_series_by_title(GRAFANA_PANEL_TITLE_WITHDRAW, session=sess)
+            extra.append({"kind": "withdraw", "payload": pw})
+        except Exception:
+            logger.exception("fetch withdraw panel failed (optional monitor)")
+    if extra:
+        primary["extraPanels"] = extra
     return primary
 
 
@@ -2143,6 +2182,41 @@ def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]
     return sorted(by_ts.items(), key=lambda x: x[0])
 
 
+def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> List[Tuple[float, float]]:
+    kw = (keyword or "").strip().casefold()
+    by_ts: Dict[float, float] = {}
+    for s in payload.get("series") or []:
+        lg = str(s.get("legendFormat") or "").casefold()
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            metric = r.get("metric") or {}
+            metric_blob = " ".join([str(v) for v in metric.values()]).casefold()
+            # Primary: legendFormat matches keyword; fallback: metric labels include keyword.
+            if kw and not (kw in lg or kw in metric_blob):
+                continue
+            for pair in r.get("values") or []:
+                if len(pair) < 2:
+                    continue
+                try:
+                    ts = float(pair[0])
+                    val = float(pair[1])
+                except (TypeError, ValueError):
+                    continue
+                by_ts[ts] = by_ts.get(ts, 0.0) + val
+    if not by_ts:
+        return []
+    return sorted(by_ts.items(), key=lambda x: x[0])
+
+
+def _merge_deposit_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
+    return _merge_series_points_by_keyword(payload, MONITORING_DEPOSIT_SERIES_KEYWORD)
+
+
+def _merge_withdraw_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
+    return _merge_series_points_by_keyword(payload, MONITORING_WITHDRAW_SERIES_KEYWORD)
+
+
 def _best_consecutive_drop_run(vals: List[float], ts: List[float]) -> Optional[Dict[str, Any]]:
     """
     Longest weakly-decreasing runs (each step ``vals[k+1] <= vals[k]``); score each run by
@@ -2208,24 +2282,26 @@ def _best_consecutive_spike_run(vals: List[float], ts: List[float]) -> Optional[
 
 
 def _http_drop_spike_analysis(
-    points: List[Tuple[float, float]], alert_threshold_pct: float
+    points: List[Tuple[float, float]],
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    window_seconds: int = 120,
 ) -> Dict[str, Any]:
     """
-    For N=1..10 minutes (N buckets at panel step): compare mean(previous N) vs mean(last N).
-    ``hit_alert`` if any N has average drop ≥ ``alert_threshold_pct``.
-
-    Max drop / max spike use **whole consecutive** weakly monotonic segments (multi-minute),
-    scored from first to last bucket of each segment — not single adjacent-minute comparisons.
-    ``hit_alert`` is true when either drop **or** spike reaches threshold.
+    Alert rules:
+    1) within ``window_seconds`` (default 2 minutes), drop/spike >= ``fast_threshold_pct``
+    2) continuous monotonic run drop/spike >= ``continuous_threshold_pct``
     """
     out: Dict[str, Any] = {
         "pointCount": len(points),
         "hit_alert": False,
-        "alert_threshold_pct": alert_threshold_pct,
-        "windows": [],
-        "worst_avg_drop_window": None,
+        "fast_threshold_pct": fast_threshold_pct,
+        "continuous_threshold_pct": continuous_threshold_pct,
+        "window_seconds": int(window_seconds),
         "consecutive_max_drop": None,
         "consecutive_max_spike": None,
+        "window_max_drop": None,
+        "window_max_spike": None,
     }
     if len(points) < 2:
         return out
@@ -2233,6 +2309,16 @@ def _http_drop_spike_analysis(
     vals = [p[1] for p in points]
     ts = [p[0] for p in points]
     L = len(points)
+
+    # Convert "within 2 minutes" to bucket span using median step.
+    if L >= 2:
+        diffs = [max(1.0, ts[i + 1] - ts[i]) for i in range(L - 1)]
+        diffs.sort()
+        step_sec = diffs[len(diffs) // 2]
+    else:
+        step_sec = 60.0
+    span = max(1, int(round(float(window_seconds) / float(step_sec))))
+    out["window_span_buckets"] = span + 1
 
     drop_run = _best_consecutive_drop_run(vals, ts)
     if drop_run is not None:
@@ -2244,7 +2330,7 @@ def _http_drop_spike_analysis(
             "to_val": drop_run.get("to_val"),
             "buckets": drop_run["buckets"],
         }
-        if float(drop_run.get("pct") or 0.0) >= float(alert_threshold_pct):
+        if float(drop_run.get("pct") or 0.0) >= float(continuous_threshold_pct):
             out["hit_alert"] = True
     spike_run = _best_consecutive_spike_run(vals, ts)
     if spike_run is not None:
@@ -2256,46 +2342,55 @@ def _http_drop_spike_analysis(
             "to_val": spike_run.get("to_val"),
             "buckets": spike_run["buckets"],
         }
-        if float(spike_run.get("pct") or 0.0) >= float(alert_threshold_pct):
+        if float(spike_run.get("pct") or 0.0) >= float(continuous_threshold_pct):
             out["hit_alert"] = True
 
-    worst_avg_drop_pct: Optional[float] = None
-    windows: List[Dict[str, Any]] = []
-
-    for n in range(1, 11):
-        if L < 2 * n:
+    best_w_drop: Optional[Dict[str, Any]] = None
+    best_w_spike: Optional[Dict[str, Any]] = None
+    for i in range(0, L - span):
+        j = i + span
+        if vals[i] <= 0:
             continue
-        pre = vals[L - 2 * n : L - n]
-        cur = vals[L - n : L]
-        avg_pre = sum(pre) / n
-        avg_cur = sum(cur) / n
-        if avg_pre <= 0:
-            continue
-        drop_pct = (avg_pre - avg_cur) / avg_pre * 100.0
-        row = {
-            "n_minutes": n,
-            "avg_drop_pct": round(drop_pct, 2),
-            "avg_baseline": avg_pre,
-            "avg_recent": avg_cur,
-            "baseline_from_ts": ts[L - 2 * n],
-            "baseline_to_ts": ts[L - n - 1],
-            "recent_from_ts": ts[L - n],
-            "recent_to_ts": ts[L - 1],
-        }
-        windows.append(row)
-        if drop_pct >= alert_threshold_pct:
-            out["hit_alert"] = True
-        if worst_avg_drop_pct is None or drop_pct > worst_avg_drop_pct:
-            worst_avg_drop_pct = drop_pct
-            out["worst_avg_drop_window"] = dict(row)
-
-    out["windows"] = windows
+        pct = (vals[j] - vals[i]) / vals[i] * 100.0
+        if pct < 0:
+            cand_d = {
+                "pct": round(abs(pct), 2),
+                "from_ts": ts[i],
+                "to_ts": ts[j],
+                "from_val": vals[i],
+                "to_val": vals[j],
+                "window_seconds": int(round(ts[j] - ts[i])),
+            }
+            if best_w_drop is None or float(cand_d["pct"]) > float(best_w_drop["pct"]):
+                best_w_drop = cand_d
+        elif pct > 0:
+            cand_s = {
+                "pct": round(abs(pct), 2),
+                "from_ts": ts[i],
+                "to_ts": ts[j],
+                "from_val": vals[i],
+                "to_val": vals[j],
+                "window_seconds": int(round(ts[j] - ts[i])),
+            }
+            if best_w_spike is None or float(cand_s["pct"]) > float(best_w_spike["pct"]):
+                best_w_spike = cand_s
+    out["window_max_drop"] = best_w_drop
+    out["window_max_spike"] = best_w_spike
+    if best_w_drop is not None and float(best_w_drop.get("pct") or 0.0) >= float(fast_threshold_pct):
+        out["hit_alert"] = True
+    if best_w_spike is not None and float(best_w_spike.get("pct") or 0.0) >= float(fast_threshold_pct):
+        out["hit_alert"] = True
     return out
 
 
 def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_http_timeseries_points(payload)
-    a = _http_drop_spike_analysis(pts, MONITORING_HTTP_DROP_ALERT_PCT)
+    a = _http_drop_spike_analysis(
+        pts,
+        MONITORING_HTTP_DROP_ALERT_PCT,
+        MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
+        MONITORING_ALERT_WINDOW_SECONDS,
+    )
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
     return a
@@ -2303,28 +2398,62 @@ def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_9280_push_points(payload)
-    a = _http_drop_spike_analysis(pts, MONITORING_9280_ALERT_PCT)
+    a = _http_drop_spike_analysis(
+        pts,
+        MONITORING_9280_ALERT_PCT,
+        MONITORING_9280_CONTINUOUS_ALERT_PCT,
+        MONITORING_ALERT_WINDOW_SECONDS,
+    )
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
     return a
 
 
-def _format_9280_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
-    thr = float(analysis.get("alert_threshold_pct") or MONITORING_9280_ALERT_PCT)
+def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    pts = _merge_deposit_points(payload)
+    a = _http_drop_spike_analysis(
+        pts,
+        MONITORING_DEPOSIT_ALERT_PCT,
+        MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT,
+        MONITORING_ALERT_WINDOW_SECONDS,
+    )
+    a["point_count"] = len(pts)
+    a["merged_points"] = [[t, v] for t, v in pts]
+    return a
+
+
+def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    pts = _merge_withdraw_points(payload)
+    a = _http_drop_spike_analysis(
+        pts,
+        MONITORING_WITHDRAW_ALERT_PCT,
+        MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT,
+        MONITORING_ALERT_WINDOW_SECONDS,
+    )
+    a["point_count"] = len(pts)
+    a["merged_points"] = [[t, v] for t, v in pts]
+    return a
+
+
+def _format_extra_analysis_lines(section_label: str, analysis: Dict[str, Any]) -> List[str]:
+    fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_9280_ALERT_PCT)
+    cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_9280_CONTINUOUS_ALERT_PCT)
+    win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
     lines: List[str] = [
         "",
-        f"[9280 + Push] alert threshold: drop/spike >= {thr:g}%",
+        f"[{section_label}] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
+        f"or continuous drop/spike > {cont_thr:g}%",
     ]
-    cd = analysis.get("consecutive_max_drop") or analysis.get("adjacent_max_drop")
-    cs = analysis.get("consecutive_max_spike") or analysis.get("adjacent_max_spike")
-    if isinstance(cd, dict) and cd.get("from_ts") is not None:
-        lines.append(f"max drop : {_fmt_ts_short(cd['from_ts'])} -> {_fmt_ts_short(cd['to_ts'])}  -{cd.get('pct')}%")
-    else:
-        lines.append("max drop : n/a")
-    if isinstance(cs, dict) and cs.get("from_ts") is not None:
-        lines.append(f"max spike: {_fmt_ts_short(cs['from_ts'])} -> {_fmt_ts_short(cs['to_ts'])}  +{cs.get('pct')}%")
-    else:
-        lines.append("max spike: n/a")
+    wd = analysis.get("window_max_drop")
+    ws = analysis.get("window_max_spike")
+    cd = analysis.get("consecutive_max_drop")
+    cs = analysis.get("consecutive_max_spike")
+    lines.append(
+        f"within {win_sec//60}m drop/spike: -{(wd or {}).get('pct', 'n/a')}% / +{(ws or {}).get('pct', 'n/a')}%"
+    )
+    lines.append(
+        f"continuous drop/spike : -{(cd or {}).get('pct', 'n/a')}% / +{(cs or {}).get('pct', 'n/a')}%"
+    )
     return lines
 
 
@@ -2332,21 +2461,38 @@ def _format_trigger_lines(
     graph_label: str,
     series_label: str,
     analysis: Dict[str, Any],
-    threshold_pct: float,
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    window_seconds: int,
 ) -> List[str]:
     out: List[str] = []
-    cd = analysis.get("consecutive_max_drop") or analysis.get("adjacent_max_drop")
-    cs = analysis.get("consecutive_max_spike") or analysis.get("adjacent_max_spike")
-    if isinstance(cd, dict) and float(cd.get("pct") or 0.0) >= float(threshold_pct):
+    wd = analysis.get("window_max_drop")
+    ws = analysis.get("window_max_spike")
+    cd = analysis.get("consecutive_max_drop")
+    cs = analysis.get("consecutive_max_spike")
+    win_m = max(1, int(round(float(window_seconds) / 60.0)))
+    if isinstance(wd, dict) and float(wd.get("pct") or 0.0) >= float(fast_threshold_pct):
         out.append(
-            f"[{graph_label}] {series_label} DROP {cd.get('pct')}%: "
-            f"{_fmt_num(cd.get('from_val'))} ({_fmt_ts_short(cd.get('from_ts'))}) -> "
+            f"[{graph_label}] {series_label} DROP {wd.get('pct')}% within {win_m}m "
+            f"(>{fast_threshold_pct:g}%): {_fmt_num(wd.get('from_val'))} ({_fmt_ts_short(wd.get('from_ts'))}) -> "
+            f"{_fmt_num(wd.get('to_val'))} ({_fmt_ts_short(wd.get('to_ts'))})"
+        )
+    if isinstance(ws, dict) and float(ws.get("pct") or 0.0) >= float(fast_threshold_pct):
+        out.append(
+            f"[{graph_label}] {series_label} SPIKE {ws.get('pct')}% within {win_m}m "
+            f"(>{fast_threshold_pct:g}%): {_fmt_num(ws.get('from_val'))} ({_fmt_ts_short(ws.get('from_ts'))}) -> "
+            f"{_fmt_num(ws.get('to_val'))} ({_fmt_ts_short(ws.get('to_ts'))})"
+        )
+    if isinstance(cd, dict) and float(cd.get("pct") or 0.0) >= float(continuous_threshold_pct):
+        out.append(
+            f"[{graph_label}] {series_label} CONTINUOUS DROP {cd.get('pct')}% "
+            f"(>{continuous_threshold_pct:g}%): {_fmt_num(cd.get('from_val'))} ({_fmt_ts_short(cd.get('from_ts'))}) -> "
             f"{_fmt_num(cd.get('to_val'))} ({_fmt_ts_short(cd.get('to_ts'))})"
         )
-    if isinstance(cs, dict) and float(cs.get("pct") or 0.0) >= float(threshold_pct):
+    if isinstance(cs, dict) and float(cs.get("pct") or 0.0) >= float(continuous_threshold_pct):
         out.append(
-            f"[{graph_label}] {series_label} SPIKE {cs.get('pct')}%: "
-            f"{_fmt_num(cs.get('from_val'))} ({_fmt_ts_short(cs.get('from_ts'))}) -> "
+            f"[{graph_label}] {series_label} CONTINUOUS SPIKE {cs.get('pct')}% "
+            f"(>{continuous_threshold_pct:g}%): {_fmt_num(cs.get('from_val'))} ({_fmt_ts_short(cs.get('from_ts'))}) -> "
             f"{_fmt_num(cs.get('to_val'))} ({_fmt_ts_short(cs.get('to_ts'))})"
         )
     return out
@@ -2356,22 +2502,20 @@ def _format_trigger_fallback_line(
     graph_label: str,
     series_label: str,
     analysis: Dict[str, Any],
-    threshold_pct: float,
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    window_seconds: int,
 ) -> Optional[str]:
     """
     Fallback reason when concise consecutive drop/spike lines are empty but ``hit_alert`` is true.
     Uses avg-drop window details so alert messages are never reasonless.
     """
-    w = analysis.get("worst_avg_drop_window")
-    if isinstance(w, dict) and float(w.get("avg_drop_pct") or 0.0) >= float(threshold_pct):
-        return (
-            f"[{graph_label}] {series_label} AVG-DROP {w.get('avg_drop_pct')}% "
-            f"({w.get('n_minutes')}m): {_fmt_num(w.get('avg_baseline'))} -> {_fmt_num(w.get('avg_recent'))} "
-            f"[{_fmt_ts_short(w.get('baseline_from_ts'))}..{_fmt_ts_short(w.get('baseline_to_ts'))} -> "
-            f"{_fmt_ts_short(w.get('recent_from_ts'))}..{_fmt_ts_short(w.get('recent_to_ts'))}]"
-        )
+    win_m = max(1, int(round(float(window_seconds) / 60.0)))
     if bool(analysis.get("hit_alert")):
-        return f"[{graph_label}] {series_label} alert triggered (reason details unavailable)"
+        return (
+            f"[{graph_label}] {series_label} alert triggered "
+            f"(rules: >{fast_threshold_pct:g}% within {win_m}m or continuous >{continuous_threshold_pct:g}%)"
+        )
     return None
 
 
@@ -2382,29 +2526,67 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     """
     lines: List[str] = ["[ALERT] Threshold reached"]
     a_http = _http_analysis_for_payload(payload)
-    reasons = _format_trigger_lines(GRAFANA_PANEL_TITLE, "HTTP", a_http, MONITORING_HTTP_DROP_ALERT_PCT)
+    reasons = _format_trigger_lines(
+        GRAFANA_PANEL_TITLE,
+        "HTTP",
+        a_http,
+        MONITORING_HTTP_DROP_ALERT_PCT,
+        MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
+        MONITORING_ALERT_WINDOW_SECONDS,
+    )
     if not reasons:
-        fb = _format_trigger_fallback_line(GRAFANA_PANEL_TITLE, "HTTP", a_http, MONITORING_HTTP_DROP_ALERT_PCT)
+        fb = _format_trigger_fallback_line(
+            GRAFANA_PANEL_TITLE,
+            "HTTP",
+            a_http,
+            MONITORING_HTTP_DROP_ALERT_PCT,
+            MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
+            MONITORING_ALERT_WINDOW_SECONDS,
+        )
         if fb:
             reasons.append(fb)
     lines.extend(reasons)
     for ex in payload.get("extraPanels") or []:
-        if not isinstance(ex, dict) or (ex.get("kind") or "") != "9280_push":
+        if not isinstance(ex, dict):
             continue
+        kind = (ex.get("kind") or "")
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        a2 = _analysis_for_9280_payload(p2)
+        if kind == "9280_push":
+            g_lbl = GRAFANA_PANEL_TITLE_9280
+            s_lbl = MONITORING_9280_SERIES_KEYWORD
+            a2 = _analysis_for_9280_payload(p2)
+            fast2 = MONITORING_9280_ALERT_PCT
+            cont2 = MONITORING_9280_CONTINUOUS_ALERT_PCT
+        elif kind == "deposit":
+            g_lbl = GRAFANA_PANEL_TITLE_DEPOSIT
+            s_lbl = MONITORING_DEPOSIT_SERIES_KEYWORD
+            a2 = _analysis_for_deposit_payload(p2)
+            fast2 = MONITORING_DEPOSIT_ALERT_PCT
+            cont2 = MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT
+        elif kind == "withdraw":
+            g_lbl = GRAFANA_PANEL_TITLE_WITHDRAW
+            s_lbl = MONITORING_WITHDRAW_SERIES_KEYWORD
+            a2 = _analysis_for_withdraw_payload(p2)
+            fast2 = MONITORING_WITHDRAW_ALERT_PCT
+            cont2 = MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT
+        else:
+            continue
         reasons2 = _format_trigger_lines(
-            GRAFANA_PANEL_TITLE_9280,
-            MONITORING_9280_SERIES_KEYWORD,
+            g_lbl,
+            s_lbl,
             a2,
-            MONITORING_9280_ALERT_PCT,
+            fast2,
+            cont2,
+            MONITORING_ALERT_WINDOW_SECONDS,
         )
         if not reasons2:
             fb2 = _format_trigger_fallback_line(
-                GRAFANA_PANEL_TITLE_9280,
-                MONITORING_9280_SERIES_KEYWORD,
+                g_lbl,
+                s_lbl,
                 a2,
-                MONITORING_9280_ALERT_PCT,
+                fast2,
+                cont2,
+                MONITORING_ALERT_WINDOW_SECONDS,
             )
             if fb2:
                 reasons2.append(fb2)
@@ -2422,10 +2604,14 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
-        if (ex.get("kind") or "") == "9280_push":
-            p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-            if bool(_analysis_for_9280_payload(p2).get("hit_alert")):
-                return True
+        k = (ex.get("kind") or "")
+        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+        if k == "9280_push" and bool(_analysis_for_9280_payload(p2).get("hit_alert")):
+            return True
+        if k == "deposit" and bool(_analysis_for_deposit_payload(p2).get("hit_alert")):
+            return True
+        if k == "withdraw" and bool(_analysis_for_withdraw_payload(p2).get("hit_alert")):
+            return True
     return False
 
 
@@ -2451,25 +2637,25 @@ def _format_http_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
     Compact footer: max drop/spike from best consecutive monotonic run (first→last bucket %).
     Threshold line matches product copy; @mention is still driven by ``hit_alert`` (mean windows).
     """
-    thr = float(analysis.get("alert_threshold_pct") or MONITORING_HTTP_DROP_ALERT_PCT)
+    fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_HTTP_DROP_ALERT_PCT)
+    cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_HTTP_CONTINUOUS_ALERT_PCT)
+    win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
     lines: List[str] = [
         "",
-        f"[HTTP only] alert threshold: drop/spike >= {thr:g}%",
+        f"[HTTP] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
+        f"or continuous drop/spike > {cont_thr:g}%",
     ]
 
-    cd = analysis.get("consecutive_max_drop") or analysis.get("adjacent_max_drop")
-    cs = analysis.get("consecutive_max_spike") or analysis.get("adjacent_max_spike")
-    if isinstance(cd, dict) and cd.get("from_ts") is not None:
-        p = cd.get("pct")
-        lines.append(f"max drop : {_fmt_ts_short(cd['from_ts'])} -> {_fmt_ts_short(cd['to_ts'])}  -{p}%")
-    else:
-        lines.append("max drop : n/a")
-
-    if isinstance(cs, dict) and cs.get("from_ts") is not None:
-        p = cs.get("pct")
-        lines.append(f"max spike: {_fmt_ts_short(cs['from_ts'])} -> {_fmt_ts_short(cs['to_ts'])}  +{p}%")
-    else:
-        lines.append("max spike: n/a")
+    wd = analysis.get("window_max_drop")
+    ws = analysis.get("window_max_spike")
+    cd = analysis.get("consecutive_max_drop")
+    cs = analysis.get("consecutive_max_spike")
+    lines.append(
+        f"within {win_sec//60}m drop/spike: -{(wd or {}).get('pct', 'n/a')}% / +{(ws or {}).get('pct', 'n/a')}%"
+    )
+    lines.append(
+        f"continuous drop/spike : -{(cd or {}).get('pct', 'n/a')}% / +{(cs or {}).get('pct', 'n/a')}%"
+    )
 
     return lines
 
@@ -2521,13 +2707,28 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
-        if (ex.get("kind") or "") != "9280_push":
-            continue
+        k = (ex.get("kind") or "")
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        a2 = _analysis_for_9280_payload(p2)
+        if k == "9280_push":
+            a2 = _analysis_for_9280_payload(p2)
+            title = GRAFANA_PANEL_TITLE_9280
+            series = MONITORING_9280_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("9280 + Push", a2)
+        elif k == "deposit":
+            a2 = _analysis_for_deposit_payload(p2)
+            title = GRAFANA_PANEL_TITLE_DEPOSIT
+            series = MONITORING_DEPOSIT_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("Deposit", a2)
+        elif k == "withdraw":
+            a2 = _analysis_for_withdraw_payload(p2)
+            title = GRAFANA_PANEL_TITLE_WITHDRAW
+            series = MONITORING_WITHDRAW_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("Withdraw", a2)
+        else:
+            continue
         pts2 = a2.get("merged_points") or []
         lines.append("")
-        lines.append(f"[{GRAFANA_PANEL_TITLE_9280}] series: {MONITORING_9280_SERIES_KEYWORD}")
+        lines.append(f"[{title}] series: {series}")
         if pts2:
             tail2 = pts2[-max_rows:]
             rows2: List[str] = ["time           value", "-------------  ------------"]
@@ -2537,8 +2738,8 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
             lines.extend(rows2)
             lines.append("```")
         else:
-            lines.append("(no 9280 + Push points matched)")
-        lines.extend(_format_9280_analysis_lines(a2))
+            lines.append(f"(no {series} points matched)")
+        lines.extend(extra_footer)
 
     if _monitoring_payload_hit_alert(payload) and TARGET_USER_OPEN_ID:
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
