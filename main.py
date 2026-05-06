@@ -128,6 +128,11 @@ _CFG: Dict[str, Any] = {
     "LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA": "1",
     # 1=监控摘要用 **一条** 飞书交互卡片（schema 2.0）；截图开启时先上传 image_key **嵌进卡片**，不再跟一条独立图片
     "MONITORING_MESSAGE_CARD_ENABLE": "1",
+    # 1=在监控卡片底部展示按钮（Open Grafana）
+    "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
+    "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Open Grafana",
+    # 留空则自动使用 GRAFANA_BASE_URL + GRAFANA_DASHBOARD_PATH + from/to
+    "MONITORING_MESSAGE_CARD_BUTTON_URL": "",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -1349,6 +1354,21 @@ def _monitoring_card_body_md_strip_title(reply: str) -> str:
     return _monitoring_reply_to_card_md(r)
 
 
+def _monitoring_card_button_url() -> str:
+    manual = _cfg_str("MONITORING_MESSAGE_CARD_BUTTON_URL", "").strip()
+    if manual:
+        return manual
+    base = f"{GRAFANA_BASE_URL}{GRAFANA_DASHBOARD_PATH}"
+    q = urlencode(
+        [
+            ("orgId", "1"),
+            ("from", (GRAFANA_DASHBOARD_FROM or "now-10m").strip()),
+            ("to", (GRAFANA_DASHBOARD_TO or "now").strip()),
+        ]
+    )
+    return f"{base}?{q}"
+
+
 def _monitoring_interactive_card_dict(
     reply: str,
     receive_id_type: str,
@@ -1369,6 +1389,23 @@ def _monitoring_interactive_card_dict(
                 "alt": {"tag": "plain_text", "content": "Grafana"},
                 "preview": True,
                 "transparent": False,
+            }
+        )
+    if _lark_env_truthy("MONITORING_MESSAGE_CARD_BUTTON_ENABLE"):
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "type": "primary",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": _cfg_str("MONITORING_MESSAGE_CARD_BUTTON_TEXT", "Open Grafana")[:40],
+                        },
+                        "url": _monitoring_card_button_url(),
+                    }
+                ],
             }
         )
     return {
