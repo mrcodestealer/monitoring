@@ -1375,10 +1375,17 @@ def _monitoring_interactive_card_dict(
     receive_id: str,
     lark_img_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Feishu card JSON v2 — one ``msg_type=interactive`` message (markdown + optional embedded PNG)."""
+    """
+    Feishu interactive card payload for ``im/v1/messages``.
+    Use the broadly compatible ``header + elements`` shape (OpenAPI samples), which is less picky
+    than ``schema=2.0 + body`` on some tenants.
+    """
     title = f"📊 【{GRAFANA_PANEL_TITLE}】graph"
     elements: List[Dict[str, Any]] = [
-        {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": _monitoring_card_body_md_strip_title(reply)},
+        },
     ]
     ik = (lark_img_key or "").strip()
     if ik:
@@ -1387,8 +1394,6 @@ def _monitoring_interactive_card_dict(
                 "tag": "img",
                 "img_key": ik,
                 "alt": {"tag": "plain_text", "content": "Grafana"},
-                "preview": True,
-                "transparent": False,
             }
         )
     if _lark_env_truthy("MONITORING_MESSAGE_CARD_BUTTON_ENABLE"):
@@ -1409,14 +1414,12 @@ def _monitoring_interactive_card_dict(
             }
         )
     return {
-        "schema": "2.0",
-        "config": {"update_multi": True, "wide_screen_mode": True},
+        "config": {"wide_screen_mode": True},
         "header": {
             "template": "blue",
             "title": {"tag": "plain_text", "content": title[:190]},
-            "subtitle": {"tag": "plain_text", "content": "Grafana · monitoring"},
         },
-        "body": {"elements": elements},
+        "elements": elements,
     }
 
 
