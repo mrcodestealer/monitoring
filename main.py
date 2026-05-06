@@ -18,6 +18,8 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（最近 10 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``now-10m`` 一致）。
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
 
+可选 ``GRAFANA_PERSISTENT_WORKER_ENABLE=1``：**单线程常驻** Playwright + Grafana 页，每分钟 Refresh / 必要时 reload，Prometheus 读数与告警；``/monitoring`` 走热页截图（少重复登录）。见 ``MONITORING_DAEMON_*``。
+
 可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：在文字后追加无头 Chromium 截图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
 默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` 截整页滚动区域（长 dashboard 全部图表）；设为 ``0`` 则仅视口大小（易只拍到上半屏）。
 多轮滚动 + Spinner 轮询见 ``GRAFANA_SCREENSHOT_STABILIZE_ROUNDS`` 等键；Prometheus 无数据/报错的格子无法被脚本「画出曲线」。
@@ -32,6 +34,7 @@ import os
 from urllib.parse import urlencode
 from datetime import datetime
 import re
+import queue
 import threading
 import time
 import warnings
@@ -102,6 +105,12 @@ _CFG: Dict[str, Any] = {
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
     # HTTP 均值告警命中时，除原群外再发一份文字到该群（chat_id，常为 oc_…）；空=关闭
     "MONITORING_ALERT_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
+    # 1=常驻 headless Grafana（单线程 Playwright）；每分钟 Refresh + Prometheus 读数；/monitoring 排队用热页截图
+    "GRAFANA_PERSISTENT_WORKER_ENABLE": "0",
+    # 常驻循环间隔（秒）；默认 60
+    "MONITORING_DAEMON_INTERVAL_SECONDS": 60,
+    # 非空则每分钟把当日摘要+截图发到该群；空=仅后台刷新页面与告警边沿转发（仍写 MONITORING_ALERT_CHAT_ID）
+    "MONITORING_DAEMON_CHAT_ID": "",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -283,6 +292,12 @@ def _lark_webhook_request_timer_end(response: Response):
 _processed_lark_message_ids: set = set()
 _PROCESSED_LARK_IDS_CAP = 4000
 _monitoring_reply_dispatch_lock = threading.Lock()
+_persistent_worker_queue: queue.Queue = queue.Queue(maxsize=24)
+_persistent_worker_thread: Optional[threading.Thread] = None
+_persistent_worker_ready = threading.Event()
+_persistent_shutdown = threading.Event()
+_persistent_prev_hit_alert = False
+_persistent_boot_warm_done = False
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
@@ -363,6 +378,11 @@ LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
 MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
+GRAFANA_PERSISTENT_WORKER_ENABLE = _lark_env_truthy("GRAFANA_PERSISTENT_WORKER_ENABLE")
+MONITORING_DAEMON_INTERVAL_SECONDS = max(
+    30, min(3600, _cfg_int("MONITORING_DAEMON_INTERVAL_SECONDS", 60))
+)
+MONITORING_DAEMON_CHAT_ID = _cfg_str("MONITORING_DAEMON_CHAT_ID", "").strip()
 
 # 群聊里富媒体等类型仍可能带可解析文本；仅跳过明显无 /monitoring 的类型。
 _SKIP_IM_MESSAGE_TYPES = frozenset(
@@ -726,11 +746,10 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
     return not (clean or "").strip()
 
 
-def grafana_login_session() -> requests.Session:
+def grafana_relogin_session(session: requests.Session) -> None:
+    """POST /login on an existing session (refresh ``grafana_session`` after expiry)."""
     if not GRAFANA_USER or not GRAFANA_PASSWORD:
         raise ValueError("Set GRAFANA_USER and GRAFANA_PASSWORD in .env")
-
-    session = requests.Session()
     login_url = f"{GRAFANA_BASE_URL}/login"
     resp = session.post(
         login_url,
@@ -739,10 +758,36 @@ def grafana_login_session() -> requests.Session:
         timeout=30,
     )
     resp.raise_for_status()
-    # Grafana sets grafana_session cookie on success
     if "grafana_session" not in session.cookies.get_dict():
         logger.warning("Login returned 200 but no grafana_session cookie; check credentials / SSO")
+
+
+def grafana_login_session() -> requests.Session:
+    session = requests.Session()
+    grafana_relogin_session(session)
     return session
+
+
+def _grafana_session_probe_ok(session: requests.Session) -> bool:
+    try:
+        r = session.get(f"{GRAFANA_BASE_URL}/api/user", timeout=20)
+        return int(r.status_code) == 200
+    except Exception:
+        return False
+
+
+def _fetch_request_total_with_relogin(session: requests.Session) -> Dict[str, Any]:
+    """Prometheus 面板拉数；失败时尝试 ``grafana_relogin_session`` 一次再试。"""
+    try:
+        return fetch_request_total_1m_series(session=session)
+    except Exception as first:
+        logger.warning("fetch_request_total_1m_series failed — relogin and retry: %s", first)
+        try:
+            grafana_relogin_session(session)
+        except Exception:
+            logger.exception("grafana_relogin_session after fetch failure")
+            raise first
+        return fetch_request_total_1m_series(session=session)
 
 
 def fetch_grafana_dashboard(
@@ -1653,6 +1698,308 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             browser.close()
 
 
+def _playwright_sync_context_cookies(context: Any, session: requests.Session) -> None:
+    try:
+        context.clear_cookies()
+    except Exception:
+        pass
+    jar = _playwright_cookie_list(session)
+    if jar:
+        context.add_cookies(jar)
+
+
+def _grafana_persistent_page_screenshot_png(page: Any) -> bytes:
+    if int(GRAFANA_SCREENSHOT_SETTLE_MS) > 0:
+        page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
+    _grafana_close_open_menus(page)
+    full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
+    return page.screenshot(type="png", full_page=full_page)
+
+
+def _persistent_ensure_session_and_cookies(
+    session: requests.Session, context: Any, page: Any, timeout_ms: int, full_renav: bool
+) -> None:
+    global _persistent_boot_warm_done
+    if not _grafana_session_probe_ok(session):
+        grafana_relogin_session(session)
+    _playwright_sync_context_cookies(context, session)
+    if not full_renav and _persistent_boot_warm_done:
+        return
+    base = str(GRAFANA_BASE_URL).rstrip("/")
+    url = _grafana_build_screenshot_dashboard_url(0, 0)
+    tw = max(5000, int(timeout_ms))
+    if _lark_env_truthy("GRAFANA_SCREENSHOT_BOOT_WARM"):
+        try:
+            page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(20000, tw))
+            page.wait_for_timeout(220)
+        except Exception as e:
+            logger.info("persistent worker: boot warm goto / failed: %s", e)
+    _persistent_boot_warm_done = True
+    page.goto(url, wait_until="load", timeout=tw)
+    page.wait_for_timeout(200)
+    _grafana_playwright_dock_nav_only(page, tw)
+    _grafana_click_dashboard_refresh(page, tw)
+    _grafana_expand_collapsed_dashboard_rows(page)
+    _grafana_wait_dashboard_ready(page, tw)
+    _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
+    _grafana_stabilize_dashboard_render(page, tw)
+
+
+def _persistent_refresh_or_reload_graph(
+    session: requests.Session, context: Any, page: Any, timeout_ms: int
+) -> None:
+    """Dashboard Refresh；若无图则整页 reload 再跑一遍 dock/expand/stabilize。"""
+    tw = max(5000, int(timeout_ms))
+    if not _grafana_session_probe_ok(session):
+        grafana_relogin_session(session)
+    _playwright_sync_context_cookies(context, session)
+    _grafana_click_dashboard_refresh(page, tw)
+    _grafana_wait_loading_like_gone(page, int(GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS))
+    page.wait_for_timeout(200)
+    if _grafana_dashboard_has_visual_content(page):
+        return
+    logger.warning("persistent worker: graph not detected after Refresh — reloading dashboard")
+    try:
+        page.reload(wait_until="load", timeout=tw)
+        page.wait_for_timeout(380)
+    except Exception as e:
+        logger.warning("persistent worker: page.reload failed: %s", e)
+    _grafana_playwright_dock_nav_only(page, tw)
+    _grafana_click_dashboard_refresh(page, tw)
+    _grafana_expand_collapsed_dashboard_rows(page)
+    _grafana_wait_dashboard_ready(page, min(20000, tw // 2))
+    _grafana_wait_dashboard_body_populated(page, min(8000, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS)))
+    _grafana_stabilize_dashboard_render(page, tw, rounds=1)
+    if not _grafana_dashboard_has_visual_content(page):
+        logger.error(
+            "persistent worker: still no chart-like DOM after reload — check Grafana session / layout"
+        )
+
+
+def _send_monitoring_reply_and_alert_copy(
+    chat_id: str,
+    open_id: str,
+    reply: str,
+    http_ex: Optional[Dict[str, Any]],
+) -> bool:
+    sent = False
+    if chat_id:
+        _lark_send_text("chat_id", chat_id, reply)
+        sent = True
+    elif open_id:
+        _lark_send_text("open_id", open_id, reply)
+        sent = True
+    if (
+        sent
+        and http_ex
+        and http_ex.get("hit_alert")
+        and MONITORING_ALERT_CHAT_ID
+        and MONITORING_ALERT_CHAT_ID != (chat_id or "").strip()
+    ):
+        try:
+            _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
+        except Exception:
+            logger.exception(
+                "monitoring alert forward failed persistent alert_chat_id=%r",
+                MONITORING_ALERT_CHAT_ID[:24],
+            )
+    return sent
+
+
+def _persistent_alert_edge_notify(reply: str, http_ex: Optional[Dict[str, Any]], skip_chat: str) -> None:
+    """告警由 False→True 时额外推送到 ``MONITORING_ALERT_CHAT_ID``（避免每分钟刷屏）。"""
+    global _persistent_prev_hit_alert
+    hit = bool(http_ex and http_ex.get("hit_alert"))
+    if (
+        hit
+        and not _persistent_prev_hit_alert
+        and MONITORING_ALERT_CHAT_ID
+        and MONITORING_ALERT_CHAT_ID != skip_chat
+    ):
+        try:
+            _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
+            logger.info(
+                "persistent daemon: alert edge → MONITORING_ALERT_CHAT_ID prefix=%s",
+                MONITORING_ALERT_CHAT_ID[:16],
+            )
+        except Exception:
+            logger.exception("persistent daemon: alert edge forward failed")
+    _persistent_prev_hit_alert = hit
+
+
+def _persistent_send_png_if_enabled(
+    chat_id: str, open_id: str, page: Any, sent_text: bool
+) -> None:
+    if not sent_text or not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+        return
+    try:
+        png = _grafana_persistent_page_screenshot_png(page)
+        key = _lark_upload_png_image_key(png)
+        if chat_id:
+            _lark_send_image_message("chat_id", chat_id, key)
+        else:
+            _lark_send_image_message("open_id", open_id, key)
+        logger.info("persistent: Grafana screenshot sent bytes=%s", len(png))
+    except Exception:
+        logger.exception("persistent: screenshot or image send failed (text already sent)")
+
+
+def _persistent_grafana_worker_main() -> None:
+    global _persistent_boot_warm_done
+    global _persistent_prev_hit_alert
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as e:
+        logger.error(
+            "GRAFANA_PERSISTENT_WORKER_ENABLE requires playwright — pip install playwright && playwright install chromium: %s",
+            e,
+        )
+        return
+
+    timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
+    session = grafana_login_session()
+    playwright = sync_playwright().start()
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    )
+    context = browser.new_context(
+        viewport={
+            "width": max(400, int(GRAFANA_SCREENSHOT_WIDTH)),
+            "height": max(300, int(GRAFANA_SCREENSHOT_HEIGHT)),
+        },
+        user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        ),
+        locale="en-US",
+    )
+    page = context.new_page()
+    try:
+        page.add_init_script(
+            "try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});}catch(e){}"
+        )
+    except Exception:
+        pass
+
+    try:
+        _persistent_boot_warm_done = False
+        _persistent_ensure_session_and_cookies(session, context, page, timeout_ms, full_renav=True)
+        if not _grafana_dashboard_has_visual_content(page):
+            _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
+        _persistent_worker_ready.set()
+        logger.info(
+            "persistent Grafana worker ready — interval=%ss daemon_chat=%r",
+            MONITORING_DAEMON_INTERVAL_SECONDS,
+            (MONITORING_DAEMON_CHAT_ID[:16] + "…") if len(MONITORING_DAEMON_CHAT_ID) > 16 else MONITORING_DAEMON_CHAT_ID or "(none)",
+        )
+        next_tick = time.monotonic() + float(MONITORING_DAEMON_INTERVAL_SECONDS)
+
+        while not _persistent_shutdown.is_set():
+            slice_end = min(next_tick, time.monotonic() + 1.0)
+            timeout = max(0.05, slice_end - time.monotonic())
+            try:
+                cmd = _persistent_worker_queue.get(timeout=timeout)
+            except queue.Empty:
+                cmd = None
+
+            if isinstance(cmd, dict) and cmd.get("type") == "user":
+                chat_id = str(cmd.get("chat_id") or "")
+                open_id = str(cmd.get("open_id") or "")
+                payload: Optional[Dict[str, Any]] = None
+                http_ex: Optional[Dict[str, Any]] = None
+                try:
+                    _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
+                    payload = _fetch_request_total_with_relogin(session)
+                    http_ex = _http_analysis_for_payload(payload)
+                    reply = _format_monitoring_reply(payload)
+                    sent = _send_monitoring_reply_and_alert_copy(chat_id, open_id, reply, http_ex)
+                    _persistent_send_png_if_enabled(chat_id, open_id, page, sent)
+                    _persistent_prev_hit_alert = bool(http_ex.get("hit_alert"))
+                except Exception:
+                    logger.exception("persistent worker: user /monitoring job failed")
+                    try:
+                        err = "监控数据拉取失败（persistent worker）— 将退回单次登录流程或查看日志"
+                        if chat_id:
+                            _lark_send_text("chat_id", chat_id, err)
+                        elif open_id:
+                            _lark_send_text("open_id", open_id, err)
+                    except Exception:
+                        pass
+
+            if time.monotonic() < next_tick:
+                continue
+
+            next_tick = time.monotonic() + float(MONITORING_DAEMON_INTERVAL_SECONDS)
+            daemon_chat = (MONITORING_DAEMON_CHAT_ID or "").strip()
+            try:
+                _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
+                payload = _fetch_request_total_with_relogin(session)
+                http_ex = _http_analysis_for_payload(payload)
+                reply = _format_monitoring_reply(payload)
+                if daemon_chat:
+                    sent = _send_monitoring_reply_and_alert_copy(daemon_chat, "", reply, None)
+                    _persistent_send_png_if_enabled(daemon_chat, "", page, sent)
+                    _persistent_alert_edge_notify(reply, http_ex, skip_chat=daemon_chat)
+                else:
+                    _persistent_alert_edge_notify(reply, http_ex, skip_chat="")
+            except Exception:
+                logger.exception("persistent worker: daemon tick failed")
+                try:
+                    grafana_relogin_session(session)
+                except Exception:
+                    logger.exception("persistent worker: relogin after tick failure")
+
+    finally:
+        _persistent_worker_ready.clear()
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+        logger.info("persistent Grafana worker stopped")
+
+
+def _start_persistent_grafana_worker() -> None:
+    global _persistent_worker_thread
+    if _persistent_worker_thread is not None and _persistent_worker_thread.is_alive():
+        return
+    _persistent_shutdown.clear()
+    _persistent_worker_thread = threading.Thread(
+        target=_persistent_grafana_worker_main,
+        name="grafana-persistent",
+        daemon=True,
+    )
+    _persistent_worker_thread.start()
+
+
+def _persistent_enqueue_user_monitoring(chat_id: str, open_id: str, mid: str) -> bool:
+    if not GRAFANA_PERSISTENT_WORKER_ENABLE:
+        return False
+    t = _persistent_worker_thread
+    if t is None or not t.is_alive():
+        return False
+    if not _persistent_worker_ready.wait(timeout=120.0):
+        logger.warning("persistent worker not ready in 120s — cold /monitoring path")
+        return False
+    try:
+        _persistent_worker_queue.put(
+            {"type": "user", "chat_id": chat_id, "open_id": open_id, "mid": mid},
+            timeout=8.0,
+        )
+        return True
+    except queue.Full:
+        logger.warning("persistent worker queue full — cold /monitoring path")
+        return False
+
+
 def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
     """Pick Prometheus rows that correspond to the HTTP series (legend ``http`` / label value ``http``)."""
     for k, v in metric.items():
@@ -1959,6 +2306,9 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
     Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
     """
     logger.info("monitoring background job start mid=%r chat=%r open=%r", mid, bool(chat_id), bool(open_id))
+    if _persistent_enqueue_user_monitoring(chat_id, open_id, mid):
+        logger.info("monitoring delegated to persistent Grafana worker mid=%r", mid)
+        return
     grafana_session: Optional[requests.Session] = None
     payload: Optional[Dict[str, Any]] = None
     http_ex: Optional[Dict[str, Any]] = None
@@ -2769,6 +3119,19 @@ def run_monitoring_bot() -> None:
             "GRAFANA_QUERY_LOOKBACK_SECONDS=%s (default 600 = 10m) — /monitoring Prometheus window is not 10 minutes",
             GRAFANA_QUERY_LOOKBACK_SECONDS,
         )
+    if GRAFANA_PERSISTENT_WORKER_ENABLE:
+        logger.info(
+            "GRAFANA_PERSISTENT_WORKER_ENABLE=1 — starting daemon interval=%ss daemon_chat=%r "
+            "(set MONITORING_DAEMON_CHAT_ID for per-interval Lark summary + PNG)",
+            MONITORING_DAEMON_INTERVAL_SECONDS,
+            MONITORING_DAEMON_CHAT_ID or "",
+        )
+        if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+            logger.warning(
+                "Persistent worker runs Grafana Refresh in-browser; set GRAFANA_SCREENSHOT_ENABLE=1 so "
+                "/monitoring and daemon broadcasts attach PNGs."
+            )
+        _start_persistent_grafana_worker()
     raw_mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower()
     mode = raw_mode if raw_mode else "ws"
 
