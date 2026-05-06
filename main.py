@@ -1736,7 +1736,59 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     except Exception:
         pass
 
+    def _click_dock_js() -> bool:
+        """Grafana/React 有时拦截 Playwright 合成点击；用 DOM 内原生事件 + HTMLElement.click。"""
+        try:
+            r = page.evaluate(
+                """() => {
+                  const mega = document.querySelector(
+                    '[data-testid="data-testid navigation mega-menu"]'
+                  );
+                  let dock = mega ? mega.querySelector('#dock-menu-button') : null;
+                  if (!dock) dock = document.querySelector('#dock-menu-button');
+                  if (!dock) {
+                    const all = Array.from(document.querySelectorAll('button[aria-label="Dock menu"]'));
+                    dock = all[0] || null;
+                  }
+                  if (!dock) return 'missing';
+                  try { dock.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+                  try { dock.focus({ preventScroll: true }); } catch (e) {}
+                  const v = window;
+                  const o = { bubbles: true, cancelable: true, view: v };
+                  dock.dispatchEvent(new MouseEvent('pointerover', o));
+                  dock.dispatchEvent(new MouseEvent('mouseover', o));
+                  dock.dispatchEvent(new MouseEvent('pointerdown', o));
+                  dock.dispatchEvent(new MouseEvent('mousedown', o));
+                  dock.dispatchEvent(new MouseEvent('pointerup', o));
+                  dock.dispatchEvent(new MouseEvent('mouseup', o));
+                  dock.dispatchEvent(new MouseEvent('click', o));
+                  if (typeof dock.click === 'function') dock.click();
+                  return 'ok';
+                }"""
+            )
+            if r == "ok":
+                logger.info("Grafana screenshot: Dock menu fired via in-page JS (DOM events + .click())")
+                return True
+        except Exception as ex:
+            logger.info("Grafana screenshot: Dock JS click failed: %s", ex)
+        return False
+
     def _click_dock() -> bool:
+        # 侧栏处于「锁定」时会出现 Unlock menu，先点一次解除再 Dock（顺序因 Grafana 版本而异）
+        for unlock_sel in (
+            'button[aria-label="Unlock menu"]',
+            '[aria-label="Unlock menu"]',
+        ):
+            ul = page.locator(unlock_sel).first
+            try:
+                if ul.count() > 0 and ul.is_visible():
+                    ul.scroll_into_view_if_needed(timeout=3000)
+                    ul.click(timeout=3000, force=True)
+                    page.wait_for_timeout(200)
+                    logger.info("Grafana screenshot: clicked %r before Dock", unlock_sel)
+            except Exception:
+                pass
+
         selectors = (
             '[data-testid="data-testid navigation mega-menu"] #dock-menu-button',
             '[data-testid="data-testid navigation mega-menu"] button[aria-label="Dock menu"]',
@@ -1749,8 +1801,31 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
             try:
                 if loc.count() == 0:
                     continue
-                loc.wait_for(state="visible", timeout=4000)
-                loc.click(timeout=5000, force=True)
+                loc.wait_for(state="attached", timeout=5000)
+                try:
+                    loc.wait_for(state="visible", timeout=2500)
+                except Exception:
+                    pass
+                loc.scroll_into_view_if_needed(timeout=5000)
+                page.wait_for_timeout(140)
+                try:
+                    loc.hover(timeout=2500)
+                    page.wait_for_timeout(80)
+                except Exception:
+                    pass
+                try:
+                    loc.click(timeout=6000, force=True, delay=40)
+                except Exception as e1:
+                    logger.info(
+                        "Grafana screenshot: Dock Playwright click failed %r (%s); trying dispatch_event",
+                        sel,
+                        e1,
+                    )
+                    try:
+                        loc.dispatch_event("click")
+                    except Exception as e2:
+                        logger.info("Grafana screenshot: Dock dispatch_event failed: %s", e2)
+                        continue
                 logger.info("Grafana screenshot: clicked Dock menu via %r", sel)
                 return True
             except Exception:
@@ -1758,12 +1833,18 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
         try:
             alt = page.get_by_role("button", name=re.compile(r"^\s*Dock menu\s*$", re.I)).first
             if alt.count() > 0:
-                alt.wait_for(state="visible", timeout=3000)
-                alt.click(timeout=5000, force=True)
+                alt.wait_for(state="attached", timeout=4000)
+                alt.scroll_into_view_if_needed(timeout=5000)
+                try:
+                    alt.click(timeout=6000, force=True, delay=40)
+                except Exception:
+                    alt.dispatch_event("click")
                 logger.info("Grafana screenshot: clicked Dock menu (role=name)")
                 return True
         except Exception:
             pass
+        if _click_dock_js():
+            return True
         return False
 
     try:
