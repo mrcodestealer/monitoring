@@ -16,6 +16,7 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
 群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（最近 10 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``now-10m`` 一致）。
+可选 ``MONITORING_MESSAGE_CARD_ENABLE=1``：摘要用飞书 **交互卡片** +「重新截图」按钮（需订阅 ``card.action.trigger``）。
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
 
 可选 ``GRAFANA_PERSISTENT_WORKER_ENABLE=1``：**单线程常驻** Playwright + Grafana 页，每分钟 Refresh / 必要时 reload，Prometheus 读数与告警；``/monitoring`` 走热页截图（少重复登录）。见 ``MONITORING_DAEMON_*``。
@@ -141,6 +142,8 @@ _CFG: Dict[str, Any] = {
     # 请求总数/1m：仅 HTTP 序列参与跌幅判断；平均跌幅 ≥ 该阈值时 @ 下面 open_id（可用环境变量覆盖）
     "TARGET_USER_OPEN_ID": "",
     "MONITORING_HTTP_DROP_ALERT_PCT": 10,
+    # 1=监控摘要用 **交互卡片**（含「重新截图」按钮）；0=纯文本。需在飞书后台订阅「卡片回传交互」card.action.trigger（HTTP 或 WS 已注册）
+    "MONITORING_MESSAGE_CARD_ENABLE": "0",
 }
 
 
@@ -314,6 +317,8 @@ _persistent_worker_ready = threading.Event()
 _persistent_shutdown = threading.Event()
 _persistent_prev_hit_alert = False
 _persistent_boot_warm_done = False
+_processed_lark_card_event_ids: set = set()
+_PROCESSED_CARD_IDS_CAP = 2000
 _dash_model_cache_lock = threading.Lock()
 _dash_model_cache_uid: str = ""
 _dash_model_cache_body: Optional[Dict[str, Any]] = None
@@ -404,6 +409,7 @@ MONITORING_DAEMON_INTERVAL_SECONDS = max(
 )
 MONITORING_DAEMON_CHAT_ID = _cfg_str("MONITORING_DAEMON_CHAT_ID", "").strip()
 GRAFANA_PERSISTENT_USER_SKIP_REFRESH = _lark_env_truthy("GRAFANA_PERSISTENT_USER_SKIP_REFRESH")
+MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
 
 # 群聊里富媒体等类型仍可能带可解析文本；仅跳过明显无 /monitoring 的类型。
 _SKIP_IM_MESSAGE_TYPES = frozenset(
@@ -1245,6 +1251,309 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
         )
 
 
+def _lark_parse_card_action_value(val: Any) -> Optional[Dict[str, Any]]:
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            o = json.loads(s)
+            return o if isinstance(o, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _lark_should_merge_flat_card_callback(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    et = _lark_header_event_type(data)
+    if isinstance(et, str) and et.startswith("card.action"):
+        return True
+    if _lark_is_schema_v2(data) and isinstance(data.get("action"), dict):
+        return True
+    return False
+
+
+def _lark_normalize_card_callback_envelope(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return data
+    if not _lark_should_merge_flat_card_callback(data):
+        return data
+    ev = data.get("event")
+    if not isinstance(ev, dict):
+        ev = {}
+    for k in (
+        "action",
+        "operator",
+        "open_chat_id",
+        "chat_id",
+        "context",
+        "host",
+        "delivery_type",
+        "token",
+    ):
+        if k in data and data[k] is not None and k not in ev:
+            ev[k] = data[k]
+    ctx = ev.get("context")
+    if not isinstance(ctx, dict):
+        ctx = {}
+        ev["context"] = ctx
+    if isinstance(data.get("open_chat_id"), str) and data["open_chat_id"].strip() and not ctx.get(
+        "open_chat_id"
+    ):
+        ctx["open_chat_id"] = data["open_chat_id"].strip()
+    if isinstance(data.get("open_message_id"), str) and data["open_message_id"].strip() and not ctx.get(
+        "open_message_id"
+    ):
+        ctx["open_message_id"] = data["open_message_id"].strip()
+    top_uid = data.get("open_id") or data.get("user_id")
+    top_union = data.get("union_id")
+    op = ev.get("operator")
+    if top_uid or top_union:
+        if not isinstance(op, dict):
+            ev["operator"] = {}
+            op = ev["operator"]
+        if isinstance(op, dict):
+            op = dict(op)
+            if top_uid and not op.get("open_id"):
+                op["open_id"] = top_uid
+            if top_union and not op.get("union_id"):
+                op["union_id"] = top_union
+            ev["operator"] = op
+    ctx_merge = ev.get("context") if isinstance(ev.get("context"), dict) else {}
+    if not ev.get("open_chat_id") and ctx_merge.get("open_chat_id"):
+        ev["open_chat_id"] = ctx_merge["open_chat_id"]
+    data["event"] = ev
+    return data
+
+
+def _lark_event_body_looks_like_card_interaction(ev: Any) -> bool:
+    if not isinstance(ev, dict):
+        return False
+    act = ev.get("action")
+    if not isinstance(act, dict):
+        return False
+    if ev.get("message"):
+        return False
+    if act.get("tag") == "button":
+        return True
+    if act.get("name") and act.get("value") is not None:
+        return bool(ev.get("operator") or ev.get("context"))
+    if act.get("value") is not None and (ev.get("operator") or ev.get("context")):
+        return True
+    return bool(ev.get("operator") or ev.get("context"))
+
+
+def _lark_extract_card_event_fields(ev: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Any]:
+    ctx = ev.get("context") if isinstance(ev.get("context"), dict) else {}
+    act = ev.get("action") or {}
+    val = act.get("value")
+    chat_id = ev.get("open_chat_id") or ev.get("chat_id")
+    if not chat_id:
+        chat_id = ctx.get("open_chat_id") or ctx.get("chat_id")
+    op = ev.get("operator") or {}
+    sender_id = op.get("open_id") or op.get("union_id")
+    if not sender_id:
+        sender_id = ev.get("open_id") or ev.get("user_id") or op.get("user_id")
+    return (str(chat_id).strip() if chat_id else None, str(sender_id).strip() if sender_id else None, val)
+
+
+def _lark_resolve_card_action(data: Dict[str, Any]) -> Optional[Tuple[Optional[str], Optional[str], Any, Any]]:
+    if not isinstance(data, dict):
+        return None
+    hdr = data.get("header") if isinstance(data.get("header"), dict) else {}
+    et = _lark_header_event_type(data)
+    eid = hdr.get("event_id") if isinstance(hdr, dict) else None
+    if eid is None:
+        eid = data.get("event_id")
+    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+    named = et in ("card.action.trigger", "card.action.trigger_v1")
+    heuristic = et != "im.message.receive_v1" and (
+        (_lark_is_schema_v2(data) and _lark_event_body_looks_like_card_interaction(ev))
+        or (
+            isinstance(ev.get("action"), dict)
+            and len(ev.get("action") or {}) > 0
+            and (ev.get("operator") or ev.get("context"))
+        )
+    )
+    ctx0 = ev.get("context") if isinstance(ev.get("context"), dict) else {}
+    legacy_shape = (
+        et != "im.message.receive_v1"
+        and isinstance(ev.get("action"), dict)
+        and len(ev.get("action") or {}) > 0
+        and (ev.get("operator") or ev.get("context"))
+        and bool(
+            ev.get("open_chat_id")
+            or ev.get("chat_id")
+            or ctx0.get("open_chat_id")
+            or ctx0.get("chat_id")
+        )
+    )
+    if not (named or heuristic or legacy_shape):
+        return None
+    chat_id, sender_id, val = _lark_extract_card_event_fields(ev)
+    return (chat_id, sender_id, val, eid)
+
+
+def _monitoring_reply_to_card_md(reply: str) -> str:
+    s = (reply or "")[:3800]
+    s = s.replace("```", "'''")
+    if len(reply or "") > 3800:
+        s += "\n\n…(truncated)"
+    return s
+
+
+def _monitoring_interactive_card_dict(reply: str, receive_id_type: str, receive_id: str) -> Dict[str, Any]:
+    btn_val = {"m": "shot", "t": (receive_id_type or "chat_id").strip(), "i": (receive_id or "").strip()}
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "turquoise",
+            "title": {"tag": "plain_text", "content": "Grafana /monitoring"},
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": _monitoring_reply_to_card_md(reply)},
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "重新截图"},
+                    "type": "primary",
+                    "behaviors": [{"type": "callback", "value": btn_val}],
+                },
+            ],
+        },
+    }
+
+
+def _lark_send_interactive_card(receive_id_type: str, receive_id: str, card: Dict[str, Any]) -> None:
+    from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
+    from lark_oapi.api.im.v1.model.create_message_request_body import CreateMessageRequestBody
+
+    client = _get_lark_oapi_client()
+    content = json.dumps(card, ensure_ascii=False)
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(receive_id)
+        .msg_type("interactive")
+        .content(content)
+        .build()
+    )
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type(receive_id_type)
+        .request_body(body)
+        .build()
+    )
+    resp = client.im.v1.message.create(req)
+    if not resp.success():
+        raise RuntimeError(
+            f"Lark interactive card send failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
+        )
+
+
+def _lark_send_monitoring_user_message(receive_id_type: str, receive_id: str, reply: str) -> None:
+    """Plain text or interactive card (``MONITORING_MESSAGE_CARD_ENABLE``)."""
+    rid = (receive_id or "").strip()
+    if not rid:
+        raise ValueError("empty receive_id for monitoring message")
+    if MONITORING_MESSAGE_CARD_ENABLE:
+        card = _monitoring_interactive_card_dict(reply, receive_id_type, rid)
+        _lark_send_interactive_card(receive_id_type, rid, card)
+        return
+    _lark_send_text(receive_id_type, rid, reply)
+
+
+def _screenshot_only_cold_worker(receive_id_type: str, receive_id: str) -> None:
+    """No persistent worker: login, headless PNG, send image."""
+    logger.info("screenshot_only cold worker start rt=%r id_prefix=%r", receive_id_type, receive_id[:16])
+    try:
+        sess = grafana_login_session()
+        payload = fetch_request_total_1m_series(session=sess)
+        w = payload.get("window") or {}
+        su = int(w.get("startUnix") or 0)
+        eu = int(w.get("endUnix") or 0)
+        if su <= 0 or eu <= 0:
+            raise ValueError("invalid prometheus window for screenshot")
+        png = _grafana_headless_screenshot_png(sess, su, eu)
+        key = _lark_upload_png_image_key(png)
+        _lark_send_image_message(receive_id_type, receive_id, key)
+        logger.info("screenshot_only cold sent bytes=%s", len(png))
+    except Exception:
+        logger.exception("screenshot_only cold worker failed")
+
+
+def _persistent_enqueue_screenshot_only(receive_id_type: str, receive_id: str) -> bool:
+    if not GRAFANA_PERSISTENT_WORKER_ENABLE:
+        return False
+    t = _persistent_worker_thread
+    if t is None or not t.is_alive():
+        return False
+    if not _persistent_worker_ready.wait(timeout=30.0):
+        return False
+    cid = receive_id if receive_id_type == "chat_id" else ""
+    oid = receive_id if receive_id_type == "open_id" else ""
+    try:
+        _persistent_worker_queue.put(
+            {"type": "screenshot_only", "chat_id": cid, "open_id": oid},
+            timeout=6.0,
+        )
+        return True
+    except queue.Full:
+        return False
+
+
+def _process_card_action_event(data: Dict[str, Any]) -> None:
+    """Handle ``card.action.trigger*`` — e.g. monitoring card **重新截图** button."""
+    global _processed_lark_card_event_ids
+    if not isinstance(data, dict):
+        return
+    data = _lark_normalize_card_callback_envelope(dict(data))
+    resolved = _lark_resolve_card_action(data)
+    if not resolved:
+        logger.info("card.action: resolver returned None — ignored")
+        return
+    chat_id, sender_id, val, eid = resolved
+    if eid:
+        with _monitoring_reply_dispatch_lock:
+            if eid in _processed_lark_card_event_ids:
+                logger.info("duplicate card event_id=%r — skip", eid)
+                return
+            _processed_lark_card_event_ids.add(eid)
+            if len(_processed_lark_card_event_ids) > _PROCESSED_CARD_IDS_CAP:
+                _processed_lark_card_event_ids.clear()
+    if LARK_BOT_OPEN_ID and sender_id and sender_id == LARK_BOT_OPEN_ID:
+        return
+    parsed = _lark_parse_card_action_value(val)
+    if not isinstance(parsed, dict) or str(parsed.get("m") or "").strip().lower() != "shot":
+        logger.debug("card.action: value not monitoring screenshot %r", parsed)
+        return
+    rt = str(parsed.get("t") or "chat_id").strip().lower()
+    rid = str(parsed.get("i") or "").strip()
+    if not rid:
+        logger.warning("card.action shot: missing receive id in value=%r", parsed)
+        return
+    if rt not in ("chat_id", "open_id"):
+        rt = "chat_id"
+    logger.info("card.action: screenshot_only rt=%r id_prefix=%r", rt, rid[:16])
+    if _persistent_enqueue_screenshot_only(rt, rid):
+        return
+    threading.Thread(
+        target=_screenshot_only_cold_worker,
+        args=(rt, rid),
+        daemon=True,
+        name="screenshot-only-cold",
+    ).start()
+
+
 # Playwright ``wait_for_function`` / ``evaluate``: true when dashboard body looks mounted (not only header).
 _GRAFANA_JS_REACTROOT_HAS_CHARTS = """() => {
   const rr = document.getElementById('reactRoot');
@@ -1919,10 +2228,10 @@ def _send_monitoring_reply_and_alert_copy(
 ) -> bool:
     sent = False
     if chat_id:
-        _lark_send_text("chat_id", chat_id, reply)
+        _lark_send_monitoring_user_message("chat_id", chat_id, reply)
         sent = True
     elif open_id:
-        _lark_send_text("open_id", open_id, reply)
+        _lark_send_monitoring_user_message("open_id", open_id, reply)
         sent = True
     if (
         sent
@@ -2069,6 +2378,22 @@ def _persistent_grafana_worker_main() -> None:
                             _lark_send_text("open_id", open_id, err)
                     except Exception:
                         pass
+
+            if isinstance(cmd, dict) and cmd.get("type") == "screenshot_only":
+                sc_chat = str(cmd.get("chat_id") or "")
+                sc_open = str(cmd.get("open_id") or "")
+                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE") and (sc_chat or sc_open):
+                    try:
+                        _persistent_prepare_dom_before_png(page, timeout_ms)
+                        png = _grafana_persistent_page_screenshot_png(page)
+                        key = _lark_upload_png_image_key(png)
+                        if sc_chat:
+                            _lark_send_image_message("chat_id", sc_chat, key)
+                        else:
+                            _lark_send_image_message("open_id", sc_open, key)
+                        logger.info("persistent screenshot_only sent bytes=%s", len(png))
+                    except Exception:
+                        logger.exception("persistent worker screenshot_only failed")
 
             if time.monotonic() < next_tick:
                 continue
@@ -2479,7 +2804,7 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
     sent = False
     try:
         if chat_id:
-            _lark_send_text("chat_id", chat_id, reply)
+            _lark_send_monitoring_user_message("chat_id", chat_id, reply)
             sent = True
             logger.info(
                 "monitoring reply sent (background) receive_id_type=chat_id chat_id_prefix=%s... len=%s",
@@ -2487,7 +2812,7 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
                 len(reply),
             )
         elif open_id:
-            _lark_send_text("open_id", open_id, reply)
+            _lark_send_monitoring_user_message("open_id", open_id, reply)
             sent = True
             logger.info("monitoring reply sent (background) receive_id_type=open_id len=%s", len(reply))
         else:
@@ -2754,6 +3079,16 @@ def _on_ws_p2_im_message_receive_v1(data: Any) -> None:
         logger.exception("WebSocket P2ImMessageReceiveV1 handler failed")
 
 
+def _on_ws_p2_card_action_trigger(ce: Any) -> None:
+    """WebSocket delivery for ``card.action.trigger`` / ``card.action.trigger_v1`` (button on monitoring card)."""
+    try:
+        data = _lark_ws_sdk_event_to_dict(ce)
+        data = _lark_normalize_card_callback_envelope(data)
+        _process_card_action_event(data)
+    except Exception:
+        logger.exception("WebSocket card.action handler failed")
+
+
 def _on_ws_im_message_p2_customized(ce: Any) -> None:
     """
     Fallback for ``im.message.receive_v2`` or extra types (``LARK_WS_EXTRA_IM_TYPES``).
@@ -2988,6 +3323,8 @@ def start_lark_ws_client_blocking() -> None:
         EventDispatcherHandler.builder(enc, ver)
         .register_p2_im_message_receive_v1(_on_ws_p2_im_message_receive_v1)
         .register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
+        .register_p2_customized_event("card.action.trigger", _on_ws_p2_card_action_trigger)
+        .register_p2_customized_event("card.action.trigger_v1", _on_ws_p2_card_action_trigger)
     )
     for raw_t in _cfg_str("LARK_WS_EXTRA_IM_TYPES", "").replace(";", ",").split(","):
         t = raw_t.strip()
@@ -3210,8 +3547,21 @@ def webhook_event():
 
     et = _lark_header_event_type(data)
     et_l = (et or "").lower()
-    # Card interactions also require a fast 200; business logic should update the card asynchronously via Open API.
+    # Card interactions also require a fast 200; run handler on a worker thread (same pattern as im.message).
     if et_l.startswith("card.action"):
+        try:
+            pd = copy.deepcopy(data)
+            pd = _lark_normalize_card_callback_envelope(pd)
+
+            def _card_w(ref: Dict[str, Any]) -> None:
+                try:
+                    _process_card_action_event(ref)
+                except Exception:
+                    logger.exception("card.action webhook worker failed")
+
+            threading.Thread(target=_card_w, args=(pd,), daemon=True, name="lark-card-action").start()
+        except Exception:
+            logger.exception("card.action dispatch failed")
         return _lark_feishu_webhook_ack_immediate()
 
     if _lark_ack_only_event_type(et):
@@ -3285,6 +3635,11 @@ def run_monitoring_bot() -> None:
                 "/monitoring and daemon broadcasts attach PNGs."
             )
         _start_persistent_grafana_worker()
+    if MONITORING_MESSAGE_CARD_ENABLE:
+        logger.info(
+            "MONITORING_MESSAGE_CARD_ENABLE=1 — Feishu console: subscribe **Card callback interaction** "
+            "(card.action.trigger) to the same Request URL as IM (HTTP) or use WS (registered in this app)."
+        )
     raw_mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower()
     mode = raw_mode if raw_mode else "ws"
 
