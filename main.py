@@ -33,6 +33,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 from urllib.parse import urlencode
 from datetime import datetime
@@ -102,6 +103,12 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 7000,
     # 至少等到 N 个 .react-grid-item（0=不等待；经典大屏可设 4–8；Scenes 布局可能为 0）
     "GRAFANA_SCREENSHOT_MIN_GRID_ITEMS": 0,
+    # 截图前“全面板加载”门槛：已加载面板占比（含图或明确 No data）
+    "GRAFANA_SCREENSHOT_PANEL_READY_RATIO": 0.92,
+    # 截图前“全面板加载”最少面板数（防小屏/过滤时占比误判）
+    "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 8,
+    # 全面板加载等待预算（毫秒）
+    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 12000,
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
     "VERIFICATION_TOKEN": "QlZMYp7rogAS914dxxMVNgboUKxQP7jc",
@@ -399,6 +406,15 @@ GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS = max(
 )
 GRAFANA_SCREENSHOT_MIN_GRID_ITEMS = max(
     0, min(200, _cfg_int("GRAFANA_SCREENSHOT_MIN_GRID_ITEMS", 0))
+)
+GRAFANA_SCREENSHOT_PANEL_READY_RATIO = max(
+    0.5, min(1.0, _cfg_float("GRAFANA_SCREENSHOT_PANEL_READY_RATIO", 0.92))
+)
+GRAFANA_SCREENSHOT_PANEL_READY_MIN = max(
+    0, min(300, _cfg_int("GRAFANA_SCREENSHOT_PANEL_READY_MIN", 8))
+)
+GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS = max(
+    2000, min(120_000, _cfg_int("GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS", 12000))
 )
 GRAFANA_SCREENSHOT_KIOSK = _cfg_str("GRAFANA_SCREENSHOT_KIOSK", "").strip()
 GRAFANA_SCREENSHOT_RELATIVE_RANGE = _lark_env_truthy("GRAFANA_SCREENSHOT_RELATIVE_RANGE")
@@ -1804,6 +1820,81 @@ def _grafana_wait_min_react_grid_items(page: Any, min_items: int, budget_ms: int
     )
 
 
+def _grafana_panel_ready_stats(page: Any) -> Tuple[int, int]:
+    """
+    Return (total_panels, ready_panels).
+    A panel is "ready" when it shows chart canvas/uplot, or explicit "No data"/error text.
+    """
+    try:
+        r = page.evaluate(
+            """() => {
+              const panels = Array.from(
+                document.querySelectorAll(
+                  'section[data-testid^="data-testid Panel header"], section[data-testid*="Panel header"]'
+                )
+              );
+              let ready = 0;
+              for (const p of panels) {
+                const root = p.querySelector('[data-testid="data-testid panel content"]') || p;
+                const hasChart = !!(
+                  root.querySelector('[data-testid="uplot-main-div"]') ||
+                  root.querySelector('canvas') ||
+                  root.querySelector('[class*="timeseries"]')
+                );
+                const txt = (root.textContent || '').toLowerCase();
+                const hasExplicitNoData = txt.includes('no data') || txt.includes('n/a') || txt.includes('error');
+                if (hasChart || hasExplicitNoData) ready += 1;
+              }
+              return { total: panels.length, ready };
+            }"""
+        )
+        if isinstance(r, dict):
+            return int(r.get("total") or 0), int(r.get("ready") or 0)
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _grafana_wait_panels_fully_loaded(page: Any, budget_ms: int) -> None:
+    """
+    Wait until most dashboard panels are ready before screenshot.
+    Uses panel ready ratio + loading-like elements stable at 0.
+    """
+    b = max(1000, int(budget_ms))
+    deadline = time.monotonic() + b / 1000.0
+    stable = 0
+    while time.monotonic() < deadline:
+        total, ready = _grafana_panel_ready_stats(page)
+        loading = _grafana_loading_like_count(page)
+        need = 0
+        if total > 0:
+            need = max(int(math.ceil(total * GRAFANA_SCREENSHOT_PANEL_READY_RATIO)), int(GRAFANA_SCREENSHOT_PANEL_READY_MIN))
+        ok_panels = total > 0 and ready >= min(total, need)
+        if ok_panels and loading == 0:
+            stable += 1
+            if stable >= 2:
+                logger.info(
+                    "Grafana screenshot: panel readiness reached ready=%s/%s (need=%s), loading=%s",
+                    ready,
+                    total,
+                    need,
+                    loading,
+                )
+                return
+        else:
+            stable = 0
+        page.wait_for_timeout(220)
+    total, ready = _grafana_panel_ready_stats(page)
+    logger.warning(
+        "Grafana screenshot: panel readiness timeout after %sms (ready=%s/%s ratio_target=%.2f min=%s)",
+        b,
+        ready,
+        total,
+        GRAFANA_SCREENSHOT_PANEL_READY_RATIO,
+        GRAFANA_SCREENSHOT_PANEL_READY_MIN,
+    )
+
+
 def _grafana_scroll_paint_lazy_panels(page: Any) -> None:
     """Scroll by ~viewport steps so off-screen panels mount and uPlot/canvas paint."""
     pause = int(GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS)
@@ -2043,6 +2134,7 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             _grafana_wait_dashboard_ready(page, timeout_ms)
             _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
             _grafana_stabilize_dashboard_render(page, timeout_ms)
+            _grafana_wait_panels_fully_loaded(page, int(GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS))
             page.wait_for_timeout(180)
 
             if not _grafana_dashboard_has_visual_content(page):
@@ -2056,6 +2148,7 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
                     page, min(3200, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
                 )
                 _grafana_scroll_paint_lazy_panels(page)
+                _grafana_wait_panels_fully_loaded(page, min(8000, int(GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS)))
                 page.wait_for_timeout(120)
 
             if not _grafana_dashboard_has_visual_content(page):
@@ -2074,6 +2167,7 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
                         page, min(8000, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
                     )
                     _grafana_stabilize_dashboard_render(page, timeout_ms, rounds=1)
+                    _grafana_wait_panels_fully_loaded(page, min(9000, int(GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS)))
                 except Exception as e:
                     logger.warning("Grafana screenshot: reload retry failed: %s", e)
 
