@@ -7,6 +7,7 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 **配置**：编辑本文件顶部 ``_CFG`` 字典（不再读取 ``.env``）。也可用 **systemd ``Environment=KEY=value``** 覆盖同名键。
 
 **默认 ``LARK_EVENT_MODE=ws``** — 长连接；可选 ``ENABLE_HTTP=1`` 并行 HTTP。
+若同一条用户消息出现 **两条回复 / 两张图**：常见为 ``im.message.receive_v1`` 与 ``receive_v2`` 双投 — 默认 ``LARK_WS_REGISTER_IM_MESSAGE_V2=0`` 只处理 v1，并启用 ``MONITORING_IM_DEBOUNCE_SECONDS``（秒）去抖。
 
 **``LARK_EVENT_MODE=http``** — 监听 ``PORT``（本仓库默认 **5002**，与同机运行的 ``Chatbox/main.py``（常用 **5000**）错开端口），事件走 ``POST /webhook/event``。
 默认 HTTP 栈为 **Flask ``threaded=True``**（实现方式对齐 Chatbox）；生产可设 ``HTTP_SERVER=waitress``。
@@ -133,6 +134,10 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_LOG_LEVEL": "INFO",
     "LARK_WS_USE_HTTP_KEYS": "0",
     "LARK_WS_EXTRA_IM_TYPES": "",
+    # 1=同时订阅 WS 的 im.message.receive_v2（易与 receive_v1 **双投** 同一条用户消息 → 两条回复/两张图）；默认 0 仅 v1
+    "LARK_WS_REGISTER_IM_MESSAGE_V2": "0",
+    # 同一聊天内相同触发正文在 N 秒内的第二次投递视为重复（双通道/空 message_id 兜底）；0=关闭
+    "MONITORING_IM_DEBOUNCE_SECONDS": "2",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -311,6 +316,8 @@ def _lark_webhook_request_timer_end(response: Response):
 _processed_lark_message_ids: set = set()
 _PROCESSED_LARK_IDS_CAP = 4000
 _monitoring_reply_dispatch_lock = threading.Lock()
+# Same user action delivered twice in quick succession (e.g. v1+v2 or empty ids) — key ``chat|open|clean``.
+_monitoring_im_trigger_last: Dict[str, float] = {}
 _persistent_worker_queue: queue.Queue = queue.Queue(maxsize=24)
 _persistent_worker_thread: Optional[threading.Thread] = None
 _persistent_worker_ready = threading.Event()
@@ -441,6 +448,13 @@ def _lark_dict_pick_str(d: Any, *keys: str) -> str:
         if s:
             return s
     return ""
+
+
+def _lark_im_message_dedupe_id(msg: Dict[str, Any]) -> str:
+    """Prefer ``message_id``; some WS v2 envelopes expose ``open_message_id`` only."""
+    return _lark_dict_pick_str(
+        msg, "message_id", "messageId", "open_message_id", "openMessageId"
+    )
 
 
 def _lark_message_chat_id(msg: Dict[str, Any]) -> str:
@@ -1437,18 +1451,13 @@ def _monitoring_interactive_card_dict(
     lark_img_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Feishu **card JSON v2** (``schema: "2.0"``): body text uses ``div`` + ``lark_md`` (supports fenced code blocks).
-    Buttons sit as **top-level** ``body.elements`` with ``behaviors`` callbacks — v2 does not wrap them in the v1
-    ``action`` module.
+    Feishu **card JSON v2** (``schema: "2.0"``): body uses ``markdown`` + optional ``img`` + ``button`` with
+    ``behaviors`` callbacks (buttons are top-level ``body.elements`` entries, not v1 ``action`` wrappers).
     """
     btn_val = {"m": "shot", "t": (receive_id_type or "chat_id").strip(), "i": (receive_id or "").strip()}
     title = _monitoring_card_title_plain()
-    md_body = _monitoring_card_body_md_strip_title(reply, preserve_code_fences=True)
     elements: List[Dict[str, Any]] = [
-        {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": md_body},
-        },
+        {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
     ]
     ik = (lark_img_key or "").strip()
     if ik:
@@ -3146,7 +3155,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     event = data.get("event") if isinstance(data.get("event"), dict) else {}
     raw_msg = event.get("message")
     msg = raw_msg if isinstance(raw_msg, dict) else {}
-    mid = _lark_dict_pick_str(msg, "message_id", "messageId")
+    mid = _lark_im_message_dedupe_id(msg)
     mtype = (_lark_dict_pick_str(msg, "message_type", "messageType") or "").lower()
     chat_resolved = _lark_message_chat_id(msg)
     logger.info(
@@ -3202,10 +3211,33 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         (open_id[:12] + "…") if len(open_id) > 12 else open_id,
     )
 
+    debounce_sec = 0.0
+    raw_db = _cfg_raw("MONITORING_IM_DEBOUNCE_SECONDS")
+    if raw_db is not None and str(raw_db).strip() != "":
+        try:
+            debounce_sec = float(raw_db)
+        except (TypeError, ValueError):
+            debounce_sec = 2.0
+    debounce_key = f"{chat_id or ''}\n{open_id or ''}\n{(clean or '').strip()[:320]}"
+    now_m = time.monotonic()
     with _monitoring_reply_dispatch_lock:
         if mid and mid in _processed_lark_message_ids:
             logger.info("duplicate message_id=%s — skip (already dispatched)", mid)
             return
+        if debounce_sec > 0:
+            prev_t = _monitoring_im_trigger_last.get(debounce_key, 0.0)
+            if now_m - prev_t < debounce_sec:
+                logger.info(
+                    "monitoring debounce skip (%.2fs window) chat=%r open_prefix=%r",
+                    debounce_sec,
+                    bool(chat_id),
+                    (open_id[:10] + "…") if len(open_id) > 10 else open_id,
+                )
+                return
+            _monitoring_im_trigger_last[debounce_key] = now_m
+            if len(_monitoring_im_trigger_last) > 512:
+                _monitoring_im_trigger_last.clear()
+                _monitoring_im_trigger_last[debounce_key] = now_m
         if mid:
             _processed_lark_message_ids.add(mid)
 
@@ -3507,10 +3539,22 @@ def start_lark_ws_client_blocking() -> None:
     bld = (
         EventDispatcherHandler.builder(enc, ver)
         .register_p2_im_message_receive_v1(_on_ws_p2_im_message_receive_v1)
-        .register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
         .register_p2_customized_event("card.action.trigger", _on_ws_p2_card_action_trigger)
         .register_p2_customized_event("card.action.trigger_v1", _on_ws_p2_card_action_trigger)
     )
+    if _lark_env_truthy("LARK_WS_REGISTER_IM_MESSAGE_V2"):
+        bld = bld.register_p2_customized_event(
+            "im.message.receive_v2", _on_ws_im_message_p2_customized
+        )
+        logger.info(
+            "LARK_WS_REGISTER_IM_MESSAGE_V2=1 — handling im.message.receive_v2 (if you see duplicate "
+            "replies, set to 0 and rely on receive_v1 only)."
+        )
+    else:
+        logger.info(
+            "LARK_WS_REGISTER_IM_MESSAGE_V2=0 — **not** subscribing to im.message.receive_v2 (avoids duplicate "
+            "v1+v2 delivery for the same user message). Set _CFG / env to 1 if your workspace requires v2."
+        )
     for raw_t in _cfg_str("LARK_WS_EXTRA_IM_TYPES", "").replace(";", ",").split(","):
         t = raw_t.strip()
         if not t:
@@ -3553,10 +3597,16 @@ def start_lark_ws_client_blocking() -> None:
             domain=dnorm,
             auto_reconnect=True,
         )
+        _im_v2_note = (
+            " + p2 im.message.receive_v2 (LARK_WS_REGISTER_IM_MESSAGE_V2=1)"
+            if _lark_env_truthy("LARK_WS_REGISTER_IM_MESSAGE_V2")
+            else ""
+        )
         logger.info(
-            "Lark WebSocket client starting (domain=%s); WS handlers: "
-            "p2 im.message.receive_v1 (typed SDK) + p2 im.message.receive_v2 (customized)",
+            "Lark WebSocket client starting (domain=%s); WS IM handlers: "
+            "p2 im.message.receive_v1 (typed SDK)%s",
             dnorm,
+            _im_v2_note,
         )
         try:
             cli.start()
