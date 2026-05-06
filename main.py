@@ -111,6 +111,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DAEMON_INTERVAL_SECONDS": 60,
     # 非空则每分钟把当日摘要+截图发到该群；空=仅后台刷新页面与告警边沿转发（仍写 MONITORING_ALERT_CHAT_ID）
     "MONITORING_DAEMON_CHAT_ID": "",
+    # 1=/monitoring 排队任务：已有图表则 **不点 Refresh**，直接 ``page.screenshot``（真正「已在 Grafana 里」快照）；0=每次用户请求都先 Refresh 再截
+    "GRAFANA_PERSISTENT_USER_SKIP_REFRESH": "1",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -383,6 +385,7 @@ MONITORING_DAEMON_INTERVAL_SECONDS = max(
     30, min(3600, _cfg_int("MONITORING_DAEMON_INTERVAL_SECONDS", 60))
 )
 MONITORING_DAEMON_CHAT_ID = _cfg_str("MONITORING_DAEMON_CHAT_ID", "").strip()
+GRAFANA_PERSISTENT_USER_SKIP_REFRESH = _lark_env_truthy("GRAFANA_PERSISTENT_USER_SKIP_REFRESH")
 
 # 群聊里富媒体等类型仍可能带可解析文本；仅跳过明显无 /monitoring 的类型。
 _SKIP_IM_MESSAGE_TYPES = frozenset(
@@ -1776,6 +1779,28 @@ def _persistent_refresh_or_reload_graph(
         )
 
 
+def _persistent_prepare_user_job_page(
+    session: requests.Session, context: Any, page: Any, timeout_ms: int
+) -> None:
+    """
+    ``/monitoring`` queued on the persistent worker: sync cookies, then **by default** skip Grafana
+    Refresh when charts already render — capture is ``page.screenshot()`` on the long-lived tab (no new browser).
+    """
+    if not _grafana_session_probe_ok(session):
+        grafana_relogin_session(session)
+    _playwright_sync_context_cookies(context, session)
+    if not GRAFANA_PERSISTENT_USER_SKIP_REFRESH:
+        _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
+        return
+    if _grafana_dashboard_has_visual_content(page):
+        logger.info(
+            "persistent user job: charts visible — skip Refresh; PNG = page.screenshot() on warm Grafana tab"
+        )
+        return
+    logger.info("persistent user job: no chart DOM — Refresh/reload before PNG")
+    _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
+
+
 def _send_monitoring_reply_and_alert_copy(
     chat_id: str,
     open_id: str,
@@ -1839,7 +1864,10 @@ def _persistent_send_png_if_enabled(
             _lark_send_image_message("chat_id", chat_id, key)
         else:
             _lark_send_image_message("open_id", open_id, key)
-        logger.info("persistent: Grafana screenshot sent bytes=%s", len(png))
+        logger.info(
+            "persistent: Grafana PNG from **warm tab** (one Chromium process; not _grafana_headless_screenshot_png) bytes=%s",
+            len(png),
+        )
     except Exception:
         logger.exception("persistent: screenshot or image send failed (text already sent)")
 
@@ -1913,7 +1941,7 @@ def _persistent_grafana_worker_main() -> None:
                 payload: Optional[Dict[str, Any]] = None
                 http_ex: Optional[Dict[str, Any]] = None
                 try:
-                    _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
+                    _persistent_prepare_user_job_page(session, context, page, timeout_ms)
                     payload = _fetch_request_total_with_relogin(session)
                     http_ex = _http_analysis_for_payload(payload)
                     reply = _format_monitoring_reply(payload)
@@ -2307,8 +2335,21 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
     """
     logger.info("monitoring background job start mid=%r chat=%r open=%r", mid, bool(chat_id), bool(open_id))
     if _persistent_enqueue_user_monitoring(chat_id, open_id, mid):
-        logger.info("monitoring delegated to persistent Grafana worker mid=%r", mid)
+        logger.info(
+            "monitoring delegated to persistent Grafana worker mid=%r (PNG will use warm ``page`` if charts visible)",
+            mid,
+        )
         return
+    if GRAFANA_PERSISTENT_WORKER_ENABLE:
+        logger.warning(
+            "monitoring: persistent worker enabled but job **not** queued (worker not ready in 120s or queue full) — "
+            "using **cold** Chromium path for this request"
+        )
+    else:
+        logger.info(
+            "monitoring: GRAFANA_PERSISTENT_WORKER_ENABLE=0 — using **cold** Chromium per screenshot "
+            "(launch → goto dashboard → close)"
+        )
     grafana_session: Optional[requests.Session] = None
     payload: Optional[Dict[str, Any]] = None
     http_ex: Optional[Dict[str, Any]] = None
@@ -2393,7 +2434,8 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
                             )
                         n_cookies = len(_playwright_cookie_list(grafana_session))
                         logger.info(
-                            "monitoring screenshot start cookies=%s window=%s..%s",
+                            "monitoring **cold** screenshot: ephemeral Chromium via _grafana_headless_screenshot_png "
+                            "cookies=%s window=%s..%s",
                             n_cookies,
                             su,
                             eu,
