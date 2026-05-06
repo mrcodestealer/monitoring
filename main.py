@@ -164,9 +164,15 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ALERT_WINDOW_SECONDS": 120,
     "MONITORING_WATCH_ENABLE": "1",
     "MONITORING_WATCH_INTERVAL_SECONDS": "60",
-    # 自动告警最短间隔（防刷屏）
+    # 自动告警最短间隔（防刷屏）；默认 300=5 分钟
     "MONITORING_WATCH_ALERT_COOLDOWN_SECONDS": "300",
-    
+    # Watchdog：Prometheus 判窗对齐到整分钟，相对「当前分钟起点」向回偏移（分钟）。例：6 与 1 → 12:46:xx 只评 12:40:00..12:45:00
+    "MONITORING_WATCH_EVAL_START_OFFSET_MINUTES": "6",
+    "MONITORING_WATCH_EVAL_END_OFFSET_MINUTES": "1",
+    # Watchdog 告警附带截图的 Grafana URL（相对时间）；与判窗数据窗口无关，默认最近 15 分钟整页
+    "MONITORING_WATCH_SCREENSHOT_FROM": "now-15m",
+    "MONITORING_WATCH_SCREENSHOT_TO": "now",
+    "MONITORING_WATCH_SCREENSHOT_TIMEZONE": "browser",
     # Tag person
     "TARGET_USER_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
     # In which group
@@ -1224,11 +1230,20 @@ def _prometheus_query_range(
 
 
 def _fetch_panel_series_by_title(
-    panel_title: str, session: Optional[requests.Session] = None
+    panel_title: str,
+    session: Optional[requests.Session] = None,
+    start_unix: Optional[int] = None,
+    end_unix: Optional[int] = None,
 ) -> Dict[str, Any]:
-    lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
-    end = int(time.time()) - lag
-    start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
+    if start_unix is not None and end_unix is not None:
+        start = int(start_unix)
+        end = int(end_unix)
+        if start >= end:
+            raise ValueError("query window: start_unix must be < end_unix")
+    else:
+        lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
+        end = int(time.time()) - lag
+        start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
     sess = session or grafana_login_session()
     dash = _fetch_dashboard_model(sess, GRAFANA_DASHBOARD_UID)
     panel = _find_panel(dash, panel_title)
@@ -1265,36 +1280,89 @@ def _fetch_panel_series_by_title(
     }
 
 
-def fetch_request_total_1m_series(session: Optional[requests.Session] = None) -> Dict[str, Any]:
+def fetch_request_total_1m_series(
+    session: Optional[requests.Session] = None,
+    start_unix: Optional[int] = None,
+    end_unix: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     Same data as Grafana panel「请求总数/1m」: last ``GRAFANA_QUERY_LOOKBACK_SECONDS`` (default **600 = 10m**),
     step ``GRAFANA_QUERY_STEP``. Align with dashboard ``GRAFANA_DASHBOARD_FROM`` / ``now-10m`` for screenshots.
     ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
     avoiding incomplete recent-minute series that look like a false drop.
     Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
+    If ``start_unix`` and ``end_unix`` are set, both are used instead of lag/lookback (watchdog eval window).
     """
-    return _fetch_panel_series_by_title(GRAFANA_PANEL_TITLE, session=session)
+    return _fetch_panel_series_by_title(
+        GRAFANA_PANEL_TITLE,
+        session=session,
+        start_unix=start_unix,
+        end_unix=end_unix,
+    )
 
 
-def fetch_monitoring_payload(session: Optional[requests.Session] = None) -> Dict[str, Any]:
+def _monitoring_watch_eval_window_unix(now: Optional[float] = None) -> Tuple[int, int]:
+    """
+    Minute-aligned Prometheus window for **watchdog only** (exclude current incomplete minute by default).
+    Defaults: start = floor_to_minute(now) − 6m, end = floor_to_minute(now) − 1m
+    (e.g. at 12:46:30 → 12:40:00 .. 12:45:00 unix, inclusive for query_range with step 60).
+    """
+    t = time.time() if now is None else float(now)
+    end_off = max(0, _cfg_int("MONITORING_WATCH_EVAL_END_OFFSET_MINUTES", 1))
+    start_off = max(end_off + 1, _cfg_int("MONITORING_WATCH_EVAL_START_OFFSET_MINUTES", 6))
+    t_floor = int(t // 60) * 60
+    end_unix = t_floor - end_off * 60
+    start_unix = t_floor - start_off * 60
+    return start_unix, end_unix
+
+
+def fetch_monitoring_payload(
+    session: Optional[requests.Session] = None,
+    *,
+    for_watchdog: bool = False,
+) -> Dict[str, Any]:
     sess = session or grafana_login_session()
-    primary = fetch_request_total_1m_series(session=sess)
+    w_start: Optional[int] = None
+    w_end: Optional[int] = None
+    if for_watchdog:
+        w_start, w_end = _monitoring_watch_eval_window_unix()
+        logger.info(
+            "fetch_monitoring_payload watchdog eval window unix %s..%s (aligned minutes)",
+            w_start,
+            w_end,
+        )
+    primary = fetch_request_total_1m_series(session=sess, start_unix=w_start, end_unix=w_end)
     extra: List[Dict[str, Any]] = []
     if _lark_env_truthy("MONITORING_9280_ENABLE"):
         try:
-            p9280 = _fetch_panel_series_by_title(GRAFANA_PANEL_TITLE_9280, session=sess)
+            p9280 = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_9280,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
             extra.append({"kind": "9280_push", "payload": p9280})
         except Exception:
             logger.exception("fetch 9280 panel failed (optional monitor)")
     if _lark_env_truthy("MONITORING_DEPOSIT_ENABLE"):
         try:
-            pd = _fetch_panel_series_by_title(GRAFANA_PANEL_TITLE_DEPOSIT, session=sess)
+            pd = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_DEPOSIT,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
             extra.append({"kind": "deposit", "payload": pd})
         except Exception:
             logger.exception("fetch deposit panel failed (optional monitor)")
     if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
         try:
-            pw = _fetch_panel_series_by_title(GRAFANA_PANEL_TITLE_WITHDRAW, session=sess)
+            pw = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_WITHDRAW,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
             extra.append({"kind": "withdraw", "payload": pw})
         except Exception:
             logger.exception("fetch withdraw panel failed (optional monitor)")
@@ -2012,15 +2080,22 @@ def _grafana_wait_dashboard_body_populated(page: Any, budget_ms: int) -> bool:
         return False
 
 
-def _grafana_build_screenshot_dashboard_url(start_unix: int, end_unix: int) -> str:
+def _grafana_build_screenshot_dashboard_url(
+    start_unix: int,
+    end_unix: int,
+    *,
+    relative_from: Optional[str] = None,
+    relative_to: Optional[str] = None,
+    timezone_param: Optional[str] = None,
+) -> str:
     params: List[Tuple[str, str]] = [("orgId", "1")]
-    if GRAFANA_SCREENSHOT_RELATIVE_RANGE:
-        params.extend(
-            [
-                ("from", (GRAFANA_DASHBOARD_FROM or "now-10m").strip()),
-                ("to", (GRAFANA_DASHBOARD_TO or "now").strip()),
-            ]
-        )
+    rf_ov = (relative_from or "").strip()
+    rt_ov = (relative_to or "").strip()
+    force_relative = bool(rf_ov or rt_ov)
+    if GRAFANA_SCREENSHOT_RELATIVE_RANGE or force_relative:
+        rf = rf_ov or (GRAFANA_DASHBOARD_FROM or "now-10m").strip()
+        rt = rt_ov or (GRAFANA_DASHBOARD_TO or "now").strip()
+        params.extend([("from", rf), ("to", rt)])
     else:
         params.extend(
             [
@@ -2028,6 +2103,9 @@ def _grafana_build_screenshot_dashboard_url(start_unix: int, end_unix: int) -> s
                 ("to", str(int(end_unix) * 1000)),
             ]
         )
+    tz = (timezone_param or "").strip()
+    if tz:
+        params.append(("timezone", tz))
     k = (GRAFANA_SCREENSHOT_KIOSK or "").strip().lower()
     if k and k not in ("0", "false", "no", "off"):
         if k in ("1", "true", "yes", "on"):
@@ -2100,7 +2178,15 @@ def _playwright_cookie_list(session: requests.Session) -> List[Dict[str, Any]]:
     return out
 
 
-def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int, end_unix: int) -> bytes:
+def _grafana_headless_screenshot_png(
+    session: requests.Session,
+    start_unix: int,
+    end_unix: int,
+    *,
+    relative_from: Optional[str] = None,
+    relative_to: Optional[str] = None,
+    timezone_param: Optional[str] = None,
+) -> bytes:
     """
     Headless Chromium (Playwright) opens the same dashboard URL as the UI, with session cookies.
     Requires: ``pip install playwright`` and ``playwright install chromium`` on the server.
@@ -2110,6 +2196,9 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
 
     Defaults favor **low latency** (short sleeps, tight spinner/populate caps). If captures go blank,
     raise ``GRAFANA_SCREENSHOT_POPULATE_MAX_MS`` and ``GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS`` first.
+
+    Optional ``relative_from`` / ``relative_to`` / ``timezone_param`` override the URL query for this
+    capture only (watchdog uses ``now-15m`` … ``now`` + ``timezone=browser`` while Prometheus uses a shorter eval window).
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -2118,13 +2207,22 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             "Playwright not installed — pip install playwright && playwright install chromium"
         ) from e
 
-    url = _grafana_build_screenshot_dashboard_url(start_unix, end_unix)
+    url = _grafana_build_screenshot_dashboard_url(
+        start_unix,
+        end_unix,
+        relative_from=relative_from,
+        relative_to=relative_to,
+        timezone_param=timezone_param,
+    )
     cookies = _playwright_cookie_list(session)
     timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
+    rel_eff = GRAFANA_SCREENSHOT_RELATIVE_RANGE or bool(
+        (relative_from or "").strip() or (relative_to or "").strip()
+    )
     logger.info(
         "Grafana screenshot: relative_range=%s url=%s",
-        GRAFANA_SCREENSHOT_RELATIVE_RANGE,
+        rel_eff,
         url[:300] + ("…" if len(url) > 300 else ""),
     )
 
@@ -2225,6 +2323,25 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             return png
         finally:
             browser.close()
+
+
+def _grafana_watchdog_alert_screenshot_png(session: requests.Session) -> bytes:
+    """
+    Watchdog alert image: Grafana **browser** range ``now-15m`` … ``now`` (plus optional ``timezone``),
+    independent of the shorter Prometheus eval window on the payload.
+    """
+    su, eu = _monitoring_watch_eval_window_unix()
+    rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-15m").strip() or "now-15m"
+    rt = _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip() or "now"
+    tz = _cfg_str("MONITORING_WATCH_SCREENSHOT_TIMEZONE", "browser").strip()
+    return _grafana_headless_screenshot_png(
+        session,
+        su,
+        eu,
+        relative_from=rf,
+        relative_to=rt,
+        timezone_param=tz or None,
+    )
 
 
 def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
@@ -3017,7 +3134,7 @@ def _monitoring_watchdog_loop() -> None:
                 continue
 
             sess = grafana_login_session()
-            payload = fetch_monitoring_payload(session=sess)
+            payload = fetch_monitoring_payload(session=sess, for_watchdog=True)
             if not _monitoring_payload_hit_alert(payload):
                 time.sleep(sec)
                 continue
@@ -3037,14 +3154,10 @@ def _monitoring_watchdog_loop() -> None:
             reply = _format_alert_trigger_reply(payload)
             pre_key: Optional[str] = None
             if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-                w0 = payload.get("window") or {}
-                su0 = int(w0.get("startUnix") or 0)
-                eu0 = int(w0.get("endUnix") or 0)
-                if su0 > 0 and eu0 > 0:
-                    try:
-                        pre_key = _lark_upload_png_image_key(_grafana_headless_screenshot_png(sess, su0, eu0))
-                    except Exception:
-                        logger.exception("monitoring watchdog pre-screenshot failed")
+                try:
+                    pre_key = _lark_upload_png_image_key(_grafana_watchdog_alert_screenshot_png(sess))
+                except Exception:
+                    logger.exception("monitoring watchdog pre-screenshot failed")
 
             used_card, embedded = _lark_send_monitoring_user_message(
                 "chat_id",
@@ -3067,17 +3180,13 @@ def _monitoring_watchdog_loop() -> None:
                     except Exception:
                         logger.exception("monitoring watchdog pre_key image send failed")
                 else:
-                    w = payload.get("window") or {}
-                    su = int(w.get("startUnix") or 0)
-                    eu = int(w.get("endUnix") or 0)
-                    if su > 0 and eu > 0:
-                        try:
-                            png = _grafana_headless_screenshot_png(sess, su, eu)
-                            key = _lark_upload_png_image_key(png)
-                            _lark_send_image_message("chat_id", alert_chat, key)
-                            logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
-                        except Exception:
-                            logger.exception("monitoring watchdog screenshot send failed")
+                    try:
+                        png = _grafana_watchdog_alert_screenshot_png(sess)
+                        key = _lark_upload_png_image_key(png)
+                        _lark_send_image_message("chat_id", alert_chat, key)
+                        logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
+                    except Exception:
+                        logger.exception("monitoring watchdog screenshot send failed")
         except Exception:
             logger.exception("monitoring watchdog cycle failed")
         time.sleep(sec)
