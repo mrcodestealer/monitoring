@@ -7,7 +7,6 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 **配置**：编辑本文件顶部 ``_CFG`` 字典（不再读取 ``.env``）。也可用 **systemd ``Environment=KEY=value``** 覆盖同名键。
 
 **默认 ``LARK_EVENT_MODE=ws``** — 长连接；可选 ``ENABLE_HTTP=1`` 并行 HTTP。
-若同一条用户消息出现 **两条回复 / 两张图**：① ``LARK_EVENT_MODE=ws`` 且仍配置了 HTTP Request URL → 同一条 IM 会 **WS + HTTP 各收一次**，默认 ``LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS=1`` 在 HTTP 上忽略 im.message；② ``receive_v1``+``receive_v2`` 双投 — 默认 ``LARK_WS_REGISTER_IM_MESSAGE_V2=0``；③ ``MONITORING_IM_DEBOUNCE_SECONDS`` 去抖。
 
 **``LARK_EVENT_MODE=http``** — 监听 ``PORT``（本仓库默认 **5002**，与同机运行的 ``Chatbox/main.py``（常用 **5000**）错开端口），事件走 ``POST /webhook/event``。
 默认 HTTP 栈为 **Flask ``threaded=True``**（实现方式对齐 Chatbox）；生产可设 ``HTTP_SERVER=waitress``。
@@ -17,10 +16,7 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
 群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（最近 10 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``now-10m`` 一致）。
-默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：摘要用飞书 **交互卡片** +「重新截图」按钮（需订阅 ``card.action.trigger``）；``GRAFANA_SCREENSHOT_ENABLE=1`` 时 PNG 先上传为 ``image_key`` 并 **嵌入卡片**（不再跟一条独立图片消息，除非卡片发送失败回退为纯文本）。设 ``0`` 则纯文本。
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
-
-可选 ``GRAFANA_PERSISTENT_WORKER_ENABLE=1``：**单线程常驻** Playwright + Grafana 页，每分钟 Refresh / 必要时 reload，Prometheus 读数与告警；``/monitoring`` 走热页截图（少重复登录）。见 ``MONITORING_DAEMON_*``。
 
 可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：在文字后追加无头 Chromium 截图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
 默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` 截整页滚动区域（长 dashboard 全部图表）；设为 ``0`` 则仅视口大小（易只拍到上半屏）。
@@ -36,10 +32,8 @@ import os
 from urllib.parse import urlencode
 from datetime import datetime
 import re
-import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 import warnings
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
@@ -108,38 +102,11 @@ _CFG: Dict[str, Any] = {
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
     # HTTP 均值告警命中时，除原群外再发一份文字到该群（chat_id，常为 oc_…）；空=关闭
     "MONITORING_ALERT_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
-    # 1=常驻 headless Grafana（单线程 Playwright）；每分钟 Refresh + Prometheus 读数；/monitoring 排队用热页截图
-    "GRAFANA_PERSISTENT_WORKER_ENABLE": "0",
-    # 常驻循环间隔（秒）；默认 60
-    "MONITORING_DAEMON_INTERVAL_SECONDS": 60,
-    # 非空则每分钟把当日摘要+截图发到该群；空=仅后台刷新页面与告警边沿转发（仍写 MONITORING_ALERT_CHAT_ID）
-    "MONITORING_DAEMON_CHAT_ID": "",
-    # 1=/monitoring 排队任务：已有图表则 **不点 Refresh**，直接 ``page.screenshot``（真正「已在 Grafana 里」快照）；0=每次用户请求都先 Refresh 再截
-    "GRAFANA_PERSISTENT_USER_SKIP_REFRESH": "1",
-    # 常驻 tab 截图：默认 0ms settle + **视口** PNG（全页滚动很慢，易占满数秒）；需要长图再设 FULL_PAGE=1
-    "GRAFANA_PERSISTENT_SCREENSHOT_SETTLE_MS": 0,
-    "GRAFANA_PERSISTENT_SCREENSHOT_FULL_PAGE": "0",
-    # 1=截 PNG 前滚动 + 等 Spinner + stabilize（显著减少「黑块未画完」；略增耗时）。0=最快但易空白
-    "GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_BEFORE_CAPTURE": "1",
-    # prepare 时 stabilize 轮数（1–4）；黑块仍多可试 3
-    "GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_ROUNDS": 2,
-    # prepare 阶段等 loading-like 消失的最长毫秒
-    "GRAFANA_PERSISTENT_SCREENSHOT_PREPNG_SPINNER_MS": 3500,
-    # 面板多个 Prometheus target 时并行 query_range（同 cookie 只读，安全）
-    "GRAFANA_QUERY_PARALLEL_TARGETS": "1",
-    # 缓存 /api/dashboards/uid JSON，减轻每次拉数前的 RTT（0=关闭）
-    "GRAFANA_DASHBOARD_MODEL_CACHE_SECONDS": 120,
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
     "LARK_WS_USE_HTTP_KEYS": "0",
     "LARK_WS_EXTRA_IM_TYPES": "",
-    # 1=同时订阅 WS 的 im.message.receive_v2（易与 receive_v1 **双投** 同一条用户消息 → 两条回复/两张图）；默认 0 仅 v1
-    "LARK_WS_REGISTER_IM_MESSAGE_V2": "0",
-    # 同一聊天内相同触发正文在 N 秒内的第二次投递视为重复（双通道/空 message_id 兜底）；0=关闭（默认 5s）
-    "MONITORING_IM_DEBOUNCE_SECONDS": "5",
-    # 1=且 LARK_EVENT_MODE=ws 时 **忽略** POST /webhook/event 上的 im.message（避免与长连接各处理一次 → 重复回复）
-    "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -149,8 +116,6 @@ _CFG: Dict[str, Any] = {
     # 请求总数/1m：仅 HTTP 序列参与跌幅判断；平均跌幅 ≥ 该阈值时 @ 下面 open_id（可用环境变量覆盖）
     "TARGET_USER_OPEN_ID": "",
     "MONITORING_HTTP_DROP_ALERT_PCT": 10,
-    # 1=监控摘要用 **交互卡片**（含「重新截图」按钮）；0=纯文本。需在飞书后台订阅「卡片回传交互」card.action.trigger（HTTP 或 WS 已注册）
-    "MONITORING_MESSAGE_CARD_ENABLE": "1",
 }
 
 
@@ -318,25 +283,6 @@ def _lark_webhook_request_timer_end(response: Response):
 _processed_lark_message_ids: set = set()
 _PROCESSED_LARK_IDS_CAP = 4000
 _monitoring_reply_dispatch_lock = threading.Lock()
-# Same user action delivered twice in quick succession (e.g. v1+v2 or empty ids) — key ``chat|sender|clean``.
-_monitoring_im_trigger_last: Dict[str, float] = {}
-# While a background job for that key is running, drop duplicate triggers (same chat/sender/clean).
-_monitoring_inflight_keys: set = set()
-# Feishu ``header.event_id`` — unique per delivery; catches retries / double dispatch with different ``message_id``.
-_processed_lark_im_event_ids: set = set()
-_PROCESSED_IM_EVENT_IDS_CAP = 4000
-_persistent_worker_queue: queue.Queue = queue.Queue(maxsize=24)
-_persistent_worker_thread: Optional[threading.Thread] = None
-_persistent_worker_ready = threading.Event()
-_persistent_shutdown = threading.Event()
-_persistent_prev_hit_alert = False
-_persistent_boot_warm_done = False
-_processed_lark_card_event_ids: set = set()
-_PROCESSED_CARD_IDS_CAP = 2000
-_dash_model_cache_lock = threading.Lock()
-_dash_model_cache_uid: str = ""
-_dash_model_cache_body: Optional[Dict[str, Any]] = None
-_dash_model_cache_ts: float = 0.0
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
@@ -417,13 +363,6 @@ LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
 MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
-GRAFANA_PERSISTENT_WORKER_ENABLE = _lark_env_truthy("GRAFANA_PERSISTENT_WORKER_ENABLE")
-MONITORING_DAEMON_INTERVAL_SECONDS = max(
-    30, min(3600, _cfg_int("MONITORING_DAEMON_INTERVAL_SECONDS", 60))
-)
-MONITORING_DAEMON_CHAT_ID = _cfg_str("MONITORING_DAEMON_CHAT_ID", "").strip()
-GRAFANA_PERSISTENT_USER_SKIP_REFRESH = _lark_env_truthy("GRAFANA_PERSISTENT_USER_SKIP_REFRESH")
-MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
 
 # 群聊里富媒体等类型仍可能带可解析文本；仅跳过明显无 /monitoring 的类型。
 _SKIP_IM_MESSAGE_TYPES = frozenset(
@@ -455,41 +394,6 @@ def _lark_dict_pick_str(d: Any, *keys: str) -> str:
         if s:
             return s
     return ""
-
-
-def _lark_im_message_dedupe_id(msg: Dict[str, Any]) -> str:
-    """Prefer ``message_id``; some WS v2 envelopes expose ``open_message_id`` only."""
-    return _lark_dict_pick_str(
-        msg, "message_id", "messageId", "open_message_id", "openMessageId"
-    )
-
-
-def _lark_im_payload_event_id(data: Dict[str, Any]) -> str:
-    """Schema 2.0 ``header.event_id`` — stable per Feishu push; use to drop duplicate deliveries."""
-    h = data.get("header") if isinstance(data.get("header"), dict) else {}
-    return _lark_dict_pick_str(h, "event_id", "eventId")
-
-
-def _lark_skip_http_im_message_when_ws_mode() -> bool:
-    """
-    If the app runs ``LARK_EVENT_MODE=ws`` but ``ENABLE_HTTP=1`` still exposes ``/webhook/event``, Feishu may
-    **also** POST ``im.message.*`` to the Request URL while the same event is pushed on the WebSocket — two workers.
-    When this returns True, HTTP skips IM (WS remains the source of truth).
-    """
-    if not _lark_env_truthy("LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS"):
-        return False
-    return _cfg_str("LARK_EVENT_MODE", "ws").strip().lower() == "ws"
-
-
-def _lark_im_sender_debounce_token(sender: Dict[str, Any], open_id: str) -> str:
-    """Stable sender token for debounce when ``open_id`` is missing in one of two duplicate deliveries."""
-    u = _lark_dict_pick_str(sender, "union_id", "unionId")
-    if u:
-        return u
-    o = (open_id or "").strip()
-    if o:
-        return o
-    return _lark_dict_pick_str(sender, "user_id", "userId")
 
 
 def _lark_message_chat_id(msg: Dict[str, Any]) -> str:
@@ -822,10 +726,11 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
     return not (clean or "").strip()
 
 
-def grafana_relogin_session(session: requests.Session) -> None:
-    """POST /login on an existing session (refresh ``grafana_session`` after expiry)."""
+def grafana_login_session() -> requests.Session:
     if not GRAFANA_USER or not GRAFANA_PASSWORD:
         raise ValueError("Set GRAFANA_USER and GRAFANA_PASSWORD in .env")
+
+    session = requests.Session()
     login_url = f"{GRAFANA_BASE_URL}/login"
     resp = session.post(
         login_url,
@@ -834,36 +739,10 @@ def grafana_relogin_session(session: requests.Session) -> None:
         timeout=30,
     )
     resp.raise_for_status()
+    # Grafana sets grafana_session cookie on success
     if "grafana_session" not in session.cookies.get_dict():
         logger.warning("Login returned 200 but no grafana_session cookie; check credentials / SSO")
-
-
-def grafana_login_session() -> requests.Session:
-    session = requests.Session()
-    grafana_relogin_session(session)
     return session
-
-
-def _grafana_session_probe_ok(session: requests.Session) -> bool:
-    try:
-        r = session.get(f"{GRAFANA_BASE_URL}/api/user", timeout=20)
-        return int(r.status_code) == 200
-    except Exception:
-        return False
-
-
-def _fetch_request_total_with_relogin(session: requests.Session) -> Dict[str, Any]:
-    """Prometheus 面板拉数；失败时尝试 ``grafana_relogin_session`` 一次再试。"""
-    try:
-        return fetch_request_total_1m_series(session=session)
-    except Exception as first:
-        logger.warning("fetch_request_total_1m_series failed — relogin and retry: %s", first)
-        try:
-            grafana_relogin_session(session)
-        except Exception:
-            logger.exception("grafana_relogin_session after fetch failure")
-            raise first
-        return fetch_request_total_1m_series(session=session)
 
 
 def fetch_grafana_dashboard(
@@ -1050,30 +929,8 @@ def _fetch_dashboard_model(session: requests.Session, uid: str) -> Dict[str, Any
     return r.json().get("dashboard") or {}
 
 
-def _fetch_dashboard_model_cached(session: requests.Session, uid: str) -> Dict[str, Any]:
-    """Short-TTL cache for dashboard JSON to skip an HTTP round-trip on every ``/monitoring``."""
-    global _dash_model_cache_uid, _dash_model_cache_body, _dash_model_cache_ts
-    ttl = max(0, min(3600, _cfg_int("GRAFANA_DASHBOARD_MODEL_CACHE_SECONDS", 120)))
-    if ttl <= 0:
-        return _fetch_dashboard_model(session, uid)
-    now = time.time()
-    with _dash_model_cache_lock:
-        if (
-            _dash_model_cache_body is not None
-            and _dash_model_cache_uid == uid
-            and now - _dash_model_cache_ts < float(ttl)
-        ):
-            return _dash_model_cache_body
-    body = _fetch_dashboard_model(session, uid)
-    with _dash_model_cache_lock:
-        _dash_model_cache_uid = uid
-        _dash_model_cache_body = body
-        _dash_model_cache_ts = time.time()
-    return body
-
-
-def _prometheus_query_range_with_cookies(
-    cookie_jar: Dict[str, str],
+def _prometheus_query_range(
+    session: requests.Session,
     datasource_uid: str,
     expr: str,
     start_unix: int,
@@ -1087,22 +944,9 @@ def _prometheus_query_range_with_cookies(
         "end": str(end_unix),
         "step": str(step),
     }
-    r = requests.get(base, params=params, cookies=cookie_jar, timeout=120)
+    r = session.get(base, params=params, timeout=120)
     r.raise_for_status()
     return r.json()
-
-
-def _prometheus_query_range(
-    session: requests.Session,
-    datasource_uid: str,
-    expr: str,
-    start_unix: int,
-    end_unix: int,
-    step: int,
-) -> Dict[str, Any]:
-    return _prometheus_query_range_with_cookies(
-        dict(session.cookies), datasource_uid, expr, start_unix, end_unix, step
-    )
 
 
 def fetch_request_total_1m_series(session: Optional[requests.Session] = None) -> Dict[str, Any]:
@@ -1112,20 +956,18 @@ def fetch_request_total_1m_series(session: Optional[requests.Session] = None) ->
     ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
     avoiding incomplete recent-minute series that look like a false drop.
     Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
-    Multiple panel targets are queried **in parallel** when ``GRAFANA_QUERY_PARALLEL_TARGETS=1``.
     """
-    t0 = time.perf_counter()
     lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
     end = int(time.time()) - lag
     start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
     sess = session or grafana_login_session()
-    dash = _fetch_dashboard_model_cached(sess, GRAFANA_DASHBOARD_UID)
+    dash = _fetch_dashboard_model(sess, GRAFANA_DASHBOARD_UID)
     panel = _find_panel(dash, GRAFANA_PANEL_TITLE)
     if not panel:
         raise ValueError(f'Panel titled "{GRAFANA_PANEL_TITLE}" not found on dashboard {GRAFANA_DASHBOARD_UID}')
 
     panel_ds = _datasource_uid(panel.get("datasource"))
-    work: List[Tuple[Any, str, str]] = []
+    series_out: List[Dict[str, Any]] = []
     for t in panel.get("targets") or []:
         expr = (t.get("expr") or "").strip()
         if not expr:
@@ -1134,42 +976,19 @@ def fetch_request_total_1m_series(session: Optional[requests.Session] = None) ->
         if not ds_uid:
             logger.warning("skip target without datasource uid: %s", t.get("refId"))
             continue
-        work.append((t, ds_uid, expr))
-
-    series_out: List[Dict[str, Any]] = []
-    if not work:
-        raise ValueError("No Prometheus expr targets on panel (check panel JSON / datasource)")
-
-    jar = dict(sess.cookies)
-    step = int(GRAFANA_QUERY_STEP)
-
-    def _one_target(row: Tuple[Any, str, str]) -> Dict[str, Any]:
-        t, ds_uid, expr = row
-        raw = _prometheus_query_range_with_cookies(jar, ds_uid, expr, start, end, step)
-        return {
-            "refId": t.get("refId"),
-            "legendFormat": t.get("legendFormat"),
-            "expr": expr,
-            "datasourceUid": ds_uid,
-            "prometheus": raw,
-        }
-
-    if len(work) > 1 and _lark_env_truthy("GRAFANA_QUERY_PARALLEL_TARGETS"):
-        n_workers = min(8, len(work))
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            series_out = list(pool.map(_one_target, work))
-    else:
-        for row in work:
-            series_out.append(_one_target(row))
-
-    elapsed = time.perf_counter() - t0
-    if elapsed > 1.5:
-        logger.info(
-            "fetch_request_total_1m_series targets=%s parallel=%s elapsed=%.2fs",
-            len(series_out),
-            len(work) > 1 and _lark_env_truthy("GRAFANA_QUERY_PARALLEL_TARGETS"),
-            elapsed,
+        raw = _prometheus_query_range(sess, ds_uid, expr, start, end, GRAFANA_QUERY_STEP)
+        series_out.append(
+            {
+                "refId": t.get("refId"),
+                "legendFormat": t.get("legendFormat"),
+                "expr": expr,
+                "datasourceUid": ds_uid,
+                "prometheus": raw,
+            }
         )
+
+    if not series_out:
+        raise ValueError("No Prometheus expr targets on panel (check panel JSON / datasource)")
 
     return {
         "panelTitle": GRAFANA_PANEL_TITLE,
@@ -1298,384 +1117,6 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
         raise RuntimeError(
             f"Lark image send failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
         )
-
-
-def _lark_parse_card_action_value(val: Any) -> Optional[Dict[str, Any]]:
-    if val is None:
-        return None
-    if isinstance(val, dict):
-        return val
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return None
-        try:
-            o = json.loads(s)
-            return o if isinstance(o, dict) else None
-        except json.JSONDecodeError:
-            return None
-    return None
-
-
-def _lark_should_merge_flat_card_callback(data: Any) -> bool:
-    if not isinstance(data, dict):
-        return False
-    et = _lark_header_event_type(data)
-    if isinstance(et, str) and et.startswith("card.action"):
-        return True
-    if _lark_is_schema_v2(data) and isinstance(data.get("action"), dict):
-        return True
-    return False
-
-
-def _lark_normalize_card_callback_envelope(data: Any) -> Any:
-    if not isinstance(data, dict):
-        return data
-    if not _lark_should_merge_flat_card_callback(data):
-        return data
-    ev = data.get("event")
-    if not isinstance(ev, dict):
-        ev = {}
-    for k in (
-        "action",
-        "operator",
-        "open_chat_id",
-        "chat_id",
-        "context",
-        "host",
-        "delivery_type",
-        "token",
-    ):
-        if k in data and data[k] is not None and k not in ev:
-            ev[k] = data[k]
-    ctx = ev.get("context")
-    if not isinstance(ctx, dict):
-        ctx = {}
-        ev["context"] = ctx
-    if isinstance(data.get("open_chat_id"), str) and data["open_chat_id"].strip() and not ctx.get(
-        "open_chat_id"
-    ):
-        ctx["open_chat_id"] = data["open_chat_id"].strip()
-    if isinstance(data.get("open_message_id"), str) and data["open_message_id"].strip() and not ctx.get(
-        "open_message_id"
-    ):
-        ctx["open_message_id"] = data["open_message_id"].strip()
-    top_uid = data.get("open_id") or data.get("user_id")
-    top_union = data.get("union_id")
-    op = ev.get("operator")
-    if top_uid or top_union:
-        if not isinstance(op, dict):
-            ev["operator"] = {}
-            op = ev["operator"]
-        if isinstance(op, dict):
-            op = dict(op)
-            if top_uid and not op.get("open_id"):
-                op["open_id"] = top_uid
-            if top_union and not op.get("union_id"):
-                op["union_id"] = top_union
-            ev["operator"] = op
-    ctx_merge = ev.get("context") if isinstance(ev.get("context"), dict) else {}
-    if not ev.get("open_chat_id") and ctx_merge.get("open_chat_id"):
-        ev["open_chat_id"] = ctx_merge["open_chat_id"]
-    data["event"] = ev
-    return data
-
-
-def _lark_event_body_looks_like_card_interaction(ev: Any) -> bool:
-    if not isinstance(ev, dict):
-        return False
-    act = ev.get("action")
-    if not isinstance(act, dict):
-        return False
-    if ev.get("message"):
-        return False
-    if act.get("tag") == "button":
-        return True
-    if act.get("name") and act.get("value") is not None:
-        return bool(ev.get("operator") or ev.get("context"))
-    if act.get("value") is not None and (ev.get("operator") or ev.get("context")):
-        return True
-    return bool(ev.get("operator") or ev.get("context"))
-
-
-def _lark_extract_card_event_fields(ev: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Any]:
-    ctx = ev.get("context") if isinstance(ev.get("context"), dict) else {}
-    act = ev.get("action") or {}
-    val = act.get("value")
-    chat_id = ev.get("open_chat_id") or ev.get("chat_id")
-    if not chat_id:
-        chat_id = ctx.get("open_chat_id") or ctx.get("chat_id")
-    op = ev.get("operator") or {}
-    sender_id = op.get("open_id") or op.get("union_id")
-    if not sender_id:
-        sender_id = ev.get("open_id") or ev.get("user_id") or op.get("user_id")
-    return (str(chat_id).strip() if chat_id else None, str(sender_id).strip() if sender_id else None, val)
-
-
-def _lark_resolve_card_action(data: Dict[str, Any]) -> Optional[Tuple[Optional[str], Optional[str], Any, Any]]:
-    if not isinstance(data, dict):
-        return None
-    hdr = data.get("header") if isinstance(data.get("header"), dict) else {}
-    et = _lark_header_event_type(data)
-    eid = hdr.get("event_id") if isinstance(hdr, dict) else None
-    if eid is None:
-        eid = data.get("event_id")
-    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
-    named = et in ("card.action.trigger", "card.action.trigger_v1")
-    heuristic = et != "im.message.receive_v1" and (
-        (_lark_is_schema_v2(data) and _lark_event_body_looks_like_card_interaction(ev))
-        or (
-            isinstance(ev.get("action"), dict)
-            and len(ev.get("action") or {}) > 0
-            and (ev.get("operator") or ev.get("context"))
-        )
-    )
-    ctx0 = ev.get("context") if isinstance(ev.get("context"), dict) else {}
-    legacy_shape = (
-        et != "im.message.receive_v1"
-        and isinstance(ev.get("action"), dict)
-        and len(ev.get("action") or {}) > 0
-        and (ev.get("operator") or ev.get("context"))
-        and bool(
-            ev.get("open_chat_id")
-            or ev.get("chat_id")
-            or ctx0.get("open_chat_id")
-            or ctx0.get("chat_id")
-        )
-    )
-    if not (named or heuristic or legacy_shape):
-        return None
-    chat_id, sender_id, val = _lark_extract_card_event_fields(ev)
-    return (chat_id, sender_id, val, eid)
-
-
-def _monitoring_reply_to_card_md(reply: str, *, preserve_code_fences: bool = False) -> str:
-    """
-    Card body text (length-capped). Legacy ``tag: markdown`` disliked raw ``` fences — we strip/replace unless
-    ``preserve_code_fences`` (used with ``div`` + ``lark_md`` per Feishu card JSON v2).
-    """
-    s = (reply or "")[:3800]
-    if not preserve_code_fences:
-        s = s.replace("```", "'''")
-    if len(reply or "") > 3800:
-        s += "\n\n…(truncated)"
-    return s
-
-
-def _monitoring_card_title_plain() -> str:
-    """Match on-dashboard line ``【{panel}】graph`` with emoji so the card reads as a monitoring card."""
-    pt = (GRAFANA_PANEL_TITLE or "Monitoring").strip()
-    return f"📊 【{pt}】graph"
-
-
-def _monitoring_card_body_md_strip_title(
-    reply: str, *, preserve_code_fences: bool = False
-) -> str:
-    """Remove the first line if it duplicates the card header (``【面板】graph``)."""
-    r = (reply or "").strip()
-    dup = f"【{GRAFANA_PANEL_TITLE}】graph"
-    if r.startswith(dup):
-        r = r[len(dup) :].lstrip("\n")
-    return _monitoring_reply_to_card_md(r, preserve_code_fences=preserve_code_fences)
-
-
-def _monitoring_interactive_card_dict(
-    reply: str,
-    receive_id_type: str,
-    receive_id: str,
-    lark_img_key: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Feishu **card JSON v2** (``schema: "2.0"``): body uses ``markdown`` + optional ``img`` + ``button`` with
-    ``behaviors`` callbacks (buttons are top-level ``body.elements`` entries, not v1 ``action`` wrappers).
-    """
-    btn_val = {"m": "shot", "t": (receive_id_type or "chat_id").strip(), "i": (receive_id or "").strip()}
-    title = _monitoring_card_title_plain()
-    elements: List[Dict[str, Any]] = [
-        {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
-    ]
-    ik = (lark_img_key or "").strip()
-    if ik:
-        elements.append(
-            {
-                "tag": "img",
-                "img_key": ik,
-                "alt": {"tag": "plain_text", "content": "Grafana"},
-                "preview": True,
-                "transparent": False,
-            }
-        )
-    elements.append(
-        {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "📷 重新截图"},
-            "type": "primary",
-            "behaviors": [{"type": "callback", "value": btn_val}],
-        }
-    )
-    return {
-        "schema": "2.0",
-        "config": {"update_multi": True, "wide_screen_mode": True},
-        "header": {
-            "template": "blue",
-            "title": {"tag": "plain_text", "content": title},
-            "subtitle": {"tag": "plain_text", "content": "Grafana · 下方按钮可重新截图"},
-        },
-        "body": {"elements": elements},
-    }
-
-
-def _lark_send_interactive_card(receive_id_type: str, receive_id: str, card: Dict[str, Any]) -> None:
-    """
-    Send ``msg_type=interactive`` via **HTTP** (same pattern as :func:`_lark_upload_png_image_key` / Chatbox),
-    not lark-oapi ``message.create`` — some SDK builds mishandle ``interactive`` ``content`` encoding.
-    """
-    tok = _lark_tenant_access_token_string()
-    url = f"{_lark_api_domain()}/open-apis/im/v1/messages"
-    content_str = json.dumps(card, ensure_ascii=False)
-    payload = {
-        "receive_id": receive_id,
-        "msg_type": "interactive",
-        "content": content_str,
-    }
-    r = requests.post(
-        url,
-        params={"receive_id_type": receive_id_type},
-        headers={
-            "Authorization": f"Bearer {tok}",
-            "Content-Type": "application/json; charset=utf-8",
-        },
-        json=payload,
-        timeout=60,
-    )
-    r.raise_for_status()
-    j = r.json()
-    if int(j.get("code", -1)) != 0:
-        raise RuntimeError(f"im/v1/messages interactive failed: {j}")
-    mid = (j.get("data") or {}).get("message_id")
-    logger.info(
-        "Lark interactive card sent (HTTP) message_id=%r receive_id_type=%r",
-        mid,
-        receive_id_type,
-    )
-
-
-def _lark_send_monitoring_user_message(
-    receive_id_type: str,
-    receive_id: str,
-    reply: str,
-    lark_img_key: Optional[str] = None,
-) -> bool:
-    """
-    Plain text or interactive card (``MONITORING_MESSAGE_CARD_ENABLE``).
-    ``lark_img_key``: optional ``im/v1/images`` key — when card mode is on, PNG is **embedded** in the card ``img`` element.
-
-    Returns ``True`` if a **successful** interactive card was sent; ``False`` if plain text was used.
-    """
-    rid = (receive_id or "").strip()
-    if not rid:
-        raise ValueError("empty receive_id for monitoring message")
-    if MONITORING_MESSAGE_CARD_ENABLE:
-        try:
-            card = _monitoring_interactive_card_dict(reply, receive_id_type, rid, lark_img_key)
-            _lark_send_interactive_card(receive_id_type, rid, card)
-            logger.info(
-                "monitoring reply sent as **interactive card** rt=%s len=%s embedded_img=%s",
-                receive_id_type,
-                len(reply),
-                bool((lark_img_key or "").strip()),
-            )
-            return True
-        except Exception as e:
-            logger.warning(
-                "monitoring interactive card failed (%s) — falling back to plain text; "
-                "check app permission「发送消息卡片」and card JSON / Feishu logs.",
-                e,
-            )
-    _lark_send_text(receive_id_type, rid, reply)
-    return False
-
-
-def _screenshot_only_cold_worker(receive_id_type: str, receive_id: str) -> None:
-    """No persistent worker: login, headless PNG, send image."""
-    logger.info("screenshot_only cold worker start rt=%r id_prefix=%r", receive_id_type, receive_id[:16])
-    try:
-        sess = grafana_login_session()
-        payload = fetch_request_total_1m_series(session=sess)
-        w = payload.get("window") or {}
-        su = int(w.get("startUnix") or 0)
-        eu = int(w.get("endUnix") or 0)
-        if su <= 0 or eu <= 0:
-            raise ValueError("invalid prometheus window for screenshot")
-        png = _grafana_headless_screenshot_png(sess, su, eu)
-        key = _lark_upload_png_image_key(png)
-        _lark_send_image_message(receive_id_type, receive_id, key)
-        logger.info("screenshot_only cold sent bytes=%s", len(png))
-    except Exception:
-        logger.exception("screenshot_only cold worker failed")
-
-
-def _persistent_enqueue_screenshot_only(receive_id_type: str, receive_id: str) -> bool:
-    if not GRAFANA_PERSISTENT_WORKER_ENABLE:
-        return False
-    t = _persistent_worker_thread
-    if t is None or not t.is_alive():
-        return False
-    if not _persistent_worker_ready.wait(timeout=30.0):
-        return False
-    cid = receive_id if receive_id_type == "chat_id" else ""
-    oid = receive_id if receive_id_type == "open_id" else ""
-    try:
-        _persistent_worker_queue.put(
-            {"type": "screenshot_only", "chat_id": cid, "open_id": oid},
-            timeout=6.0,
-        )
-        return True
-    except queue.Full:
-        return False
-
-
-def _process_card_action_event(data: Dict[str, Any]) -> None:
-    """Handle ``card.action.trigger*`` — e.g. monitoring card **重新截图** button."""
-    global _processed_lark_card_event_ids
-    if not isinstance(data, dict):
-        return
-    data = _lark_normalize_card_callback_envelope(dict(data))
-    resolved = _lark_resolve_card_action(data)
-    if not resolved:
-        logger.info("card.action: resolver returned None — ignored")
-        return
-    chat_id, sender_id, val, eid = resolved
-    if eid:
-        with _monitoring_reply_dispatch_lock:
-            if eid in _processed_lark_card_event_ids:
-                logger.info("duplicate card event_id=%r — skip", eid)
-                return
-            _processed_lark_card_event_ids.add(eid)
-            if len(_processed_lark_card_event_ids) > _PROCESSED_CARD_IDS_CAP:
-                _processed_lark_card_event_ids.clear()
-    if LARK_BOT_OPEN_ID and sender_id and sender_id == LARK_BOT_OPEN_ID:
-        return
-    parsed = _lark_parse_card_action_value(val)
-    if not isinstance(parsed, dict) or str(parsed.get("m") or "").strip().lower() != "shot":
-        logger.debug("card.action: value not monitoring screenshot %r", parsed)
-        return
-    rt = str(parsed.get("t") or "chat_id").strip().lower()
-    rid = str(parsed.get("i") or "").strip()
-    if not rid:
-        logger.warning("card.action shot: missing receive id in value=%r", parsed)
-        return
-    if rt not in ("chat_id", "open_id"):
-        rt = "chat_id"
-    logger.info("card.action: screenshot_only rt=%r id_prefix=%r", rt, rid[:16])
-    if _persistent_enqueue_screenshot_only(rt, rid):
-        return
-    threading.Thread(
-        target=_screenshot_only_cold_worker,
-        args=(rt, rid),
-        daemon=True,
-        name="screenshot-only-cold",
-    ).start()
 
 
 # Playwright ``wait_for_function`` / ``evaluate``: true when dashboard body looks mounted (not only header).
@@ -2212,451 +1653,6 @@ def _grafana_headless_screenshot_png(session: requests.Session, start_unix: int,
             browser.close()
 
 
-def _playwright_sync_context_cookies(context: Any, session: requests.Session) -> None:
-    try:
-        context.clear_cookies()
-    except Exception:
-        pass
-    jar = _playwright_cookie_list(session)
-    if jar:
-        context.add_cookies(jar)
-
-
-def _persistent_prepare_dom_before_png(page: Any, timeout_ms: int) -> None:
-    """
-    Warm-tab capture often shows black KPI tiles if we shoot before uPlot/canvas mount.
-    Optional scroll + spinner wait + :func:`_grafana_stabilize_dashboard_render` (see ``GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_*``).
-    """
-    if not _lark_env_truthy("GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_BEFORE_CAPTURE"):
-        return
-    rounds = max(1, min(4, _cfg_int("GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_ROUNDS", 2)))
-    spin = max(600, min(15000, _cfg_int("GRAFANA_PERSISTENT_SCREENSHOT_PREPNG_SPINNER_MS", 3500)))
-    try:
-        _grafana_scroll_paint_lazy_panels(page)
-        _grafana_wait_loading_like_gone(page, spin)
-        _grafana_stabilize_dashboard_render(page, timeout_ms, rounds=rounds)
-        logger.info(
-            "persistent PNG prepare: rounds=%s spinner_budget_ms=%s (reduce black panels)",
-            rounds,
-            spin,
-        )
-    except Exception as e:
-        logger.warning("persistent PNG prepare skipped after error: %s", e)
-
-
-def _grafana_persistent_page_screenshot_png(page: Any) -> bytes:
-    """
-    Screenshot the **already open** Grafana tab. ``GRAFANA_PERSISTENT_SCREENSHOT_SETTLE_MS`` defaults **0**.
-    ``GRAFANA_PERSISTENT_SCREENSHOT_FULL_PAGE`` unset → inherit ``GRAFANA_SCREENSHOT_FULL_PAGE``; in ``_CFG``
-    default **0** (viewport) because full-page capture scrolls the whole dashboard and often costs **several seconds**.
-    """
-    settle = max(0, min(8000, _cfg_int("GRAFANA_PERSISTENT_SCREENSHOT_SETTLE_MS", 0)))
-    if settle > 0:
-        page.wait_for_timeout(settle)
-    _grafana_close_open_menus(page)
-    raw_fp = _cfg_raw("GRAFANA_PERSISTENT_SCREENSHOT_FULL_PAGE")
-    if raw_fp is None or (isinstance(raw_fp, str) and not str(raw_fp).strip()):
-        full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
-    else:
-        full_page = str(raw_fp).strip().lower() in ("1", "true", "yes", "on")
-    return page.screenshot(type="png", full_page=full_page)
-
-
-def _persistent_ensure_session_and_cookies(
-    session: requests.Session, context: Any, page: Any, timeout_ms: int, full_renav: bool
-) -> None:
-    global _persistent_boot_warm_done
-    if not _grafana_session_probe_ok(session):
-        grafana_relogin_session(session)
-    _playwright_sync_context_cookies(context, session)
-    if not full_renav and _persistent_boot_warm_done:
-        return
-    base = str(GRAFANA_BASE_URL).rstrip("/")
-    url = _grafana_build_screenshot_dashboard_url(0, 0)
-    tw = max(5000, int(timeout_ms))
-    if _lark_env_truthy("GRAFANA_SCREENSHOT_BOOT_WARM"):
-        try:
-            page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(20000, tw))
-            page.wait_for_timeout(220)
-        except Exception as e:
-            logger.info("persistent worker: boot warm goto / failed: %s", e)
-    _persistent_boot_warm_done = True
-    page.goto(url, wait_until="load", timeout=tw)
-    page.wait_for_timeout(200)
-    _grafana_playwright_dock_nav_only(page, tw)
-    _grafana_click_dashboard_refresh(page, tw)
-    _grafana_expand_collapsed_dashboard_rows(page)
-    _grafana_wait_dashboard_ready(page, tw)
-    _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
-    _grafana_stabilize_dashboard_render(page, tw)
-
-
-def _persistent_refresh_or_reload_graph(
-    session: requests.Session, context: Any, page: Any, timeout_ms: int
-) -> None:
-    """Dashboard Refresh；若无图则整页 reload 再跑一遍 dock/expand/stabilize。"""
-    tw = max(5000, int(timeout_ms))
-    if not _grafana_session_probe_ok(session):
-        grafana_relogin_session(session)
-    _playwright_sync_context_cookies(context, session)
-    _grafana_click_dashboard_refresh(page, tw)
-    _grafana_wait_loading_like_gone(page, int(GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS))
-    page.wait_for_timeout(200)
-    if _grafana_dashboard_has_visual_content(page):
-        return
-    logger.warning("persistent worker: graph not detected after Refresh — reloading dashboard")
-    try:
-        page.reload(wait_until="load", timeout=tw)
-        page.wait_for_timeout(380)
-    except Exception as e:
-        logger.warning("persistent worker: page.reload failed: %s", e)
-    _grafana_playwright_dock_nav_only(page, tw)
-    _grafana_click_dashboard_refresh(page, tw)
-    _grafana_expand_collapsed_dashboard_rows(page)
-    _grafana_wait_dashboard_ready(page, min(20000, tw // 2))
-    _grafana_wait_dashboard_body_populated(page, min(8000, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS)))
-    _grafana_stabilize_dashboard_render(page, tw, rounds=1)
-    if not _grafana_dashboard_has_visual_content(page):
-        logger.error(
-            "persistent worker: still no chart-like DOM after reload — check Grafana session / layout"
-        )
-
-
-def _persistent_prepare_user_job_page(
-    session: requests.Session, context: Any, page: Any, timeout_ms: int
-) -> None:
-    """
-    ``/monitoring`` queued on the persistent worker: sync cookies, then **by default** skip Grafana
-    Refresh when charts already render — capture is ``page.screenshot()`` on the long-lived tab (no new browser).
-    """
-    if not _grafana_session_probe_ok(session):
-        grafana_relogin_session(session)
-    _playwright_sync_context_cookies(context, session)
-    if not GRAFANA_PERSISTENT_USER_SKIP_REFRESH:
-        _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
-        return
-    if _grafana_dashboard_has_visual_content(page):
-        logger.info(
-            "persistent user job: charts visible — skip Refresh; PNG = page.screenshot() on warm Grafana tab"
-        )
-        return
-    logger.info("persistent user job: no chart DOM — Refresh/reload before PNG")
-    _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
-
-
-def _send_monitoring_reply_and_alert_copy(
-    chat_id: str,
-    open_id: str,
-    reply: str,
-    http_ex: Optional[Dict[str, Any]],
-    lark_img_key: Optional[str] = None,
-) -> Tuple[bool, bool]:
-    """
-    Send the user-visible summary (text or interactive card, optionally with embedded screenshot).
-
-    Returns ``(sent, embedded_png_in_card)`` — when ``embedded_png_in_card`` is True, do not send a follow-up image message.
-    """
-    sent = False
-    ok_card = False
-    if chat_id:
-        ok_card = _lark_send_monitoring_user_message("chat_id", chat_id, reply, lark_img_key)
-        sent = True
-    elif open_id:
-        ok_card = _lark_send_monitoring_user_message("open_id", open_id, reply, lark_img_key)
-        sent = True
-    if (
-        sent
-        and http_ex
-        and http_ex.get("hit_alert")
-        and MONITORING_ALERT_CHAT_ID
-        and MONITORING_ALERT_CHAT_ID != (chat_id or "").strip()
-    ):
-        try:
-            _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
-        except Exception:
-            logger.exception(
-                "monitoring alert forward failed persistent alert_chat_id=%r",
-                MONITORING_ALERT_CHAT_ID[:24],
-            )
-    embedded = bool(
-        ok_card and MONITORING_MESSAGE_CARD_ENABLE and (lark_img_key or "").strip()
-    )
-    return sent, embedded
-
-
-def _persistent_alert_edge_notify(reply: str, http_ex: Optional[Dict[str, Any]], skip_chat: str) -> None:
-    """告警由 False→True 时额外推送到 ``MONITORING_ALERT_CHAT_ID``（避免每分钟刷屏）。"""
-    global _persistent_prev_hit_alert
-    hit = bool(http_ex and http_ex.get("hit_alert"))
-    if (
-        hit
-        and not _persistent_prev_hit_alert
-        and MONITORING_ALERT_CHAT_ID
-        and MONITORING_ALERT_CHAT_ID != skip_chat
-    ):
-        try:
-            _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
-            logger.info(
-                "persistent daemon: alert edge → MONITORING_ALERT_CHAT_ID prefix=%s",
-                MONITORING_ALERT_CHAT_ID[:16],
-            )
-        except Exception:
-            logger.exception("persistent daemon: alert edge forward failed")
-    _persistent_prev_hit_alert = hit
-
-
-def _persistent_send_png_if_enabled(
-    chat_id: str, open_id: str, page: Any, sent_text: bool, timeout_ms: int
-) -> None:
-    if not sent_text or not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-        return
-    try:
-        _persistent_prepare_dom_before_png(page, timeout_ms)
-        png = _grafana_persistent_page_screenshot_png(page)
-        key = _lark_upload_png_image_key(png)
-        if chat_id:
-            _lark_send_image_message("chat_id", chat_id, key)
-        else:
-            _lark_send_image_message("open_id", open_id, key)
-        logger.info(
-            "persistent: Grafana PNG from **warm tab** (one Chromium process; not _grafana_headless_screenshot_png) bytes=%s",
-            len(png),
-        )
-    except Exception:
-        logger.exception("persistent: screenshot or image send failed (text already sent)")
-
-
-def _persistent_grafana_worker_main() -> None:
-    global _persistent_boot_warm_done
-    global _persistent_prev_hit_alert
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as e:
-        logger.error(
-            "GRAFANA_PERSISTENT_WORKER_ENABLE requires playwright — pip install playwright && playwright install chromium: %s",
-            e,
-        )
-        return
-
-    timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
-    session = grafana_login_session()
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-        ],
-    )
-    context = browser.new_context(
-        viewport={
-            "width": max(400, int(GRAFANA_SCREENSHOT_WIDTH)),
-            "height": max(300, int(GRAFANA_SCREENSHOT_HEIGHT)),
-        },
-        user_agent=(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-        ),
-        locale="en-US",
-    )
-    page = context.new_page()
-    try:
-        page.add_init_script(
-            "try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});}catch(e){}"
-        )
-    except Exception:
-        pass
-
-    try:
-        _persistent_boot_warm_done = False
-        _persistent_ensure_session_and_cookies(session, context, page, timeout_ms, full_renav=True)
-        if not _grafana_dashboard_has_visual_content(page):
-            _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
-        _persistent_worker_ready.set()
-        logger.info(
-            "persistent Grafana worker ready — interval=%ss daemon_chat=%r",
-            MONITORING_DAEMON_INTERVAL_SECONDS,
-            (MONITORING_DAEMON_CHAT_ID[:16] + "…") if len(MONITORING_DAEMON_CHAT_ID) > 16 else MONITORING_DAEMON_CHAT_ID or "(none)",
-        )
-        next_tick = time.monotonic() + float(MONITORING_DAEMON_INTERVAL_SECONDS)
-
-        while not _persistent_shutdown.is_set():
-            slice_end = min(next_tick, time.monotonic() + 1.0)
-            timeout = max(0.05, slice_end - time.monotonic())
-            try:
-                cmd = _persistent_worker_queue.get(timeout=timeout)
-            except queue.Empty:
-                cmd = None
-
-            if isinstance(cmd, dict) and cmd.get("type") == "user":
-                chat_id = str(cmd.get("chat_id") or "")
-                open_id = str(cmd.get("open_id") or "")
-                payload: Optional[Dict[str, Any]] = None
-                http_ex: Optional[Dict[str, Any]] = None
-                try:
-                    _persistent_prepare_user_job_page(session, context, page, timeout_ms)
-                    payload = _fetch_request_total_with_relogin(session)
-                    http_ex = _http_analysis_for_payload(payload)
-                    reply = _format_monitoring_reply(payload)
-                    pre_key: Optional[str] = None
-                    if (
-                        (chat_id or open_id)
-                        and MONITORING_MESSAGE_CARD_ENABLE
-                        and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
-                    ):
-                        try:
-                            _persistent_prepare_dom_before_png(page, timeout_ms)
-                            png0 = _grafana_persistent_page_screenshot_png(page)
-                            pre_key = _lark_upload_png_image_key(png0)
-                        except Exception:
-                            logger.exception(
-                                "persistent worker: pre-screenshot for card embed failed"
-                            )
-                    sent, emb = _send_monitoring_reply_and_alert_copy(
-                        chat_id, open_id, reply, http_ex, lark_img_key=pre_key
-                    )
-                    if sent and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-                        if not emb:
-                            if pre_key:
-                                try:
-                                    if chat_id:
-                                        _lark_send_image_message("chat_id", chat_id, pre_key)
-                                    else:
-                                        _lark_send_image_message("open_id", open_id, pre_key)
-                                except Exception:
-                                    logger.exception(
-                                        "persistent worker: follow-up image after card fallback failed"
-                                    )
-                            else:
-                                _persistent_send_png_if_enabled(
-                                    chat_id, open_id, page, sent, timeout_ms
-                                )
-                    _persistent_prev_hit_alert = bool(http_ex.get("hit_alert"))
-                except Exception:
-                    logger.exception("persistent worker: user /monitoring job failed")
-                    try:
-                        err = "监控数据拉取失败（persistent worker）— 将退回单次登录流程或查看日志"
-                        if chat_id:
-                            _lark_send_text("chat_id", chat_id, err)
-                        elif open_id:
-                            _lark_send_text("open_id", open_id, err)
-                    except Exception:
-                        pass
-
-            if isinstance(cmd, dict) and cmd.get("type") == "screenshot_only":
-                sc_chat = str(cmd.get("chat_id") or "")
-                sc_open = str(cmd.get("open_id") or "")
-                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE") and (sc_chat or sc_open):
-                    try:
-                        _persistent_prepare_dom_before_png(page, timeout_ms)
-                        png = _grafana_persistent_page_screenshot_png(page)
-                        key = _lark_upload_png_image_key(png)
-                        if sc_chat:
-                            _lark_send_image_message("chat_id", sc_chat, key)
-                        else:
-                            _lark_send_image_message("open_id", sc_open, key)
-                        logger.info("persistent screenshot_only sent bytes=%s", len(png))
-                    except Exception:
-                        logger.exception("persistent worker screenshot_only failed")
-
-            if time.monotonic() < next_tick:
-                continue
-
-            next_tick = time.monotonic() + float(MONITORING_DAEMON_INTERVAL_SECONDS)
-            daemon_chat = (MONITORING_DAEMON_CHAT_ID or "").strip()
-            try:
-                _persistent_refresh_or_reload_graph(session, context, page, timeout_ms)
-                payload = _fetch_request_total_with_relogin(session)
-                http_ex = _http_analysis_for_payload(payload)
-                reply = _format_monitoring_reply(payload)
-                if daemon_chat:
-                    pre_key_d: Optional[str] = None
-                    if MONITORING_MESSAGE_CARD_ENABLE and _lark_env_truthy(
-                        "GRAFANA_SCREENSHOT_ENABLE"
-                    ):
-                        try:
-                            _persistent_prepare_dom_before_png(page, timeout_ms)
-                            png_d = _grafana_persistent_page_screenshot_png(page)
-                            pre_key_d = _lark_upload_png_image_key(png_d)
-                        except Exception:
-                            logger.exception(
-                                "persistent daemon: pre-screenshot for card embed failed"
-                            )
-                    sent, emb = _send_monitoring_reply_and_alert_copy(
-                        daemon_chat, "", reply, None, lark_img_key=pre_key_d
-                    )
-                    if sent and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-                        if not emb:
-                            if pre_key_d:
-                                try:
-                                    _lark_send_image_message(
-                                        "chat_id", daemon_chat, pre_key_d
-                                    )
-                                except Exception:
-                                    logger.exception(
-                                        "persistent daemon: follow-up image after card fallback failed"
-                                    )
-                            else:
-                                _persistent_send_png_if_enabled(
-                                    daemon_chat, "", page, sent, timeout_ms
-                                )
-                    _persistent_alert_edge_notify(reply, http_ex, skip_chat=daemon_chat)
-                else:
-                    _persistent_alert_edge_notify(reply, http_ex, skip_chat="")
-            except Exception:
-                logger.exception("persistent worker: daemon tick failed")
-                try:
-                    grafana_relogin_session(session)
-                except Exception:
-                    logger.exception("persistent worker: relogin after tick failure")
-
-    finally:
-        _persistent_worker_ready.clear()
-        try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            playwright.stop()
-        except Exception:
-            pass
-        logger.info("persistent Grafana worker stopped")
-
-
-def _start_persistent_grafana_worker() -> None:
-    global _persistent_worker_thread
-    if _persistent_worker_thread is not None and _persistent_worker_thread.is_alive():
-        return
-    _persistent_shutdown.clear()
-    _persistent_worker_thread = threading.Thread(
-        target=_persistent_grafana_worker_main,
-        name="grafana-persistent",
-        daemon=True,
-    )
-    _persistent_worker_thread.start()
-
-
-def _persistent_enqueue_user_monitoring(chat_id: str, open_id: str, mid: str) -> bool:
-    if not GRAFANA_PERSISTENT_WORKER_ENABLE:
-        return False
-    t = _persistent_worker_thread
-    if t is None or not t.is_alive():
-        return False
-    if not _persistent_worker_ready.wait(timeout=120.0):
-        logger.warning("persistent worker not ready in 120s — cold /monitoring path")
-        return False
-    try:
-        _persistent_worker_queue.put(
-            {"type": "user", "chat_id": chat_id, "open_id": open_id, "mid": mid},
-            timeout=8.0,
-        )
-        return True
-    except queue.Full:
-        logger.warning("persistent worker queue full — cold /monitoring path")
-        return False
-
-
 def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
     """Pick Prometheus rows that correspond to the HTTP series (legend ``http`` / label value ``http``)."""
     for k, v in metric.items():
@@ -2958,39 +1954,11 @@ def _lark_verify_event_token(data: Dict[str, Any]) -> bool:
     return tok == VERIFICATION_TOKEN
 
 
-def _run_monitoring_background_job(
-    chat_id: str, open_id: str, mid: str, dispatch_key: str
-) -> None:
-    """Runs :func:`_monitoring_background_worker` and always clears ``dispatch_key`` from the in-flight set."""
-    try:
-        _monitoring_background_worker(chat_id, open_id, mid)
-    finally:
-        if dispatch_key:
-            with _monitoring_reply_dispatch_lock:
-                _monitoring_inflight_keys.discard(dispatch_key)
-
-
 def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
     """
     Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
     """
     logger.info("monitoring background job start mid=%r chat=%r open=%r", mid, bool(chat_id), bool(open_id))
-    if _persistent_enqueue_user_monitoring(chat_id, open_id, mid):
-        logger.info(
-            "monitoring delegated to persistent Grafana worker mid=%r (PNG will use warm ``page`` if charts visible)",
-            mid,
-        )
-        return
-    if GRAFANA_PERSISTENT_WORKER_ENABLE:
-        logger.warning(
-            "monitoring: persistent worker enabled but job **not** queued (worker not ready in 120s or queue full) — "
-            "using **cold** Chromium path for this request"
-        )
-    else:
-        logger.info(
-            "monitoring: GRAFANA_PERSISTENT_WORKER_ENABLE=0 — using **cold** Chromium per screenshot "
-            "(launch → goto dashboard → close)"
-        )
     grafana_session: Optional[requests.Session] = None
     payload: Optional[Dict[str, Any]] = None
     http_ex: Optional[Dict[str, Any]] = None
@@ -3006,66 +1974,49 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
         payload = None
         http_ex = None
 
-    pre_key: Optional[str] = None
-    if (
-        (chat_id or open_id)
-        and MONITORING_MESSAGE_CARD_ENABLE
-        and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
-        and grafana_session is not None
-        and payload is not None
-    ):
-        w0 = payload.get("window") or {}
-        su0 = int(w0.get("startUnix") or 0)
-        eu0 = int(w0.get("endUnix") or 0)
-        if su0 > 0 and eu0 > 0:
-            try:
-                jar = grafana_session.cookies.get_dict()
-                if "grafana_session" not in jar:
-                    logger.warning(
-                        "monitoring pre-screenshot: no grafana_session cookie — expect login wall in PNG"
-                    )
-                n_cookies = len(_playwright_cookie_list(grafana_session))
-                logger.info(
-                    "monitoring **cold** pre-screenshot for card: cookies=%s window=%s..%s",
-                    n_cookies,
-                    su0,
-                    eu0,
-                )
-                png0 = _grafana_headless_screenshot_png(grafana_session, su0, eu0)
-                pre_key = _lark_upload_png_image_key(png0)
-            except Exception:
-                logger.exception("monitoring pre-screenshot for card embed failed")
-
     sent = False
-    emb = False
     try:
-        sent, emb = _send_monitoring_reply_and_alert_copy(
-            chat_id, open_id, reply, http_ex, lark_img_key=pre_key
-        )
-        if sent and chat_id:
+        if chat_id:
+            _lark_send_text("chat_id", chat_id, reply)
+            sent = True
             logger.info(
-                "monitoring reply sent (background) receive_id_type=chat_id chat_id_prefix=%s... len=%s embedded_png=%s",
+                "monitoring reply sent (background) receive_id_type=chat_id chat_id_prefix=%s... len=%s",
                 chat_id[:16],
                 len(reply),
-                emb,
             )
-        elif sent and open_id:
-            logger.info(
-                "monitoring reply sent (background) receive_id_type=open_id len=%s embedded_png=%s",
-                len(reply),
-                emb,
-            )
+        elif open_id:
+            _lark_send_text("open_id", open_id, reply)
+            sent = True
+            logger.info("monitoring reply sent (background) receive_id_type=open_id len=%s", len(reply))
         else:
             logger.warning(
                 "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
             )
 
+        if (
+            http_ex
+            and http_ex.get("hit_alert")
+            and MONITORING_ALERT_CHAT_ID
+            and MONITORING_ALERT_CHAT_ID != (chat_id or "").strip()
+        ):
+            try:
+                _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
+                logger.info(
+                    "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
+                    MONITORING_ALERT_CHAT_ID[:16],
+                    len(reply),
+                )
+            except Exception:
+                logger.exception(
+                    "monitoring alert forward failed (background) alert_chat_id=%r",
+                    MONITORING_ALERT_CHAT_ID[:24],
+                )
+
+        # 无条件打一行，便于对照 journal：是否读到 ENABLE、是否有 session/payload（缺任一则不会走截图）
         _raw_ss = _cfg_raw("GRAFANA_SCREENSHOT_ENABLE")
         logger.info(
-            "monitoring screenshot gate sent=%s emb=%s pre_key=%s session=%s payload=%s ENABLE_raw=%r ENABLE_truthy=%s",
+            "monitoring screenshot gate sent=%s session=%s payload=%s ENABLE_raw=%r ENABLE_truthy=%s",
             sent,
-            emb,
-            bool(pre_key),
             grafana_session is not None,
             payload is not None,
             _raw_ss,
@@ -3077,31 +2028,12 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
                 logger.info(
                     "monitoring screenshot skipped: set GRAFANA_SCREENSHOT_ENABLE=1 (and install playwright + chromium)"
                 )
-            elif emb:
-                logger.info(
-                    "monitoring: PNG embedded in interactive card — no separate image message"
-                )
-            elif pre_key:
-                try:
-                    if chat_id:
-                        _lark_send_image_message("chat_id", chat_id, pre_key)
-                    else:
-                        _lark_send_image_message("open_id", open_id, pre_key)
-                    logger.info(
-                        "monitoring Grafana screenshot sent (background, card fallback) image_key set"
-                    )
-                except Exception:
-                    logger.exception(
-                        "monitoring Grafana image send failed after card text fallback"
-                    )
             else:
                 w = payload.get("window") or {}
                 su = int(w.get("startUnix") or 0)
                 eu = int(w.get("endUnix") or 0)
                 if su <= 0 or eu <= 0:
-                    logger.warning(
-                        "monitoring screenshot skipped: invalid window start=%s end=%s", su, eu
-                    )
+                    logger.warning("monitoring screenshot skipped: invalid window start=%s end=%s", su, eu)
                 else:
                     try:
                         jar = grafana_session.cookies.get_dict()
@@ -3111,8 +2043,7 @@ def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
                             )
                         n_cookies = len(_playwright_cookie_list(grafana_session))
                         logger.info(
-                            "monitoring **cold** screenshot: ephemeral Chromium via _grafana_headless_screenshot_png "
-                            "cookies=%s window=%s..%s",
+                            "monitoring screenshot start cookies=%s window=%s..%s",
                             n_cookies,
                             su,
                             eu,
@@ -3202,7 +2133,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     event = data.get("event") if isinstance(data.get("event"), dict) else {}
     raw_msg = event.get("message")
     msg = raw_msg if isinstance(raw_msg, dict) else {}
-    mid = _lark_im_message_dedupe_id(msg)
+    mid = _lark_dict_pick_str(msg, "message_id", "messageId")
     mtype = (_lark_dict_pick_str(msg, "message_type", "messageType") or "").lower()
     chat_resolved = _lark_message_chat_id(msg)
     logger.info(
@@ -3250,69 +2181,24 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     chat_id = chat_resolved
     open_id = sender_open
-    sender_debounce = _lark_im_sender_debounce_token(sender, open_id)
 
-    im_event_id = _lark_im_payload_event_id(data)
     logger.info(
-        "monitoring trigger matched — background job mid=%r event_id=%r chat_id=%r open_id_prefix=%r",
+        "monitoring trigger matched — background job mid=%r chat_id=%r open_id_prefix=%r",
         mid,
-        im_event_id or None,
         bool(chat_id),
         (open_id[:12] + "…") if len(open_id) > 12 else open_id,
     )
 
-    debounce_sec = 0.0
-    raw_db = _cfg_raw("MONITORING_IM_DEBOUNCE_SECONDS")
-    if raw_db is not None and str(raw_db).strip() != "":
-        try:
-            debounce_sec = float(raw_db)
-        except (TypeError, ValueError):
-            debounce_sec = 5.0
-    # Use union_id / open_id / user_id so HTTP vs WS envelopes that disagree on open_id still share one debounce key.
-    debounce_key = f"{(chat_id or '').strip()}\n{sender_debounce}\n{(clean or '').strip()[:320]}"
-    now_m = time.monotonic()
     with _monitoring_reply_dispatch_lock:
-        if im_event_id and im_event_id in _processed_lark_im_event_ids:
-            logger.info("duplicate IM event_id=%s — skip (already dispatched)", im_event_id)
-            return
         if mid and mid in _processed_lark_message_ids:
             logger.info("duplicate message_id=%s — skip (already dispatched)", mid)
             return
-        if debounce_key in _monitoring_inflight_keys:
-            logger.info(
-                "monitoring skip — job already **in flight** for this chat/sender/clean (wait for Grafana/Lark to finish)"
-            )
-            return
-        if debounce_sec > 0:
-            prev_t = _monitoring_im_trigger_last.get(debounce_key, 0.0)
-            if now_m - prev_t < debounce_sec:
-                logger.info(
-                    "monitoring debounce skip (%.2fs window) chat=%r open_prefix=%r",
-                    debounce_sec,
-                    bool(chat_id),
-                    (open_id[:10] + "…") if len(open_id) > 10 else open_id,
-                )
-                return
-            _monitoring_im_trigger_last[debounce_key] = now_m
-            if len(_monitoring_im_trigger_last) > 600:
-                for k, _ in sorted(_monitoring_im_trigger_last.items(), key=lambda kv: kv[1])[:220]:
-                    try:
-                        del _monitoring_im_trigger_last[k]
-                    except KeyError:
-                        pass
-                _monitoring_im_trigger_last[debounce_key] = now_m
-        _monitoring_inflight_keys.add(debounce_key)
         if mid:
             _processed_lark_message_ids.add(mid)
-        if im_event_id:
-            _processed_lark_im_event_ids.add(im_event_id)
-            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
-                _processed_lark_im_event_ids.clear()
-                _processed_lark_im_event_ids.add(im_event_id)
 
     threading.Thread(
-        target=_run_monitoring_background_job,
-        args=(chat_id, open_id, mid, debounce_key),
+        target=_monitoring_background_worker,
+        args=(chat_id, open_id, mid),
         daemon=True,
         name="monitoring-reply",
     ).start()
@@ -3363,16 +2249,6 @@ def _on_ws_p2_im_message_receive_v1(data: Any) -> None:
         _process_im_message_event(payload)
     except Exception:
         logger.exception("WebSocket P2ImMessageReceiveV1 handler failed")
-
-
-def _on_ws_p2_card_action_trigger(ce: Any) -> None:
-    """WebSocket delivery for ``card.action.trigger`` / ``card.action.trigger_v1`` (button on monitoring card)."""
-    try:
-        data = _lark_ws_sdk_event_to_dict(ce)
-        data = _lark_normalize_card_callback_envelope(data)
-        _process_card_action_event(data)
-    except Exception:
-        logger.exception("WebSocket card.action handler failed")
 
 
 def _on_ws_im_message_p2_customized(ce: Any) -> None:
@@ -3608,22 +2484,8 @@ def start_lark_ws_client_blocking() -> None:
     bld = (
         EventDispatcherHandler.builder(enc, ver)
         .register_p2_im_message_receive_v1(_on_ws_p2_im_message_receive_v1)
-        .register_p2_customized_event("card.action.trigger", _on_ws_p2_card_action_trigger)
-        .register_p2_customized_event("card.action.trigger_v1", _on_ws_p2_card_action_trigger)
+        .register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
     )
-    if _lark_env_truthy("LARK_WS_REGISTER_IM_MESSAGE_V2"):
-        bld = bld.register_p2_customized_event(
-            "im.message.receive_v2", _on_ws_im_message_p2_customized
-        )
-        logger.info(
-            "LARK_WS_REGISTER_IM_MESSAGE_V2=1 — handling im.message.receive_v2 (if you see duplicate "
-            "replies, set to 0 and rely on receive_v1 only)."
-        )
-    else:
-        logger.info(
-            "LARK_WS_REGISTER_IM_MESSAGE_V2=0 — **not** subscribing to im.message.receive_v2 (avoids duplicate "
-            "v1+v2 delivery for the same user message). Set _CFG / env to 1 if your workspace requires v2."
-        )
     for raw_t in _cfg_str("LARK_WS_EXTRA_IM_TYPES", "").replace(";", ",").split(","):
         t = raw_t.strip()
         if not t:
@@ -3666,16 +2528,10 @@ def start_lark_ws_client_blocking() -> None:
             domain=dnorm,
             auto_reconnect=True,
         )
-        _im_v2_note = (
-            " + p2 im.message.receive_v2 (LARK_WS_REGISTER_IM_MESSAGE_V2=1)"
-            if _lark_env_truthy("LARK_WS_REGISTER_IM_MESSAGE_V2")
-            else ""
-        )
         logger.info(
-            "Lark WebSocket client starting (domain=%s); WS IM handlers: "
-            "p2 im.message.receive_v1 (typed SDK)%s",
+            "Lark WebSocket client starting (domain=%s); WS handlers: "
+            "p2 im.message.receive_v1 (typed SDK) + p2 im.message.receive_v2 (customized)",
             dnorm,
-            _im_v2_note,
         )
         try:
             cli.start()
@@ -3851,34 +2707,14 @@ def webhook_event():
 
     et = _lark_header_event_type(data)
     et_l = (et or "").lower()
-    # Card interactions also require a fast 200; run handler on a worker thread (same pattern as im.message).
+    # Card interactions also require a fast 200; business logic should update the card asynchronously via Open API.
     if et_l.startswith("card.action"):
-        try:
-            pd = copy.deepcopy(data)
-            pd = _lark_normalize_card_callback_envelope(pd)
-
-            def _card_w(ref: Dict[str, Any]) -> None:
-                try:
-                    _process_card_action_event(ref)
-                except Exception:
-                    logger.exception("card.action webhook worker failed")
-
-            threading.Thread(target=_card_w, args=(pd,), daemon=True, name="lark-card-action").start()
-        except Exception:
-            logger.exception("card.action dispatch failed")
         return _lark_feishu_webhook_ack_immediate()
 
     if _lark_ack_only_event_type(et):
         return _lark_feishu_webhook_ack_immediate()
 
     if et in ("im.message.receive_v1", "im.message.receive_v2"):
-        if _lark_skip_http_im_message_when_ws_mode():
-            logger.info(
-                "webhook: skip %s — HTTP IM ignored while LARK_EVENT_MODE=ws "
-                "(duplicate with WebSocket; set LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS=0 to force HTTP IM).",
-                et,
-            )
-            return _lark_feishu_webhook_ack_immediate()
         return _handle_im_message_receive(data)
 
     logger.debug(
@@ -3923,11 +2759,6 @@ def run_monitoring_bot() -> None:
     Process entrypoint: HTTP-only, WebSocket-only, or WS + HTTP sidecar (see module docstring).
     Uses :data:`app`, :data:`logger`, :func:`start_lark_ws_client_blocking` from this module.
     """
-    logger.info(
-        "monitoring bot pid=%s — duplicate replies with correct dedupe logs usually mean **two OS processes** "
-        "(same APP_ID / two systemd units / dev + prod).",
-        os.getpid(),
-    )
     port = _cfg_listen_port(5002)
     if MONITORING_AT_MENTION_ENABLE and not (LARK_BOT_OPEN_ID or "").strip():
         logger.warning(
@@ -3937,29 +2768,6 @@ def run_monitoring_bot() -> None:
         logger.warning(
             "GRAFANA_QUERY_LOOKBACK_SECONDS=%s (default 600 = 10m) — /monitoring Prometheus window is not 10 minutes",
             GRAFANA_QUERY_LOOKBACK_SECONDS,
-        )
-    if GRAFANA_PERSISTENT_WORKER_ENABLE:
-        logger.info(
-            "GRAFANA_PERSISTENT_WORKER_ENABLE=1 — starting daemon interval=%ss daemon_chat=%r "
-            "(set MONITORING_DAEMON_CHAT_ID for per-interval Lark summary + PNG)",
-            MONITORING_DAEMON_INTERVAL_SECONDS,
-            MONITORING_DAEMON_CHAT_ID or "",
-        )
-        if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-            logger.warning(
-                "Persistent worker runs Grafana Refresh in-browser; set GRAFANA_SCREENSHOT_ENABLE=1 so "
-                "/monitoring and daemon broadcasts attach PNGs."
-            )
-        _start_persistent_grafana_worker()
-    logger.info(
-        "MONITORING_MESSAGE_CARD_ENABLE=%s — monitoring user-visible summary uses %s",
-        MONITORING_MESSAGE_CARD_ENABLE,
-        "Feishu interactive card (msg_type=interactive)" if MONITORING_MESSAGE_CARD_ENABLE else "plain text",
-    )
-    if MONITORING_MESSAGE_CARD_ENABLE:
-        logger.info(
-            "Feishu console: subscribe **Card callback interaction** (card.action.trigger) to the same "
-            "Request URL as IM when using HTTP, or rely on WS handlers registered in this app."
         )
     raw_mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower()
     mode = raw_mode if raw_mode else "ws"
