@@ -126,10 +126,12 @@ _CFG: Dict[str, Any] = {
     "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     # 1=当配置 ws 模式但尚未收到任何 WS DATA 帧时，允许 HTTP IM 回退处理（避免 200 但无回复）
     "LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA": "1",
-    # 1=监控摘要用 **一条** 飞书交互卡片（schema 2.0）；截图开启时先上传 image_key **嵌进卡片**，不再跟一条独立图片
+    # 1=监控摘要用 **一条** 飞书交互卡片
     "MONITORING_MESSAGE_CARD_ENABLE": "1",
+    # 1=把截图嵌进卡片；0=卡片仅文字，截图在下一条消息单独发送
+    "MONITORING_CARD_EMBED_SCREENSHOT": "0",
     # 1=在监控卡片底部展示按钮（Open Grafana）
-    "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
+    "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "0",
     "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Open Grafana",
     # 留空则自动使用 GRAFANA_BASE_URL + GRAFANA_DASHBOARD_PATH + from/to
     "MONITORING_MESSAGE_CARD_BUTTON_URL": "",
@@ -1375,17 +1377,10 @@ def _monitoring_interactive_card_dict(
     receive_id: str,
     lark_img_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Feishu interactive card payload for ``im/v1/messages``.
-    Use the broadly compatible ``header + elements`` shape (OpenAPI samples), which is less picky
-    than ``schema=2.0 + body`` on some tenants.
-    """
+    """Feishu card JSON v2 — markdown card, optional embedded PNG."""
     title = f"📊 【{GRAFANA_PANEL_TITLE}】graph"
     elements: List[Dict[str, Any]] = [
-        {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": _monitoring_card_body_md_strip_title(reply)},
-        },
+        {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
     ]
     ik = (lark_img_key or "").strip()
     if ik:
@@ -1396,30 +1391,15 @@ def _monitoring_interactive_card_dict(
                 "alt": {"tag": "plain_text", "content": "Grafana"},
             }
         )
-    if _lark_env_truthy("MONITORING_MESSAGE_CARD_BUTTON_ENABLE"):
-        elements.append(
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "type": "primary",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": _cfg_str("MONITORING_MESSAGE_CARD_BUTTON_TEXT", "Open Grafana")[:40],
-                        },
-                        "url": _monitoring_card_button_url(),
-                    }
-                ],
-            }
-        )
     return {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
         "header": {
             "template": "blue",
             "title": {"tag": "plain_text", "content": title[:190]},
+            "subtitle": {"tag": "plain_text", "content": "Grafana · monitoring"},
         },
-        "elements": elements,
+        "body": {"elements": elements},
     }
 
 
@@ -2374,6 +2354,7 @@ def _monitoring_background_worker(
             if (
                 (chat_id or open_id)
                 and MONITORING_MESSAGE_CARD_ENABLE
+                and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
                 and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
                 and grafana_session is not None
                 and payload is not None
@@ -2391,7 +2372,7 @@ def _monitoring_background_worker(
 
             if chat_id:
                 used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
-                    "chat_id", chat_id, reply, pre_key
+                    "chat_id", chat_id, reply, pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None
                 )
                 sent = True
                 user_visible_send_ok = True
@@ -2404,7 +2385,7 @@ def _monitoring_background_worker(
                 )
             elif open_id:
                 used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
-                    "open_id", open_id, reply, pre_key
+                    "open_id", open_id, reply, pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None
                 )
                 sent = True
                 user_visible_send_ok = True
@@ -2457,17 +2438,10 @@ def _monitoring_background_worker(
                     logger.info(
                         "monitoring screenshot skipped: set GRAFANA_SCREENSHOT_ENABLE=1 (and install playwright + chromium)"
                     )
-                elif used_interactive_card:
-                    if embedded_png_in_card:
-                        logger.info(
-                            "monitoring: Grafana PNG embedded in interactive card — no separate image message"
-                        )
-                    else:
-                        logger.info(
-                            "monitoring: interactive card sent without embedded PNG — **not** sending a follow-up "
-                            "image (that was causing two chat bubbles). Set MONITORING_MESSAGE_CARD_ENABLE=0 for "
-                            "plain text + separate image."
-                        )
+                elif used_interactive_card and embedded_png_in_card:
+                    logger.info(
+                        "monitoring: Grafana PNG embedded in interactive card — no separate image message"
+                    )
                 elif pre_key:
                     try:
                         if chat_id:
