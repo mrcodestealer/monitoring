@@ -116,6 +116,8 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_REGISTER_IM_MESSAGE_V2": "0",
     # 同一 chat+发送者+触发正文在 N 秒内只跑一次监控任务；0=关闭（默认 5）
     "MONITORING_IM_DEBOUNCE_SECONDS": "5",
+    # 同一会话在 N 秒内仅接受一次 monitoring 触发（在启动后台线程前兜底，拦同秒双 envelope）
+    "MONITORING_CHAT_TRIGGER_DEBOUNCE_SECONDS": "8",
     # 同一触发在 N 秒内只允许 **一次** 真正发到飞书（拦双 POST / 双进程竞态）；0=关闭（默认 12）
     "MONITORING_SEND_COALESCE_SECONDS": "12",
     # 同一会话(chat_id/open_id)在 N 秒内只允许一次用户可见发送（兜底拦截同秒双 envelope）；0=关闭
@@ -301,6 +303,7 @@ _processed_lark_message_ids: set = set()
 _PROCESSED_LARK_IDS_CAP = 4000
 _monitoring_reply_dispatch_lock = threading.Lock()
 _monitoring_im_trigger_last: Dict[str, float] = {}
+_monitoring_chat_trigger_last: Dict[str, float] = {}
 _monitoring_inflight_keys: set = set()
 _processed_lark_im_event_ids: set = set()
 _PROCESSED_IM_EVENT_IDS_CAP = 4000
@@ -2620,8 +2623,19 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     # Some duplicated Feishu deliveries for the same human message can differ in sender/message envelope fields.
     # Keep debounce/send key stable on chat + normalized command body only, so variants collapse into one worker.
     debounce_key = f"{(chat_id or '').strip()}\n{body_key}"
+    chat_gate_key = (chat_id or "").strip() or (f"open:{(open_id or '').strip()}" if (open_id or "").strip() else "")
+    chat_gate_sec = _cfg_float("MONITORING_CHAT_TRIGGER_DEBOUNCE_SECONDS", 8.0)
     now_m = time.monotonic()
     with _monitoring_reply_dispatch_lock:
+        if chat_gate_key and chat_gate_sec > 0:
+            prev_chat = _monitoring_chat_trigger_last.get(chat_gate_key, 0.0)
+            if prev_chat > 0.0 and (now_m - prev_chat) < chat_gate_sec:
+                logger.info(
+                    "monitoring chat-trigger debounce skip (%.2fs) key=%r",
+                    chat_gate_sec,
+                    chat_gate_key[:96],
+                )
+                return
         if im_event_id and im_event_id in _processed_lark_im_event_ids:
             logger.info("duplicate IM event_id=%s — skip", im_event_id)
             return
@@ -2648,6 +2662,15 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                     except KeyError:
                         pass
                 _monitoring_im_trigger_last[debounce_key] = now_m
+        if chat_gate_key and chat_gate_sec > 0:
+            _monitoring_chat_trigger_last[chat_gate_key] = now_m
+            if len(_monitoring_chat_trigger_last) > 600:
+                for k, _ in sorted(_monitoring_chat_trigger_last.items(), key=lambda kv: kv[1])[:220]:
+                    try:
+                        del _monitoring_chat_trigger_last[k]
+                    except KeyError:
+                        pass
+                _monitoring_chat_trigger_last[chat_gate_key] = now_m
         _monitoring_inflight_keys.add(debounce_key)
         if processed_stick:
             _processed_lark_message_ids.add(processed_stick)
