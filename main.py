@@ -19,9 +19,11 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
 群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（最近 10 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``now-10m`` 一致）。
+默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
+
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
 
-可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：在文字后追加无头 Chromium 截图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
+可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：与卡片同开时先截一张上传为 ``image_key`` 嵌入卡片；仅关卡片时仍为无头 Chromium 截图后单独发图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
 默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` 截整页滚动区域（长 dashboard 全部图表）；设为 ``0`` 则仅视口大小（易只拍到上半屏）。
 多轮滚动 + Spinner 轮询见 ``GRAFANA_SCREENSHOT_STABILIZE_ROUNDS`` 等键；Prometheus 无数据/报错的格子无法被脚本「画出曲线」。
 """
@@ -118,6 +120,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_SEND_COALESCE_SECONDS": "12",
     # 1=且 LARK_EVENT_MODE=ws 时忽略 HTTP webhook 上的 im.message（避免与长连接重复处理）
     "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
+    # 1=监控摘要用 **一条** 飞书交互卡片（schema 2.0）；截图开启时先上传 image_key **嵌进卡片**，不再跟一条独立图片
+    "MONITORING_MESSAGE_CARD_ENABLE": "1",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -380,6 +384,7 @@ LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
 MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
+MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
 
 # 群聊里富媒体等类型仍可能带可解析文本；仅跳过明显无 /monitoring 的类型。
 _SKIP_IM_MESSAGE_TYPES = frozenset(
@@ -1232,6 +1237,107 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
         raise RuntimeError(
             f"Lark image send failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
         )
+
+
+def _monitoring_reply_to_card_md(reply: str) -> str:
+    s = (reply or "")[:3800]
+    s = s.replace("```", "'''")
+    if len(reply or "") > 3800:
+        s += "\n\n…(truncated)"
+    return s
+
+
+def _monitoring_card_body_md_strip_title(reply: str) -> str:
+    r = (reply or "").strip()
+    dup = f"【{GRAFANA_PANEL_TITLE}】graph"
+    if r.startswith(dup):
+        r = r[len(dup) :].lstrip("\n")
+    return _monitoring_reply_to_card_md(r)
+
+
+def _monitoring_interactive_card_dict(
+    reply: str,
+    receive_id_type: str,
+    receive_id: str,
+    lark_img_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Feishu card JSON v2 — one ``msg_type=interactive`` message (markdown + optional embedded PNG)."""
+    title = f"📊 【{GRAFANA_PANEL_TITLE}】graph"
+    elements: List[Dict[str, Any]] = [
+        {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
+    ]
+    ik = (lark_img_key or "").strip()
+    if ik:
+        elements.append(
+            {
+                "tag": "img",
+                "img_key": ik,
+                "alt": {"tag": "plain_text", "content": "Grafana"},
+                "preview": True,
+                "transparent": False,
+            }
+        )
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": title[:190]},
+            "subtitle": {"tag": "plain_text", "content": "Grafana · monitoring"},
+        },
+        "body": {"elements": elements},
+    }
+
+
+def _lark_send_interactive_card(receive_id_type: str, receive_id: str, card: Dict[str, Any]) -> None:
+    """Send ``msg_type=interactive`` via HTTP ``im/v1/messages`` (reliable JSON encoding)."""
+    tok = _lark_tenant_access_token_string()
+    url = f"{_lark_api_domain()}/open-apis/im/v1/messages"
+    content_str = json.dumps(card, ensure_ascii=False)
+    payload = {"receive_id": receive_id, "msg_type": "interactive", "content": content_str}
+    r = requests.post(
+        url,
+        params={"receive_id_type": receive_id_type},
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        json=payload,
+        timeout=60,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if int(j.get("code", -1)) != 0:
+        raise RuntimeError(f"im/v1/messages interactive failed: {j}")
+
+
+def _lark_send_monitoring_user_message(
+    receive_id_type: str,
+    receive_id: str,
+    reply: str,
+    lark_img_key: Optional[str] = None,
+) -> Tuple[bool, bool]:
+    """
+    Send monitoring summary to the user: interactive card (optional embedded PNG) or plain text.
+
+    Returns ``(sent_interactive_card_ok, embedded_png_in_card)``.
+    """
+    rid = (receive_id or "").strip()
+    if not rid:
+        raise ValueError("empty receive_id for monitoring message")
+    if MONITORING_MESSAGE_CARD_ENABLE:
+        try:
+            card = _monitoring_interactive_card_dict(reply, receive_id_type, rid, lark_img_key)
+            _lark_send_interactive_card(receive_id_type, rid, card)
+            return True, bool((lark_img_key or "").strip())
+        except Exception as e:
+            logger.warning(
+                "monitoring interactive card failed (%s) — fallback to plain text; "
+                "check app permission「发送消息卡片」.",
+                e,
+            )
+    _lark_send_text(receive_id_type, rid, reply)
+    return False, False
 
 
 # Playwright ``wait_for_function`` / ``evaluate``: true when dashboard body looks mounted (not only header).
@@ -2111,22 +2217,52 @@ def _monitoring_background_worker(
             http_ex = None
 
         sent = False
+        used_interactive_card = False
+        embedded_png_in_card = False
         try:
+            pre_key: Optional[str] = None
+            if (
+                (chat_id or open_id)
+                and MONITORING_MESSAGE_CARD_ENABLE
+                and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
+                and grafana_session is not None
+                and payload is not None
+            ):
+                w0 = payload.get("window") or {}
+                su0 = int(w0.get("startUnix") or 0)
+                eu0 = int(w0.get("endUnix") or 0)
+                if su0 > 0 and eu0 > 0:
+                    try:
+                        pre_key = _lark_upload_png_image_key(
+                            _grafana_headless_screenshot_png(grafana_session, su0, eu0)
+                        )
+                    except Exception:
+                        logger.exception("monitoring pre-screenshot for interactive card failed")
+
             if chat_id:
-                _lark_send_text("chat_id", chat_id, reply)
+                used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
+                    "chat_id", chat_id, reply, pre_key
+                )
                 sent = True
                 user_visible_send_ok = True
                 logger.info(
-                    "monitoring reply sent (background) receive_id_type=chat_id chat_id_prefix=%s... len=%s",
+                    "monitoring reply sent (background) chat_id_prefix=%s... len=%s card=%s embedded_png=%s",
                     chat_id[:16],
                     len(reply),
+                    used_interactive_card,
+                    embedded_png_in_card,
                 )
             elif open_id:
-                _lark_send_text("open_id", open_id, reply)
+                used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
+                    "open_id", open_id, reply, pre_key
+                )
                 sent = True
                 user_visible_send_ok = True
                 logger.info(
-                    "monitoring reply sent (background) receive_id_type=open_id len=%s", len(reply)
+                    "monitoring reply sent (background) open_id len=%s card=%s embedded_png=%s",
+                    len(reply),
+                    used_interactive_card,
+                    embedded_png_in_card,
                 )
             else:
                 logger.warning(
@@ -2167,6 +2303,23 @@ def _monitoring_background_worker(
                     logger.info(
                         "monitoring screenshot skipped: set GRAFANA_SCREENSHOT_ENABLE=1 (and install playwright + chromium)"
                     )
+                elif embedded_png_in_card and MONITORING_MESSAGE_CARD_ENABLE:
+                    logger.info(
+                        "monitoring: Grafana PNG embedded in interactive card — no separate image message"
+                    )
+                elif pre_key:
+                    try:
+                        if chat_id:
+                            _lark_send_image_message("chat_id", chat_id, pre_key)
+                        else:
+                            _lark_send_image_message("open_id", open_id, pre_key)
+                        logger.info(
+                            "monitoring Grafana screenshot sent (fallback image after text/card) pre_key set"
+                        )
+                    except Exception:
+                        logger.exception(
+                            "monitoring follow-up image send failed (card may have been plain text)"
+                        )
                 else:
                     w = payload.get("window") or {}
                     su = int(w.get("startUnix") or 0)
