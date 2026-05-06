@@ -117,6 +117,12 @@ _CFG: Dict[str, Any] = {
     # 常驻 tab 截图：默认 0ms settle + **视口** PNG（全页滚动很慢，易占满数秒）；需要长图再设 FULL_PAGE=1
     "GRAFANA_PERSISTENT_SCREENSHOT_SETTLE_MS": 0,
     "GRAFANA_PERSISTENT_SCREENSHOT_FULL_PAGE": "0",
+    # 1=截 PNG 前滚动 + 等 Spinner + stabilize（显著减少「黑块未画完」；略增耗时）。0=最快但易空白
+    "GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_BEFORE_CAPTURE": "1",
+    # prepare 时 stabilize 轮数（1–4）；黑块仍多可试 3
+    "GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_ROUNDS": 2,
+    # prepare 阶段等 loading-like 消失的最长毫秒
+    "GRAFANA_PERSISTENT_SCREENSHOT_PREPNG_SPINNER_MS": 3500,
     # 面板多个 Prometheus target 时并行 query_range（同 cookie 只读，安全）
     "GRAFANA_QUERY_PARALLEL_TARGETS": "1",
     # 缓存 /api/dashboards/uid JSON，减轻每次拉数前的 RTT（0=关闭）
@@ -1783,6 +1789,28 @@ def _playwright_sync_context_cookies(context: Any, session: requests.Session) ->
         context.add_cookies(jar)
 
 
+def _persistent_prepare_dom_before_png(page: Any, timeout_ms: int) -> None:
+    """
+    Warm-tab capture often shows black KPI tiles if we shoot before uPlot/canvas mount.
+    Optional scroll + spinner wait + :func:`_grafana_stabilize_dashboard_render` (see ``GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_*``).
+    """
+    if not _lark_env_truthy("GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_BEFORE_CAPTURE"):
+        return
+    rounds = max(1, min(4, _cfg_int("GRAFANA_PERSISTENT_SCREENSHOT_PREPARE_ROUNDS", 2)))
+    spin = max(600, min(15000, _cfg_int("GRAFANA_PERSISTENT_SCREENSHOT_PREPNG_SPINNER_MS", 3500)))
+    try:
+        _grafana_scroll_paint_lazy_panels(page)
+        _grafana_wait_loading_like_gone(page, spin)
+        _grafana_stabilize_dashboard_render(page, timeout_ms, rounds=rounds)
+        logger.info(
+            "persistent PNG prepare: rounds=%s spinner_budget_ms=%s (reduce black panels)",
+            rounds,
+            spin,
+        )
+    except Exception as e:
+        logger.warning("persistent PNG prepare skipped after error: %s", e)
+
+
 def _grafana_persistent_page_screenshot_png(page: Any) -> bytes:
     """
     Screenshot the **already open** Grafana tab. ``GRAFANA_PERSISTENT_SCREENSHOT_SETTLE_MS`` defaults **0**.
@@ -1935,11 +1963,12 @@ def _persistent_alert_edge_notify(reply: str, http_ex: Optional[Dict[str, Any]],
 
 
 def _persistent_send_png_if_enabled(
-    chat_id: str, open_id: str, page: Any, sent_text: bool
+    chat_id: str, open_id: str, page: Any, sent_text: bool, timeout_ms: int
 ) -> None:
     if not sent_text or not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
         return
     try:
+        _persistent_prepare_dom_before_png(page, timeout_ms)
         png = _grafana_persistent_page_screenshot_png(page)
         key = _lark_upload_png_image_key(png)
         if chat_id:
@@ -2028,7 +2057,7 @@ def _persistent_grafana_worker_main() -> None:
                     http_ex = _http_analysis_for_payload(payload)
                     reply = _format_monitoring_reply(payload)
                     sent = _send_monitoring_reply_and_alert_copy(chat_id, open_id, reply, http_ex)
-                    _persistent_send_png_if_enabled(chat_id, open_id, page, sent)
+                    _persistent_send_png_if_enabled(chat_id, open_id, page, sent, timeout_ms)
                     _persistent_prev_hit_alert = bool(http_ex.get("hit_alert"))
                 except Exception:
                     logger.exception("persistent worker: user /monitoring job failed")
@@ -2053,7 +2082,7 @@ def _persistent_grafana_worker_main() -> None:
                 reply = _format_monitoring_reply(payload)
                 if daemon_chat:
                     sent = _send_monitoring_reply_and_alert_copy(daemon_chat, "", reply, None)
-                    _persistent_send_png_if_enabled(daemon_chat, "", page, sent)
+                    _persistent_send_png_if_enabled(daemon_chat, "", page, sent, timeout_ms)
                     _persistent_alert_edge_notify(reply, http_ex, skip_chat=daemon_chat)
                 else:
                     _persistent_alert_edge_notify(reply, http_ex, skip_chat="")
