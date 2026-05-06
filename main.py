@@ -16,7 +16,7 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
 群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（最近 10 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``now-10m`` 一致）。
-可选 ``MONITORING_MESSAGE_CARD_ENABLE=1``：摘要用飞书 **交互卡片** +「重新截图」按钮（需订阅 ``card.action.trigger``）。
+默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：摘要用飞书 **交互卡片** +「重新截图」按钮（需订阅 ``card.action.trigger``）；设 ``0`` 则纯文本。
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
 
 可选 ``GRAFANA_PERSISTENT_WORKER_ENABLE=1``：**单线程常驻** Playwright + Grafana 页，每分钟 Refresh / 必要时 reload，Prometheus 读数与告警；``/monitoring`` 走热页截图（少重复登录）。见 ``MONITORING_DAEMON_*``。
@@ -143,7 +143,7 @@ _CFG: Dict[str, Any] = {
     "TARGET_USER_OPEN_ID": "",
     "MONITORING_HTTP_DROP_ALERT_PCT": 10,
     # 1=监控摘要用 **交互卡片**（含「重新截图」按钮）；0=纯文本。需在飞书后台订阅「卡片回传交互」card.action.trigger（HTTP 或 WS 已注册）
-    "MONITORING_MESSAGE_CARD_ENABLE": "0",
+    "MONITORING_MESSAGE_CARD_ENABLE": "1",
 }
 
 
@@ -1414,15 +1414,13 @@ def _monitoring_interactive_card_dict(reply: str, receive_id_type: str, receive_
         "schema": "2.0",
         "config": {"update_multi": True, "wide_screen_mode": True},
         "header": {
-            "template": "turquoise",
+            "template": "blue",
             "title": {"tag": "plain_text", "content": "Grafana /monitoring"},
         },
         "body": {
             "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": _monitoring_reply_to_card_md(reply)},
-                },
+                # 使用官方 markdown 块（div+lark_md 在部分租户下发会降级或校验失败）
+                {"tag": "markdown", "content": _monitoring_reply_to_card_md(reply)},
                 {
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": "重新截图"},
@@ -1466,9 +1464,21 @@ def _lark_send_monitoring_user_message(receive_id_type: str, receive_id: str, re
     if not rid:
         raise ValueError("empty receive_id for monitoring message")
     if MONITORING_MESSAGE_CARD_ENABLE:
-        card = _monitoring_interactive_card_dict(reply, receive_id_type, rid)
-        _lark_send_interactive_card(receive_id_type, rid, card)
-        return
+        try:
+            card = _monitoring_interactive_card_dict(reply, receive_id_type, rid)
+            _lark_send_interactive_card(receive_id_type, rid, card)
+            logger.info(
+                "monitoring reply sent as **interactive card** (msg_type=interactive) rt=%s len=%s",
+                receive_id_type,
+                len(reply),
+            )
+            return
+        except Exception as e:
+            logger.warning(
+                "monitoring interactive card failed (%s) — falling back to plain text; "
+                "check app permission「发送消息卡片」and card JSON / Feishu logs.",
+                e,
+            )
     _lark_send_text(receive_id_type, rid, reply)
 
 
@@ -3635,10 +3645,15 @@ def run_monitoring_bot() -> None:
                 "/monitoring and daemon broadcasts attach PNGs."
             )
         _start_persistent_grafana_worker()
+    logger.info(
+        "MONITORING_MESSAGE_CARD_ENABLE=%s — monitoring user-visible summary uses %s",
+        MONITORING_MESSAGE_CARD_ENABLE,
+        "Feishu interactive card (msg_type=interactive)" if MONITORING_MESSAGE_CARD_ENABLE else "plain text",
+    )
     if MONITORING_MESSAGE_CARD_ENABLE:
         logger.info(
-            "MONITORING_MESSAGE_CARD_ENABLE=1 — Feishu console: subscribe **Card callback interaction** "
-            "(card.action.trigger) to the same Request URL as IM (HTTP) or use WS (registered in this app)."
+            "Feishu console: subscribe **Card callback interaction** (card.action.trigger) to the same "
+            "Request URL as IM when using HTTP, or rely on WS handlers registered in this app."
         )
     raw_mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower()
     mode = raw_mode if raw_mode else "ws"
