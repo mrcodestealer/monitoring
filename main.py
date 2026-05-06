@@ -37,6 +37,7 @@ import re
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import warnings
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
@@ -113,6 +114,13 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DAEMON_CHAT_ID": "",
     # 1=/monitoring 排队任务：已有图表则 **不点 Refresh**，直接 ``page.screenshot``（真正「已在 Grafana 里」快照）；0=每次用户请求都先 Refresh 再截
     "GRAFANA_PERSISTENT_USER_SKIP_REFRESH": "1",
+    # 常驻 tab 截图：默认 0ms settle + **视口** PNG（全页滚动很慢，易占满数秒）；需要长图再设 FULL_PAGE=1
+    "GRAFANA_PERSISTENT_SCREENSHOT_SETTLE_MS": 0,
+    "GRAFANA_PERSISTENT_SCREENSHOT_FULL_PAGE": "0",
+    # 面板多个 Prometheus target 时并行 query_range（同 cookie 只读，安全）
+    "GRAFANA_QUERY_PARALLEL_TARGETS": "1",
+    # 缓存 /api/dashboards/uid JSON，减轻每次拉数前的 RTT（0=关闭）
+    "GRAFANA_DASHBOARD_MODEL_CACHE_SECONDS": 120,
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -300,6 +308,10 @@ _persistent_worker_ready = threading.Event()
 _persistent_shutdown = threading.Event()
 _persistent_prev_hit_alert = False
 _persistent_boot_warm_done = False
+_dash_model_cache_lock = threading.Lock()
+_dash_model_cache_uid: str = ""
+_dash_model_cache_body: Optional[Dict[str, Any]] = None
+_dash_model_cache_ts: float = 0.0
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
@@ -977,8 +989,30 @@ def _fetch_dashboard_model(session: requests.Session, uid: str) -> Dict[str, Any
     return r.json().get("dashboard") or {}
 
 
-def _prometheus_query_range(
-    session: requests.Session,
+def _fetch_dashboard_model_cached(session: requests.Session, uid: str) -> Dict[str, Any]:
+    """Short-TTL cache for dashboard JSON to skip an HTTP round-trip on every ``/monitoring``."""
+    global _dash_model_cache_uid, _dash_model_cache_body, _dash_model_cache_ts
+    ttl = max(0, min(3600, _cfg_int("GRAFANA_DASHBOARD_MODEL_CACHE_SECONDS", 120)))
+    if ttl <= 0:
+        return _fetch_dashboard_model(session, uid)
+    now = time.time()
+    with _dash_model_cache_lock:
+        if (
+            _dash_model_cache_body is not None
+            and _dash_model_cache_uid == uid
+            and now - _dash_model_cache_ts < float(ttl)
+        ):
+            return _dash_model_cache_body
+    body = _fetch_dashboard_model(session, uid)
+    with _dash_model_cache_lock:
+        _dash_model_cache_uid = uid
+        _dash_model_cache_body = body
+        _dash_model_cache_ts = time.time()
+    return body
+
+
+def _prometheus_query_range_with_cookies(
+    cookie_jar: Dict[str, str],
     datasource_uid: str,
     expr: str,
     start_unix: int,
@@ -992,9 +1026,22 @@ def _prometheus_query_range(
         "end": str(end_unix),
         "step": str(step),
     }
-    r = session.get(base, params=params, timeout=120)
+    r = requests.get(base, params=params, cookies=cookie_jar, timeout=120)
     r.raise_for_status()
     return r.json()
+
+
+def _prometheus_query_range(
+    session: requests.Session,
+    datasource_uid: str,
+    expr: str,
+    start_unix: int,
+    end_unix: int,
+    step: int,
+) -> Dict[str, Any]:
+    return _prometheus_query_range_with_cookies(
+        dict(session.cookies), datasource_uid, expr, start_unix, end_unix, step
+    )
 
 
 def fetch_request_total_1m_series(session: Optional[requests.Session] = None) -> Dict[str, Any]:
@@ -1004,18 +1051,20 @@ def fetch_request_total_1m_series(session: Optional[requests.Session] = None) ->
     ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
     avoiding incomplete recent-minute series that look like a false drop.
     Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
+    Multiple panel targets are queried **in parallel** when ``GRAFANA_QUERY_PARALLEL_TARGETS=1``.
     """
+    t0 = time.perf_counter()
     lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
     end = int(time.time()) - lag
     start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
     sess = session or grafana_login_session()
-    dash = _fetch_dashboard_model(sess, GRAFANA_DASHBOARD_UID)
+    dash = _fetch_dashboard_model_cached(sess, GRAFANA_DASHBOARD_UID)
     panel = _find_panel(dash, GRAFANA_PANEL_TITLE)
     if not panel:
         raise ValueError(f'Panel titled "{GRAFANA_PANEL_TITLE}" not found on dashboard {GRAFANA_DASHBOARD_UID}')
 
     panel_ds = _datasource_uid(panel.get("datasource"))
-    series_out: List[Dict[str, Any]] = []
+    work: List[Tuple[Any, str, str]] = []
     for t in panel.get("targets") or []:
         expr = (t.get("expr") or "").strip()
         if not expr:
@@ -1024,19 +1073,42 @@ def fetch_request_total_1m_series(session: Optional[requests.Session] = None) ->
         if not ds_uid:
             logger.warning("skip target without datasource uid: %s", t.get("refId"))
             continue
-        raw = _prometheus_query_range(sess, ds_uid, expr, start, end, GRAFANA_QUERY_STEP)
-        series_out.append(
-            {
-                "refId": t.get("refId"),
-                "legendFormat": t.get("legendFormat"),
-                "expr": expr,
-                "datasourceUid": ds_uid,
-                "prometheus": raw,
-            }
-        )
+        work.append((t, ds_uid, expr))
 
-    if not series_out:
+    series_out: List[Dict[str, Any]] = []
+    if not work:
         raise ValueError("No Prometheus expr targets on panel (check panel JSON / datasource)")
+
+    jar = dict(sess.cookies)
+    step = int(GRAFANA_QUERY_STEP)
+
+    def _one_target(row: Tuple[Any, str, str]) -> Dict[str, Any]:
+        t, ds_uid, expr = row
+        raw = _prometheus_query_range_with_cookies(jar, ds_uid, expr, start, end, step)
+        return {
+            "refId": t.get("refId"),
+            "legendFormat": t.get("legendFormat"),
+            "expr": expr,
+            "datasourceUid": ds_uid,
+            "prometheus": raw,
+        }
+
+    if len(work) > 1 and _lark_env_truthy("GRAFANA_QUERY_PARALLEL_TARGETS"):
+        n_workers = min(8, len(work))
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            series_out = list(pool.map(_one_target, work))
+    else:
+        for row in work:
+            series_out.append(_one_target(row))
+
+    elapsed = time.perf_counter() - t0
+    if elapsed > 1.5:
+        logger.info(
+            "fetch_request_total_1m_series targets=%s parallel=%s elapsed=%.2fs",
+            len(series_out),
+            len(work) > 1 and _lark_env_truthy("GRAFANA_QUERY_PARALLEL_TARGETS"),
+            elapsed,
+        )
 
     return {
         "panelTitle": GRAFANA_PANEL_TITLE,
@@ -1712,10 +1784,20 @@ def _playwright_sync_context_cookies(context: Any, session: requests.Session) ->
 
 
 def _grafana_persistent_page_screenshot_png(page: Any) -> bytes:
-    if int(GRAFANA_SCREENSHOT_SETTLE_MS) > 0:
-        page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
+    """
+    Screenshot the **already open** Grafana tab. ``GRAFANA_PERSISTENT_SCREENSHOT_SETTLE_MS`` defaults **0**.
+    ``GRAFANA_PERSISTENT_SCREENSHOT_FULL_PAGE`` unset → inherit ``GRAFANA_SCREENSHOT_FULL_PAGE``; in ``_CFG``
+    default **0** (viewport) because full-page capture scrolls the whole dashboard and often costs **several seconds**.
+    """
+    settle = max(0, min(8000, _cfg_int("GRAFANA_PERSISTENT_SCREENSHOT_SETTLE_MS", 0)))
+    if settle > 0:
+        page.wait_for_timeout(settle)
     _grafana_close_open_menus(page)
-    full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
+    raw_fp = _cfg_raw("GRAFANA_PERSISTENT_SCREENSHOT_FULL_PAGE")
+    if raw_fp is None or (isinstance(raw_fp, str) and not str(raw_fp).strip()):
+        full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
+    else:
+        full_page = str(raw_fp).strip().lower() in ("1", "true", "yes", "on")
     return page.screenshot(type="png", full_page=full_page)
 
 
