@@ -1737,7 +1737,7 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
         pass
 
     def _click_dock_js() -> bool:
-        """Grafana/React 有时拦截 Playwright 合成点击；用 DOM 内原生事件 + HTMLElement.click。"""
+        """Grafana/React 有时拦截 Playwright 合成点击；DOM 内连续两次完整 click（等同双击）。"""
         try:
             r = page.evaluate(
                 """() => {
@@ -1755,19 +1755,26 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
                   try { dock.focus({ preventScroll: true }); } catch (e) {}
                   const v = window;
                   const o = { bubbles: true, cancelable: true, view: v };
-                  dock.dispatchEvent(new MouseEvent('pointerover', o));
-                  dock.dispatchEvent(new MouseEvent('mouseover', o));
-                  dock.dispatchEvent(new MouseEvent('pointerdown', o));
-                  dock.dispatchEvent(new MouseEvent('mousedown', o));
-                  dock.dispatchEvent(new MouseEvent('pointerup', o));
-                  dock.dispatchEvent(new MouseEvent('mouseup', o));
-                  dock.dispatchEvent(new MouseEvent('click', o));
-                  if (typeof dock.click === 'function') dock.click();
+                  const fireOnce = () => {
+                    dock.dispatchEvent(new MouseEvent('pointerover', o));
+                    dock.dispatchEvent(new MouseEvent('mouseover', o));
+                    dock.dispatchEvent(new MouseEvent('pointerdown', o));
+                    dock.dispatchEvent(new MouseEvent('mousedown', o));
+                    dock.dispatchEvent(new MouseEvent('pointerup', o));
+                    dock.dispatchEvent(new MouseEvent('mouseup', o));
+                    dock.dispatchEvent(new MouseEvent('click', o));
+                    if (typeof dock.click === 'function') dock.click();
+                  };
+                  fireOnce();
+                  fireOnce();
+                  try { dock.dispatchEvent(new MouseEvent('dblclick', o)); } catch (e2) {}
                   return 'ok';
                 }"""
             )
             if r == "ok":
-                logger.info("Grafana screenshot: Dock menu fired via in-page JS (DOM events + .click())")
+                logger.info(
+                    "Grafana screenshot: Dock menu fired via in-page JS (double: two click cycles + dblclick)"
+                )
                 return True
         except Exception as ex:
             logger.info("Grafana screenshot: Dock JS click failed: %s", ex)
@@ -1814,19 +1821,24 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
                 except Exception:
                     pass
                 try:
-                    loc.click(timeout=6000, force=True, delay=40)
+                    try:
+                        loc.click(timeout=6000, force=True, delay=50, click_count=2)
+                    except TypeError:
+                        loc.dblclick(timeout=6000, force=True, delay=50)
                 except Exception as e1:
                     logger.info(
-                        "Grafana screenshot: Dock Playwright click failed %r (%s); trying dispatch_event",
+                        "Grafana screenshot: Dock Playwright double-click failed %r (%s); trying dispatch_event",
                         sel,
                         e1,
                     )
                     try:
                         loc.dispatch_event("click")
+                        page.wait_for_timeout(90)
+                        loc.dispatch_event("click")
                     except Exception as e2:
                         logger.info("Grafana screenshot: Dock dispatch_event failed: %s", e2)
                         continue
-                logger.info("Grafana screenshot: clicked Dock menu via %r", sel)
+                logger.info("Grafana screenshot: double-clicked Dock menu via %r", sel)
                 return True
             except Exception:
                 continue
@@ -1836,10 +1848,15 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
                 alt.wait_for(state="attached", timeout=4000)
                 alt.scroll_into_view_if_needed(timeout=5000)
                 try:
-                    alt.click(timeout=6000, force=True, delay=40)
+                    try:
+                        alt.click(timeout=6000, force=True, delay=50, click_count=2)
+                    except TypeError:
+                        alt.dblclick(timeout=6000, force=True, delay=50)
                 except Exception:
                     alt.dispatch_event("click")
-                logger.info("Grafana screenshot: clicked Dock menu (role=name)")
+                    page.wait_for_timeout(90)
+                    alt.dispatch_event("click")
+                logger.info("Grafana screenshot: double-clicked Dock menu (role=name)")
                 return True
         except Exception:
             pass
