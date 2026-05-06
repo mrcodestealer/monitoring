@@ -318,6 +318,7 @@ _monitoring_user_reply_sent_at: Dict[str, float] = {}
 _monitoring_user_send_in_progress: set = set()
 _monitoring_chat_reply_sent_at: Dict[str, float] = {}
 _monitoring_chat_send_in_progress: set = set()
+_monitoring_card_action_event_ids: set = set()
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
@@ -2320,6 +2321,94 @@ def _lark_verify_event_token(data: Dict[str, Any]) -> bool:
     return tok == VERIFICATION_TOKEN
 
 
+def _lark_card_action_value(data: Dict[str, Any]) -> Dict[str, Any]:
+    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+    act = ev.get("action")
+    if isinstance(act, dict):
+        val = act.get("value")
+        if isinstance(val, dict):
+            return val
+    val2 = ev.get("value")
+    if isinstance(val2, dict):
+        return val2
+    return {}
+
+
+def _lark_card_action_target_ids(data: Dict[str, Any]) -> Tuple[str, str]:
+    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+    chat_id = _lark_dict_pick_str(ev, "open_chat_id", "openChatId", "chat_id", "chatId")
+    op = ev.get("operator") if isinstance(ev.get("operator"), dict) else {}
+    op_id = op.get("operator_id") if isinstance(op.get("operator_id"), dict) else {}
+    open_id = _lark_dict_pick_str(op_id, "open_id", "openId", "user_id", "userId")
+    if not open_id:
+        open_id = _lark_dict_pick_str(op, "open_id", "openId", "user_id", "userId")
+    return chat_id, open_id
+
+
+def _monitoring_send_screenshot_on_card_click(chat_id: str, open_id: str) -> None:
+    try:
+        if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+            raise RuntimeError("GRAFANA_SCREENSHOT_ENABLE=0")
+        sess = grafana_login_session()
+        payload = fetch_request_total_1m_series(session=sess)
+        w = payload.get("window") or {}
+        su = int(w.get("startUnix") or 0)
+        eu = int(w.get("endUnix") or 0)
+        if su <= 0 or eu <= 0:
+            raise RuntimeError(f"invalid screenshot window start={su} end={eu}")
+        png = _grafana_headless_screenshot_png(sess, su, eu)
+        key = _lark_upload_png_image_key(png)
+        if (chat_id or "").strip():
+            _lark_send_image_message("chat_id", chat_id.strip(), key)
+        elif (open_id or "").strip():
+            _lark_send_image_message("open_id", open_id.strip(), key)
+        else:
+            raise RuntimeError("missing chat_id/open_id")
+        logger.info(
+            "monitoring card-action screenshot sent chat=%r open=%r bytes=%s",
+            bool(chat_id),
+            bool(open_id),
+            len(png),
+        )
+    except Exception as e:
+        logger.exception("monitoring card-action screenshot failed")
+        msg = f"刷新截图失败：{e}"
+        try:
+            if (chat_id or "").strip():
+                _lark_send_text("chat_id", chat_id.strip(), msg)
+            elif (open_id or "").strip():
+                _lark_send_text("open_id", open_id.strip(), msg)
+        except Exception:
+            logger.exception("monitoring card-action error text send failed")
+
+
+def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
+    val = _lark_card_action_value(data)
+    k = _lark_dict_pick_str(val, "k")
+    v = _lark_dict_pick_str(val, "v")
+    if not (k == "monitoring_btn" and v == "refresh"):
+        logger.info("card.action ignored value=%r", val or None)
+        return
+    ev_id = _lark_im_payload_event_id(data)
+    with _monitoring_reply_dispatch_lock:
+        if ev_id and ev_id in _monitoring_card_action_event_ids:
+            logger.info("duplicate card.action event_id=%r — skip", ev_id)
+            return
+        if ev_id:
+            _monitoring_card_action_event_ids.add(ev_id)
+            if len(_monitoring_card_action_event_ids) > 2000:
+                _monitoring_card_action_event_ids.clear()
+                _monitoring_card_action_event_ids.add(ev_id)
+    chat_id, open_id = _lark_card_action_target_ids(data)
+    logger.info("card.action refresh accepted chat=%r open=%r event_id=%r", bool(chat_id), bool(open_id), ev_id or None)
+    threading.Thread(
+        target=_monitoring_send_screenshot_on_card_click,
+        args=(chat_id, open_id),
+        daemon=True,
+        name="monitoring-card-action",
+    ).start()
+
+
 def _run_monitoring_background_job(
     chat_id: str,
     open_id: str,
@@ -3262,6 +3351,10 @@ def webhook_event():
     et_l = (et or "").lower()
     # Card interactions also require a fast 200; business logic should update the card asynchronously via Open API.
     if et_l.startswith("card.action"):
+        try:
+            _handle_monitoring_card_action(data)
+        except Exception:
+            logger.exception("card.action handler failed")
         return _lark_feishu_webhook_ack_immediate()
 
     if _lark_ack_only_event_type(et):
