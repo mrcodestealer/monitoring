@@ -106,7 +106,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_AT_MENTION_ENABLE": "1",
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
     # HTTP 均值告警命中时，除原群外再发一份文字到该群（chat_id，常为 oc_…）；空=关闭
-    "MONITORING_ALERT_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
+    "MONITORING_ALERT_CHAT_ID": "",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -427,6 +427,25 @@ def _lark_message_chat_id(msg: Dict[str, Any]) -> str:
     if isinstance(c, dict):
         return _lark_dict_pick_str(c, "chat_id", "chatId", "open_chat_id", "openChatId")
     return ""
+
+
+def _lark_message_chat_id_aliases(msg: Dict[str, Any]) -> List[str]:
+    """Collect all chat id aliases (``chat_id`` / ``open_chat_id`` from message and container)."""
+    out: List[str] = []
+
+    def _add(v: Any) -> None:
+        s = (str(v).strip() if v is not None else "")
+        if s and s not in out:
+            out.append(s)
+
+    if isinstance(msg, dict):
+        for k in ("chat_id", "chatId", "open_chat_id", "openChatId"):
+            _add(msg.get(k))
+        c = msg.get("container")
+        if isinstance(c, dict):
+            for k in ("chat_id", "chatId", "open_chat_id", "openChatId"):
+                _add(c.get(k))
+    return out
 
 
 def _lark_im_message_dedupe_id(msg: Dict[str, Any]) -> str:
@@ -2194,10 +2213,14 @@ def _lark_verify_event_token(data: Dict[str, Any]) -> bool:
 
 
 def _run_monitoring_background_job(
-    chat_id: str, open_id: str, mid: str, dispatch_key: str
+    chat_id: str,
+    open_id: str,
+    mid: str,
+    dispatch_key: str,
+    source_chat_aliases: Optional[List[str]] = None,
 ) -> None:
     try:
-        _monitoring_background_worker(chat_id, open_id, mid, dispatch_key)
+        _monitoring_background_worker(chat_id, open_id, mid, dispatch_key, source_chat_aliases)
     finally:
         if dispatch_key:
             with _monitoring_reply_dispatch_lock:
@@ -2205,7 +2228,11 @@ def _run_monitoring_background_job(
 
 
 def _monitoring_background_worker(
-    chat_id: str, open_id: str, mid: str, dispatch_key: str = ""
+    chat_id: str,
+    open_id: str,
+    mid: str,
+    dispatch_key: str = "",
+    source_chat_aliases: Optional[List[str]] = None,
 ) -> None:
     """
     Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
@@ -2287,24 +2314,28 @@ def _monitoring_background_worker(
                     "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
                 )
 
-            if (
-                http_ex
-                and http_ex.get("hit_alert")
-                and MONITORING_ALERT_CHAT_ID
-                and (MONITORING_ALERT_CHAT_ID or "").strip() != (chat_id or "").strip()
-            ):
+            alert_chat_id = (MONITORING_ALERT_CHAT_ID or "").strip()
+            src_alias = {str(x).strip() for x in (source_chat_aliases or []) if str(x).strip()}
+            if (chat_id or "").strip():
+                src_alias.add((chat_id or "").strip())
+            suppress_alert_copy = alert_chat_id in src_alias
+            if http_ex and http_ex.get("hit_alert") and alert_chat_id and not suppress_alert_copy:
                 try:
-                    _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
+                    _lark_send_text("chat_id", alert_chat_id, reply)
                     logger.info(
                         "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
-                        MONITORING_ALERT_CHAT_ID[:16],
+                        alert_chat_id[:16],
                         len(reply),
                     )
                 except Exception:
                     logger.exception(
                         "monitoring alert forward failed (background) alert_chat_id=%r",
-                        MONITORING_ALERT_CHAT_ID[:24],
+                        alert_chat_id[:24],
                     )
+            elif http_ex and http_ex.get("hit_alert") and alert_chat_id and suppress_alert_copy:
+                logger.info(
+                    "monitoring alert copy skipped: source chat matches MONITORING_ALERT_CHAT_ID alias"
+                )
 
             _raw_ss = _cfg_raw("GRAFANA_SCREENSHOT_ENABLE")
             logger.info(
@@ -2508,6 +2539,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     chat_id = chat_resolved
     open_id = sender_open
+    chat_aliases = _lark_message_chat_id_aliases(msg)
     sender_debounce = _lark_im_sender_debounce_token(sender, open_id)
     im_event_id = _lark_im_payload_event_id(data)
     msg_time = _lark_im_message_time_token(msg)
@@ -2573,7 +2605,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     threading.Thread(
         target=_run_monitoring_background_job,
-        args=(chat_id, open_id, mid, debounce_key),
+        args=(chat_id, open_id, mid, debounce_key, chat_aliases),
         daemon=True,
         name="monitoring-reply",
     ).start()
