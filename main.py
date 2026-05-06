@@ -136,8 +136,8 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_EXTRA_IM_TYPES": "",
     # 1=同时订阅 WS 的 im.message.receive_v2（易与 receive_v1 **双投** 同一条用户消息 → 两条回复/两张图）；默认 0 仅 v1
     "LARK_WS_REGISTER_IM_MESSAGE_V2": "0",
-    # 同一聊天内相同触发正文在 N 秒内的第二次投递视为重复（双通道/空 message_id 兜底）；0=关闭
-    "MONITORING_IM_DEBOUNCE_SECONDS": "2",
+    # 同一聊天内相同触发正文在 N 秒内的第二次投递视为重复（双通道/空 message_id 兜底）；0=关闭（默认 5s）
+    "MONITORING_IM_DEBOUNCE_SECONDS": "5",
     # 1=且 LARK_EVENT_MODE=ws 时 **忽略** POST /webhook/event 上的 im.message（避免与长连接各处理一次 → 重复回复）
     "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     "LARK_WS_TRANSPORT_LOG": "1",
@@ -318,8 +318,13 @@ def _lark_webhook_request_timer_end(response: Response):
 _processed_lark_message_ids: set = set()
 _PROCESSED_LARK_IDS_CAP = 4000
 _monitoring_reply_dispatch_lock = threading.Lock()
-# Same user action delivered twice in quick succession (e.g. v1+v2 or empty ids) — key ``chat|open|clean``.
+# Same user action delivered twice in quick succession (e.g. v1+v2 or empty ids) — key ``chat|sender|clean``.
 _monitoring_im_trigger_last: Dict[str, float] = {}
+# While a background job for that key is running, drop duplicate triggers (same chat/sender/clean).
+_monitoring_inflight_keys: set = set()
+# Feishu ``header.event_id`` — unique per delivery; catches retries / double dispatch with different ``message_id``.
+_processed_lark_im_event_ids: set = set()
+_PROCESSED_IM_EVENT_IDS_CAP = 4000
 _persistent_worker_queue: queue.Queue = queue.Queue(maxsize=24)
 _persistent_worker_thread: Optional[threading.Thread] = None
 _persistent_worker_ready = threading.Event()
@@ -457,6 +462,12 @@ def _lark_im_message_dedupe_id(msg: Dict[str, Any]) -> str:
     return _lark_dict_pick_str(
         msg, "message_id", "messageId", "open_message_id", "openMessageId"
     )
+
+
+def _lark_im_payload_event_id(data: Dict[str, Any]) -> str:
+    """Schema 2.0 ``header.event_id`` — stable per Feishu push; use to drop duplicate deliveries."""
+    h = data.get("header") if isinstance(data.get("header"), dict) else {}
+    return _lark_dict_pick_str(h, "event_id", "eventId")
 
 
 def _lark_skip_http_im_message_when_ws_mode() -> bool:
@@ -2947,6 +2958,18 @@ def _lark_verify_event_token(data: Dict[str, Any]) -> bool:
     return tok == VERIFICATION_TOKEN
 
 
+def _run_monitoring_background_job(
+    chat_id: str, open_id: str, mid: str, dispatch_key: str
+) -> None:
+    """Runs :func:`_monitoring_background_worker` and always clears ``dispatch_key`` from the in-flight set."""
+    try:
+        _monitoring_background_worker(chat_id, open_id, mid)
+    finally:
+        if dispatch_key:
+            with _monitoring_reply_dispatch_lock:
+                _monitoring_inflight_keys.discard(dispatch_key)
+
+
 def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
     """
     Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
@@ -3229,9 +3252,11 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     open_id = sender_open
     sender_debounce = _lark_im_sender_debounce_token(sender, open_id)
 
+    im_event_id = _lark_im_payload_event_id(data)
     logger.info(
-        "monitoring trigger matched — background job mid=%r chat_id=%r open_id_prefix=%r",
+        "monitoring trigger matched — background job mid=%r event_id=%r chat_id=%r open_id_prefix=%r",
         mid,
+        im_event_id or None,
         bool(chat_id),
         (open_id[:12] + "…") if len(open_id) > 12 else open_id,
     )
@@ -3242,13 +3267,21 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         try:
             debounce_sec = float(raw_db)
         except (TypeError, ValueError):
-            debounce_sec = 2.0
+            debounce_sec = 5.0
     # Use union_id / open_id / user_id so HTTP vs WS envelopes that disagree on open_id still share one debounce key.
     debounce_key = f"{(chat_id or '').strip()}\n{sender_debounce}\n{(clean or '').strip()[:320]}"
     now_m = time.monotonic()
     with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            logger.info("duplicate IM event_id=%s — skip (already dispatched)", im_event_id)
+            return
         if mid and mid in _processed_lark_message_ids:
             logger.info("duplicate message_id=%s — skip (already dispatched)", mid)
+            return
+        if debounce_key in _monitoring_inflight_keys:
+            logger.info(
+                "monitoring skip — job already **in flight** for this chat/sender/clean (wait for Grafana/Lark to finish)"
+            )
             return
         if debounce_sec > 0:
             prev_t = _monitoring_im_trigger_last.get(debounce_key, 0.0)
@@ -3261,15 +3294,25 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 )
                 return
             _monitoring_im_trigger_last[debounce_key] = now_m
-            if len(_monitoring_im_trigger_last) > 512:
-                _monitoring_im_trigger_last.clear()
+            if len(_monitoring_im_trigger_last) > 600:
+                for k, _ in sorted(_monitoring_im_trigger_last.items(), key=lambda kv: kv[1])[:220]:
+                    try:
+                        del _monitoring_im_trigger_last[k]
+                    except KeyError:
+                        pass
                 _monitoring_im_trigger_last[debounce_key] = now_m
+        _monitoring_inflight_keys.add(debounce_key)
         if mid:
             _processed_lark_message_ids.add(mid)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
 
     threading.Thread(
-        target=_monitoring_background_worker,
-        args=(chat_id, open_id, mid),
+        target=_run_monitoring_background_job,
+        args=(chat_id, open_id, mid, debounce_key),
         daemon=True,
         name="monitoring-reply",
     ).start()
@@ -3880,6 +3923,11 @@ def run_monitoring_bot() -> None:
     Process entrypoint: HTTP-only, WebSocket-only, or WS + HTTP sidecar (see module docstring).
     Uses :data:`app`, :data:`logger`, :func:`start_lark_ws_client_blocking` from this module.
     """
+    logger.info(
+        "monitoring bot pid=%s — duplicate replies with correct dedupe logs usually mean **two OS processes** "
+        "(same APP_ID / two systemd units / dev + prod).",
+        os.getpid(),
+    )
     port = _cfg_listen_port(5002)
     if MONITORING_AT_MENTION_ENABLE and not (LARK_BOT_OPEN_ID or "").strip():
         logger.warning(
