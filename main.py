@@ -141,7 +141,7 @@ _CFG: Dict[str, Any] = {
     "LARK_WEBHOOK_TIMING_LOG": "0",
     "MONITORING_HTTP_DROP_ALERT_PCT": 10,
     "MONITORING_9280_ENABLE": "1",
-    "MONITORING_9280_ALERT_PCT": 10,
+    "MONITORING_9280_ALERT_PCT": 1,
     "MONITORING_WATCH_ENABLE": "1",
     "MONITORING_WATCH_INTERVAL_SECONDS": "60",
     # 自动告警最短间隔（防刷屏）
@@ -402,7 +402,7 @@ TARGET_USER_OPEN_ID = _cfg_str(
     "TARGET_USER_OPEN_ID", "ou_d7bc33724e2d6ced4050c944c2ca5650"
 ).strip()
 MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
-MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 10.0)
+MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 1.0)
 LARK_ENCRYPT_KEY = (
     _cfg_str("LARK_ENCRYPT_KEY")
     or _cfg_str("ENCRYPT_KEY")
@@ -2198,6 +2198,7 @@ def _http_drop_spike_analysis(
 
     Max drop / max spike use **whole consecutive** weakly monotonic segments (multi-minute),
     scored from first to last bucket of each segment — not single adjacent-minute comparisons.
+    ``hit_alert`` is true when either drop **or** spike reaches threshold.
     """
     out: Dict[str, Any] = {
         "pointCount": len(points),
@@ -2223,6 +2224,8 @@ def _http_drop_spike_analysis(
             "to_ts": drop_run["to_ts"],
             "buckets": drop_run["buckets"],
         }
+        if float(drop_run.get("pct") or 0.0) >= float(alert_threshold_pct):
+            out["hit_alert"] = True
     spike_run = _best_consecutive_spike_run(vals, ts)
     if spike_run is not None:
         out["consecutive_max_spike"] = {
@@ -2231,6 +2234,8 @@ def _http_drop_spike_analysis(
             "to_ts": spike_run["to_ts"],
             "buckets": spike_run["buckets"],
         }
+        if float(spike_run.get("pct") or 0.0) >= float(alert_threshold_pct):
+            out["hit_alert"] = True
 
     worst_avg_drop_pct: Optional[float] = None
     windows: List[Dict[str, Any]] = []
