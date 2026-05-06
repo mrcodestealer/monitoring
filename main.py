@@ -1425,7 +1425,8 @@ def _monitoring_interactive_card_dict(
     lark_img_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Feishu card JSON v2 — markdown card, optional embedded PNG."""
-    title = f"📊 【{GRAFANA_PANEL_TITLE}】graph"
+    title = "📊 GRAFANA GRAPH"
+    is_alert_card = (reply or "").lstrip().startswith("[ALERT]")
     elements: List[Dict[str, Any]] = [
         {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
     ]
@@ -1459,7 +1460,10 @@ def _monitoring_interactive_card_dict(
         "header": {
             "template": "blue",
             "title": {"tag": "plain_text", "content": title[:190]},
-            "subtitle": {"tag": "plain_text", "content": "Grafana · monitoring"},
+            "subtitle": {
+                "tag": "plain_text",
+                "content": "Alert Triggered" if is_alert_card else "Grafana · monitoring",
+            },
         },
         "body": {"elements": elements},
     }
