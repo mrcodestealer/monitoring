@@ -105,8 +105,6 @@ _CFG: Dict[str, Any] = {
     # 1=仅 @ 机器人且无其它正文也触发（与 /monitoring 同）；1+下面 ANY=1 则 @ 且带任意文字也触发
     "MONITORING_AT_MENTION_ENABLE": "0",
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
-    # HTTP 均值告警命中时，除原群外再发一份文字到该群（chat_id，常为 oc_…）；空=关闭
-    "MONITORING_ALERT_CHAT_ID": "",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -139,14 +137,17 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_SDK_DEBUG": "0",
     "LARK_WEBHOOK_WSGI_LOG": "0",
     "LARK_WEBHOOK_TIMING_LOG": "0",
-    # 请求总数/1m：仅 HTTP 序列参与跌幅判断；平均跌幅 ≥ 该阈值时 @ 下面 open_id（可用环境变量覆盖）
-    "TARGET_USER_OPEN_ID": "",
     "MONITORING_HTTP_DROP_ALERT_PCT": 10,
     # 1=常驻后台监控（按周期自动拉 Grafana）；命中阈值则自动发到 MONITORING_ALERT_CHAT_ID
     "MONITORING_WATCH_ENABLE": "1",
     "MONITORING_WATCH_INTERVAL_SECONDS": "60",
     # 自动告警最短间隔（防刷屏）
     "MONITORING_WATCH_ALERT_COOLDOWN_SECONDS": "300",
+    
+    # Tag person
+    "TARGET_USER_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
+    # In which group
+    "MONITORING_ALERT_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
 }
 
 
