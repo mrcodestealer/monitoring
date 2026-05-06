@@ -175,6 +175,12 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_SCREENSHOT_FROM": "now-15m",
     "MONITORING_WATCH_SCREENSHOT_TO": "now",
     "MONITORING_WATCH_SCREENSHOT_TIMEZONE": "browser",
+    # 每日静默：该时段内不拉数、不判警（默认 23:59:00～次日 00:10:00 前一刻，跨午夜；本地机器时间）
+    "MONITORING_WATCH_QUIET_WINDOW_ENABLE": "1",
+    "MONITORING_WATCH_QUIET_START_HOUR": "23",
+    "MONITORING_WATCH_QUIET_START_MINUTE": "59",
+    "MONITORING_WATCH_QUIET_END_HOUR": "0",
+    "MONITORING_WATCH_QUIET_END_MINUTE": "10",
     # Tag person
     "TARGET_USER_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
     # In which group
@@ -1303,6 +1309,39 @@ def fetch_request_total_1m_series(
         start_unix=start_unix,
         end_unix=end_unix,
     )
+
+
+def _monitoring_watch_daily_quiet_tod_bounds() -> Tuple[int, int]:
+    """
+    Local-time quiet window as (start_tod_seconds, end_tod_seconds) with **end exclusive**:
+    quiet when ``tod >= start`` OR ``tod < end`` (handles wrap past midnight).
+    Default: [23:59:00, 00:10:00) → about 11 minutes.
+    Returns ``(-1, -1)`` when ``MONITORING_WATCH_QUIET_WINDOW_ENABLE=0``.
+    """
+    if not _lark_env_truthy("MONITORING_WATCH_QUIET_WINDOW_ENABLE"):
+        return -1, -1
+    sh = max(0, min(23, _cfg_int("MONITORING_WATCH_QUIET_START_HOUR", 23)))
+    sm = max(0, min(59, _cfg_int("MONITORING_WATCH_QUIET_START_MINUTE", 59)))
+    eh = max(0, min(23, _cfg_int("MONITORING_WATCH_QUIET_END_HOUR", 0)))
+    em = max(0, min(59, _cfg_int("MONITORING_WATCH_QUIET_END_MINUTE", 10)))
+    start_sec = sh * 3600 + sm * 60
+    end_sec = eh * 3600 + em * 60
+    return start_sec, end_sec
+
+
+def _monitoring_watch_in_daily_quiet_local(now: Optional[float] = None) -> bool:
+    """True if current **local** time lies in the configured daily quiet window."""
+    start_sec, end_sec = _monitoring_watch_daily_quiet_tod_bounds()
+    if start_sec < 0:
+        return False
+    t = time.time() if now is None else float(now)
+    lt = time.localtime(t)
+    tod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+    if start_sec < end_sec:
+        return start_sec <= tod < end_sec
+    if start_sec == end_sec:
+        return False
+    return tod >= start_sec or tod < end_sec
 
 
 def _monitoring_watch_eval_window_unix(now: Optional[float] = None) -> Tuple[int, int]:
@@ -3126,18 +3165,36 @@ def _monitoring_watchdog_loop() -> None:
     global _monitoring_watch_last_alert_at
     sec = max(15.0, _cfg_float("MONITORING_WATCH_INTERVAL_SECONDS", 60.0))
     cool = max(0.0, _cfg_float("MONITORING_WATCH_ALERT_COOLDOWN_SECONDS", 300.0))
+    qs, qe = _monitoring_watch_daily_quiet_tod_bounds()
+    if qs < 0:
+        q_note = "daily_quiet=disabled"
+    else:
+        sh, sm = qs // 3600, (qs // 60) % 60
+        eh, em = qe // 3600, (qe // 60) % 60
+        q_note = (
+            f"daily_quiet=on server-local {sh:02d}:{sm:02d}–{eh:02d}:{em:02d} "
+            f"(end time exclusive; no fetch/alert)"
+        )
     logger.info(
-        "monitoring watchdog started interval=%.0fs cooldown=%.0fs alert_chat=%r target_user=%r",
+        "monitoring watchdog started interval=%.0fs cooldown=%.0fs alert_chat=%r target_user=%r %s",
         sec,
         cool,
         bool((MONITORING_ALERT_CHAT_ID or "").strip()),
         bool((TARGET_USER_OPEN_ID or "").strip()),
+        q_note,
     )
     while True:
         try:
             alert_chat = (MONITORING_ALERT_CHAT_ID or "").strip()
             if not alert_chat:
                 logger.warning("monitoring watchdog: MONITORING_ALERT_CHAT_ID empty — skip this cycle")
+                time.sleep(sec)
+                continue
+
+            if _monitoring_watch_in_daily_quiet_local():
+                logger.debug(
+                    "monitoring watchdog: skip — daily quiet window (MONITORING_WATCH_QUIET_WINDOW_ENABLE=0 to disable)"
+                )
                 time.sleep(sec)
                 continue
 
