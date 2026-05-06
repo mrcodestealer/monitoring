@@ -104,6 +104,12 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_PERSISTENT_BROWSER_IDLE_REFRESH_SECONDS": "120",
     # 单次截图任务在 keeper 队列中的最长等待（秒）
     "GRAFANA_PERSISTENT_BROWSER_JOB_TIMEOUT_SECONDS": "180",
+    # 常驻浏览器每次截图前：不清空全部 cookie，只追加/覆盖新登录（减轻 SPA 主区闪空白）
+    "GRAFANA_PERSISTENT_BROWSER_SOFT_COOKIE": "1",
+    # 按快门前几毫秒：置顶滚动 + 等字体 + rAF，缓解 headless「已 ready 但 PNG 仍空壳」
+    "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "800",
+    # 1=快门前再跑一轮整页滚动刷 canvas（更慢但更稳）
+    "GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL": "0",
     # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
     "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 4500,
     # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
@@ -2240,6 +2246,52 @@ def _grafana_persistent_browser_enabled() -> bool:
     return _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE") and _lark_env_truthy("GRAFANA_PERSISTENT_BROWSER")
 
 
+def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
+    """
+    Headless Grafana 有时「面板 ready 统计够了」但 uPlot/canvas 尚未合成进位图；快门前强制置顶、
+    等字体与双 rAF，减少全页截图只有侧栏/顶栏、主区纯底色的情况。
+    """
+    try:
+        page.evaluate(
+            """() => {
+              window.scrollTo(0, 0);
+              const s = document.scrollingElement || document.documentElement;
+              if (s) s.scrollTop = 0;
+            }"""
+        )
+    except Exception:
+        pass
+    try:
+        page.evaluate(
+            """async () => {
+              try {
+                if (document.fonts && document.fonts.ready) await document.fonts.ready;
+              } catch (e) {}
+            }"""
+        )
+    except Exception:
+        pass
+    extra = max(0, min(5000, _cfg_int("GRAFANA_SCREENSHOT_PRE_CAPTURE_MS", 800)))
+    page.wait_for_timeout(extra)
+    try:
+        page.evaluate(
+            "() => new Promise((resolve) => {"
+            "  requestAnimationFrame(() => { requestAnimationFrame(() => resolve(undefined)); });"
+            "})"
+        )
+    except Exception:
+        pass
+    if _lark_env_truthy("GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL"):
+        try:
+            _grafana_scroll_paint_lazy_panels(page)
+            page.evaluate(
+                "() => { window.scrollTo(0, 0); const s = document.scrollingElement || document.documentElement; if (s) s.scrollTop = 0; }"
+            )
+            page.wait_for_timeout(220)
+        except Exception:
+            pass
+
+
 def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms: int) -> bytes:
     """
     Navigate ``page`` to dashboard ``url`` and return a PNG after the same wait/stabilize path
@@ -2301,8 +2353,12 @@ def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms
     if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
         page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
     _grafana_close_open_menus(page)
+    _grafana_playwright_pre_screenshot_paint_flush(page)
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
-    return page.screenshot(type="png", full_page=full_page)
+    try:
+        return page.screenshot(type="png", full_page=full_page, animations="disabled")
+    except TypeError:
+        return page.screenshot(type="png", full_page=full_page)
 
 
 class GrafanaPlaywrightKeeper:
@@ -2400,7 +2456,10 @@ class GrafanaPlaywrightKeeper:
             warm_url = _grafana_build_screenshot_dashboard_url(0, 0)
             logger.info("GrafanaPlaywrightKeeper: warm-up load url=%s…", warm_url[:220])
             _ = _grafana_playwright_render_dashboard_and_png(page, warm_url, timeout_ms)
-            logger.info("GrafanaPlaywrightKeeper: warm-up finished, accepting screenshot jobs")
+            logger.info(
+                "GrafanaPlaywrightKeeper: warm-up finished — persistent Chromium stays open; "
+                "screenshot jobs reuse this browser (see log line 'using persistent Playwright keeper')."
+            )
             self._ready.set()
 
             idle_sec = max(30.0, _cfg_float("GRAFANA_PERSISTENT_BROWSER_IDLE_REFRESH_SECONDS", 120.0))
@@ -2423,8 +2482,16 @@ class GrafanaPlaywrightKeeper:
                 jto = int(job.get("timeout_ms") or timeout_ms)
                 try:
                     sess = grafana_login_session()
-                    context.clear_cookies()
-                    context.add_cookies(_playwright_cookie_list(sess))
+                    ck = _playwright_cookie_list(sess)
+                    if _lark_env_truthy("GRAFANA_PERSISTENT_BROWSER_SOFT_COOKIE"):
+                        try:
+                            context.add_cookies(ck)
+                        except Exception:
+                            context.clear_cookies()
+                            context.add_cookies(ck)
+                    else:
+                        context.clear_cookies()
+                        context.add_cookies(ck)
                     box["png"] = _grafana_playwright_render_dashboard_and_png(page, jurl, max(5000, jto))
                 except Exception as ex:
                     box["err"] = ex
