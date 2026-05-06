@@ -846,6 +846,24 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
     return not (clean or "").strip()
 
 
+def _monitoring_dispatch_body_key(clean: str, raw_text: str, mentions: Any) -> str:
+    """
+    Normalize IM debounce key so ``/monitoring`` / @ 机器人 variants from different clients share one key
+    (avoids two background workers when ``clean`` whitespace or mention markup differs slightly).
+    """
+    tri = (MONITORING_TRIGGER or "/monitoring").strip().lower()
+    raw_l = (raw_text or "").lower()
+    cl = re.sub(r"\s+", " ", (clean or "").strip().lower())
+    if tri in raw_l or tri in cl:
+        return tri
+    if MONITORING_AT_MENTION_ENABLE and _lark_message_mentions_bot(mentions):
+        if MONITORING_AT_MENTION_ANY_TEXT:
+            return f"__at_any__:{cl[:240]}"
+        if not cl.strip():
+            return "__at_only__"
+    return cl[:320] or "__body__"
+
+
 def grafana_login_session() -> requests.Session:
     if not GRAFANA_USER or not GRAFANA_PASSWORD:
         raise ValueError("Set GRAFANA_USER and GRAFANA_PASSWORD in .env")
@@ -2273,7 +2291,7 @@ def _monitoring_background_worker(
                 http_ex
                 and http_ex.get("hit_alert")
                 and MONITORING_ALERT_CHAT_ID
-                and MONITORING_ALERT_CHAT_ID != (chat_id or "").strip()
+                and (MONITORING_ALERT_CHAT_ID or "").strip() != (chat_id or "").strip()
             ):
                 try:
                     _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
@@ -2303,10 +2321,17 @@ def _monitoring_background_worker(
                     logger.info(
                         "monitoring screenshot skipped: set GRAFANA_SCREENSHOT_ENABLE=1 (and install playwright + chromium)"
                     )
-                elif embedded_png_in_card and MONITORING_MESSAGE_CARD_ENABLE:
-                    logger.info(
-                        "monitoring: Grafana PNG embedded in interactive card — no separate image message"
-                    )
+                elif used_interactive_card:
+                    if embedded_png_in_card:
+                        logger.info(
+                            "monitoring: Grafana PNG embedded in interactive card — no separate image message"
+                        )
+                    else:
+                        logger.info(
+                            "monitoring: interactive card sent without embedded PNG — **not** sending a follow-up "
+                            "image (that was causing two chat bubbles). Set MONITORING_MESSAGE_CARD_ENABLE=0 for "
+                            "plain text + separate image."
+                        )
                 elif pre_key:
                     try:
                         if chat_id:
@@ -2486,7 +2511,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     sender_debounce = _lark_im_sender_debounce_token(sender, open_id)
     im_event_id = _lark_im_payload_event_id(data)
     msg_time = _lark_im_message_time_token(msg)
-    clean_key = re.sub(r"\s+", " ", (clean or "").strip().lower())[:400]
+    body_key = _monitoring_dispatch_body_key(clean, raw_text, mentions)
     processed_stick = _monitoring_processed_stick(
         mid, im_event_id, chat_id or "", sender_debounce, msg_time
     )
@@ -2508,7 +2533,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             debounce_sec = float(raw_db)
         except (TypeError, ValueError):
             debounce_sec = 5.0
-    debounce_key = f"{(chat_id or '').strip()}\n{sender_debounce}\n{msg_time}\n{clean_key[:320]}"
+    debounce_key = f"{(chat_id or '').strip()}\n{sender_debounce}\n{msg_time}\n{body_key}"
     now_m = time.monotonic()
     with _monitoring_reply_dispatch_lock:
         if im_event_id and im_event_id in _processed_lark_im_event_ids:
