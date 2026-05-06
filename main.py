@@ -114,6 +114,8 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_REGISTER_IM_MESSAGE_V2": "0",
     # 同一 chat+发送者+触发正文在 N 秒内只跑一次监控任务；0=关闭（默认 5）
     "MONITORING_IM_DEBOUNCE_SECONDS": "5",
+    # 同一触发在 N 秒内只允许 **一次** 真正发到飞书（拦双 POST / 双进程竞态）；0=关闭（默认 12）
+    "MONITORING_SEND_COALESCE_SECONDS": "12",
     # 1=且 LARK_EVENT_MODE=ws 时忽略 HTTP webhook 上的 im.message（避免与长连接重复处理）
     "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     "LARK_WS_TRANSPORT_LOG": "1",
@@ -296,6 +298,8 @@ _monitoring_im_trigger_last: Dict[str, float] = {}
 _monitoring_inflight_keys: set = set()
 _processed_lark_im_event_ids: set = set()
 _PROCESSED_IM_EVENT_IDS_CAP = 4000
+_monitoring_user_reply_sent_at: Dict[str, float] = {}
+_monitoring_user_send_in_progress: set = set()
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
@@ -427,8 +431,79 @@ def _lark_im_message_dedupe_id(msg: Dict[str, Any]) -> str:
 
 
 def _lark_im_payload_event_id(data: Dict[str, Any]) -> str:
+    """Feishu may put ``event_id`` at top level, under ``header``, or under ``event`` depending on schema/version."""
+    if not isinstance(data, dict):
+        return ""
+    top = _lark_dict_pick_str(data, "event_id", "eventId", "uuid")
+    if top:
+        return top
     h = data.get("header") if isinstance(data.get("header"), dict) else {}
-    return _lark_dict_pick_str(h, "event_id", "eventId")
+    x = _lark_dict_pick_str(h, "event_id", "eventId", "event_uuid", "eventUuid", "uuid")
+    if x:
+        return x
+    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+    return _lark_dict_pick_str(ev, "event_id", "eventId")
+
+
+def _lark_im_message_time_token(msg: Dict[str, Any]) -> str:
+    return _lark_dict_pick_str(msg, "create_time", "createTime", "update_time", "updateTime")
+
+
+def _monitoring_processed_stick(
+    mid: str,
+    im_event_id: str,
+    chat_id: str,
+    sender_debounce: str,
+    msg_time: str,
+) -> str:
+    """Stable id for ``_processed_lark_message_ids`` when ``message_id`` is missing in one POST duplicate."""
+    m = (mid or "").strip()
+    if m:
+        return m
+    e = (im_event_id or "").strip()
+    if e:
+        return f"evt:{e}"
+    if (msg_time or "").strip() and ((chat_id or "").strip() or (sender_debounce or "").strip()):
+        return f"tm:{(chat_id or '').strip()}:{msg_time.strip()}:{sender_debounce}"
+    return ""
+
+
+def _monitoring_try_begin_user_send(dispatch_key: str) -> bool:
+    """
+    Serialize user-visible sends for the same ``dispatch_key`` (HTTP double-post / race).
+    Returns False if another send is in progress or completed within the coalesce window.
+    """
+    dk = (dispatch_key or "").strip()
+    if not dk:
+        return True
+    sec = _cfg_float("MONITORING_SEND_COALESCE_SECONDS", 12.0)
+    if sec <= 0:
+        return True
+    now = time.monotonic()
+    with _monitoring_reply_dispatch_lock:
+        if dk in _monitoring_user_send_in_progress:
+            return False
+        prev = _monitoring_user_reply_sent_at.get(dk, 0.0)
+        if prev > 0.0 and (now - prev) < sec:
+            return False
+        _monitoring_user_send_in_progress.add(dk)
+        if len(_monitoring_user_reply_sent_at) > 800:
+            for k, t1 in sorted(_monitoring_user_reply_sent_at.items(), key=lambda kv: kv[1])[:300]:
+                try:
+                    del _monitoring_user_reply_sent_at[k]
+                except KeyError:
+                    pass
+    return True
+
+
+def _monitoring_end_user_send(dispatch_key: str, success: bool) -> None:
+    dk = (dispatch_key or "").strip()
+    if not dk:
+        return
+    with _monitoring_reply_dispatch_lock:
+        _monitoring_user_send_in_progress.discard(dk)
+        if success:
+            _monitoring_user_reply_sent_at[dk] = time.monotonic()
 
 
 def _lark_skip_http_im_message_when_ws_mode() -> bool:
@@ -1998,131 +2073,154 @@ def _run_monitoring_background_job(
     chat_id: str, open_id: str, mid: str, dispatch_key: str
 ) -> None:
     try:
-        _monitoring_background_worker(chat_id, open_id, mid)
+        _monitoring_background_worker(chat_id, open_id, mid, dispatch_key)
     finally:
         if dispatch_key:
             with _monitoring_reply_dispatch_lock:
                 _monitoring_inflight_keys.discard(dispatch_key)
 
 
-def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
+def _monitoring_background_worker(
+    chat_id: str, open_id: str, mid: str, dispatch_key: str = ""
+) -> None:
     """
     Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
     """
     logger.info("monitoring background job start mid=%r chat=%r open=%r", mid, bool(chat_id), bool(open_id))
-    grafana_session: Optional[requests.Session] = None
-    payload: Optional[Dict[str, Any]] = None
-    http_ex: Optional[Dict[str, Any]] = None
-    try:
-        grafana_session = grafana_login_session()
-        payload = fetch_request_total_1m_series(session=grafana_session)
-        http_ex = _http_analysis_for_payload(payload)
-        reply = _format_monitoring_reply(payload)
-    except Exception as e:
-        logger.exception("monitoring fetch failed (background)")
-        reply = f"监控数据拉取失败：{e}"
-        grafana_session = None
-        payload = None
-        http_ex = None
+    if dispatch_key and not _monitoring_try_begin_user_send(dispatch_key):
+        logger.warning(
+            "monitoring: blocked duplicate **user-visible** send (MONITORING_SEND_COALESCE_SECONDS or concurrent send)"
+        )
+        return
 
-    sent = False
+    user_visible_send_ok = False
     try:
-        if chat_id:
-            _lark_send_text("chat_id", chat_id, reply)
-            sent = True
-            logger.info(
-                "monitoring reply sent (background) receive_id_type=chat_id chat_id_prefix=%s... len=%s",
-                chat_id[:16],
-                len(reply),
-            )
-        elif open_id:
-            _lark_send_text("open_id", open_id, reply)
-            sent = True
-            logger.info("monitoring reply sent (background) receive_id_type=open_id len=%s", len(reply))
-        else:
-            logger.warning(
-                "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
-            )
+        grafana_session: Optional[requests.Session] = None
+        payload: Optional[Dict[str, Any]] = None
+        http_ex: Optional[Dict[str, Any]] = None
+        try:
+            grafana_session = grafana_login_session()
+            payload = fetch_request_total_1m_series(session=grafana_session)
+            http_ex = _http_analysis_for_payload(payload)
+            reply = _format_monitoring_reply(payload)
+        except Exception as e:
+            logger.exception("monitoring fetch failed (background)")
+            reply = f"监控数据拉取失败：{e}"
+            grafana_session = None
+            payload = None
+            http_ex = None
 
-        if (
-            http_ex
-            and http_ex.get("hit_alert")
-            and MONITORING_ALERT_CHAT_ID
-            and MONITORING_ALERT_CHAT_ID != (chat_id or "").strip()
-        ):
-            try:
-                _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
+        sent = False
+        try:
+            if chat_id:
+                _lark_send_text("chat_id", chat_id, reply)
+                sent = True
+                user_visible_send_ok = True
                 logger.info(
-                    "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
-                    MONITORING_ALERT_CHAT_ID[:16],
+                    "monitoring reply sent (background) receive_id_type=chat_id chat_id_prefix=%s... len=%s",
+                    chat_id[:16],
                     len(reply),
                 )
-            except Exception:
-                logger.exception(
-                    "monitoring alert forward failed (background) alert_chat_id=%r",
-                    MONITORING_ALERT_CHAT_ID[:24],
-                )
-
-        # 无条件打一行，便于对照 journal：是否读到 ENABLE、是否有 session/payload（缺任一则不会走截图）
-        _raw_ss = _cfg_raw("GRAFANA_SCREENSHOT_ENABLE")
-        logger.info(
-            "monitoring screenshot gate sent=%s session=%s payload=%s ENABLE_raw=%r ENABLE_truthy=%s",
-            sent,
-            grafana_session is not None,
-            payload is not None,
-            _raw_ss,
-            _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"),
-        )
-
-        if sent and grafana_session is not None and payload is not None:
-            if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+            elif open_id:
+                _lark_send_text("open_id", open_id, reply)
+                sent = True
+                user_visible_send_ok = True
                 logger.info(
-                    "monitoring screenshot skipped: set GRAFANA_SCREENSHOT_ENABLE=1 (and install playwright + chromium)"
+                    "monitoring reply sent (background) receive_id_type=open_id len=%s", len(reply)
                 )
             else:
-                w = payload.get("window") or {}
-                su = int(w.get("startUnix") or 0)
-                eu = int(w.get("endUnix") or 0)
-                if su <= 0 or eu <= 0:
-                    logger.warning("monitoring screenshot skipped: invalid window start=%s end=%s", su, eu)
-                else:
-                    try:
-                        jar = grafana_session.cookies.get_dict()
-                        if "grafana_session" not in jar:
-                            logger.warning(
-                                "monitoring screenshot: no grafana_session cookie — expect login wall in PNG"
-                            )
-                        n_cookies = len(_playwright_cookie_list(grafana_session))
-                        logger.info(
-                            "monitoring screenshot start cookies=%s window=%s..%s",
-                            n_cookies,
-                            su,
-                            eu,
-                        )
-                        png = _grafana_headless_screenshot_png(grafana_session, su, eu)
-                        key = _lark_upload_png_image_key(png)
-                        if chat_id:
-                            _lark_send_image_message("chat_id", chat_id, key)
-                        else:
-                            _lark_send_image_message("open_id", open_id, key)
-                        logger.info(
-                            "monitoring Grafana screenshot sent (background) bytes=%s",
-                            len(png),
-                        )
-                    except Exception:
-                        logger.exception(
-                            "monitoring Grafana screenshot or Lark image upload failed (text was already sent)"
-                        )
-        elif sent:
-            logger.warning(
-                "monitoring screenshot skipped: sent text but grafana_session or payload is missing (unexpected)"
-            )
-    except Exception as e:
-        logger.exception("monitoring lark text/image failed (background): %s", e)
+                logger.warning(
+                    "monitoring background: no chat_id/open_chat_id or sender open_id; msg cannot be sent"
+                )
 
-    # ``mid`` was reserved on the webhook thread before ACK to avoid duplicate workers (HTTP returns {} immediately).
-    if sent and mid and len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
-        _processed_lark_message_ids.clear()
+            if (
+                http_ex
+                and http_ex.get("hit_alert")
+                and MONITORING_ALERT_CHAT_ID
+                and MONITORING_ALERT_CHAT_ID != (chat_id or "").strip()
+            ):
+                try:
+                    _lark_send_text("chat_id", MONITORING_ALERT_CHAT_ID, reply)
+                    logger.info(
+                        "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
+                        MONITORING_ALERT_CHAT_ID[:16],
+                        len(reply),
+                    )
+                except Exception:
+                    logger.exception(
+                        "monitoring alert forward failed (background) alert_chat_id=%r",
+                        MONITORING_ALERT_CHAT_ID[:24],
+                    )
+
+            _raw_ss = _cfg_raw("GRAFANA_SCREENSHOT_ENABLE")
+            logger.info(
+                "monitoring screenshot gate sent=%s session=%s payload=%s ENABLE_raw=%r ENABLE_truthy=%s",
+                sent,
+                grafana_session is not None,
+                payload is not None,
+                _raw_ss,
+                _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"),
+            )
+
+            if sent and grafana_session is not None and payload is not None:
+                if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+                    logger.info(
+                        "monitoring screenshot skipped: set GRAFANA_SCREENSHOT_ENABLE=1 (and install playwright + chromium)"
+                    )
+                else:
+                    w = payload.get("window") or {}
+                    su = int(w.get("startUnix") or 0)
+                    eu = int(w.get("endUnix") or 0)
+                    if su <= 0 or eu <= 0:
+                        logger.warning(
+                            "monitoring screenshot skipped: invalid window start=%s end=%s", su, eu
+                        )
+                    else:
+                        try:
+                            jar = grafana_session.cookies.get_dict()
+                            if "grafana_session" not in jar:
+                                logger.warning(
+                                    "monitoring screenshot: no grafana_session cookie — expect login wall in PNG"
+                                )
+                            n_cookies = len(_playwright_cookie_list(grafana_session))
+                            logger.info(
+                                "monitoring screenshot start cookies=%s window=%s..%s",
+                                n_cookies,
+                                su,
+                                eu,
+                            )
+                            png = _grafana_headless_screenshot_png(grafana_session, su, eu)
+                            key = _lark_upload_png_image_key(png)
+                            if chat_id:
+                                _lark_send_image_message("chat_id", chat_id, key)
+                            else:
+                                _lark_send_image_message("open_id", open_id, key)
+                            logger.info(
+                                "monitoring Grafana screenshot sent (background) bytes=%s",
+                                len(png),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "monitoring Grafana screenshot or Lark image upload failed (text was already sent)"
+                            )
+            elif sent:
+                logger.warning(
+                    "monitoring screenshot skipped: sent text but grafana_session or payload is missing (unexpected)"
+                )
+        except Exception as e:
+            logger.exception("monitoring lark text/image failed (background): %s", e)
+
+        if sent and mid and len(_processed_lark_message_ids) > _PROCESSED_LARK_IDS_CAP:
+            for _ in range(500):
+                if len(_processed_lark_message_ids) <= _PROCESSED_LARK_IDS_CAP - 200:
+                    break
+                try:
+                    _processed_lark_message_ids.pop()
+                except KeyError:
+                    break
+    finally:
+        if dispatch_key:
+            _monitoring_end_user_send(dispatch_key, user_visible_send_ok)
 
 
 def _serialize_lark_user_id(uid: Any) -> Dict[str, Any]:
@@ -2234,11 +2332,18 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     open_id = sender_open
     sender_debounce = _lark_im_sender_debounce_token(sender, open_id)
     im_event_id = _lark_im_payload_event_id(data)
+    msg_time = _lark_im_message_time_token(msg)
+    clean_key = re.sub(r"\s+", " ", (clean or "").strip().lower())[:400]
+    processed_stick = _monitoring_processed_stick(
+        mid, im_event_id, chat_id or "", sender_debounce, msg_time
+    )
 
     logger.info(
-        "monitoring trigger matched — background job mid=%r event_id=%r chat_id=%r open_id_prefix=%r",
+        "monitoring trigger matched — background job mid=%r event_id=%r msg_time=%r stick=%r chat_id=%r open_id_prefix=%r",
         mid,
         im_event_id or None,
+        msg_time or None,
+        (processed_stick[:72] + "…") if len(processed_stick) > 72 else (processed_stick or None),
         bool(chat_id),
         (open_id[:12] + "…") if len(open_id) > 12 else open_id,
     )
@@ -2250,14 +2355,14 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             debounce_sec = float(raw_db)
         except (TypeError, ValueError):
             debounce_sec = 5.0
-    debounce_key = f"{(chat_id or '').strip()}\n{sender_debounce}\n{(clean or '').strip()[:320]}"
+    debounce_key = f"{(chat_id or '').strip()}\n{sender_debounce}\n{msg_time}\n{clean_key[:320]}"
     now_m = time.monotonic()
     with _monitoring_reply_dispatch_lock:
         if im_event_id and im_event_id in _processed_lark_im_event_ids:
             logger.info("duplicate IM event_id=%s — skip", im_event_id)
             return
-        if mid and mid in _processed_lark_message_ids:
-            logger.info("duplicate message_id=%s — skip (already dispatched)", mid)
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            logger.info("duplicate monitoring dispatch stick=%r — skip", processed_stick[:96])
             return
         if debounce_key in _monitoring_inflight_keys:
             logger.info("monitoring skip — same trigger already **in flight** (wait for job to finish)")
@@ -2280,8 +2385,8 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                         pass
                 _monitoring_im_trigger_last[debounce_key] = now_m
         _monitoring_inflight_keys.add(debounce_key)
-        if mid:
-            _processed_lark_message_ids.add(mid)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
         if im_event_id:
             _processed_lark_im_event_ids.add(im_event_id)
             if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
