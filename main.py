@@ -118,6 +118,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_IM_DEBOUNCE_SECONDS": "5",
     # 同一触发在 N 秒内只允许 **一次** 真正发到飞书（拦双 POST / 双进程竞态）；0=关闭（默认 12）
     "MONITORING_SEND_COALESCE_SECONDS": "12",
+    # 同一会话(chat_id/open_id)在 N 秒内只允许一次用户可见发送（兜底拦截同秒双 envelope）；0=关闭
+    "MONITORING_CHAT_COALESCE_SECONDS": "10",
     # 1=且 LARK_EVENT_MODE=ws 时忽略 HTTP webhook 上的 im.message（避免与长连接重复处理）
     "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     # 1=监控摘要用 **一条** 飞书交互卡片（schema 2.0）；截图开启时先上传 image_key **嵌进卡片**，不再跟一条独立图片
@@ -304,6 +306,8 @@ _processed_lark_im_event_ids: set = set()
 _PROCESSED_IM_EVENT_IDS_CAP = 4000
 _monitoring_user_reply_sent_at: Dict[str, float] = {}
 _monitoring_user_send_in_progress: set = set()
+_monitoring_chat_reply_sent_at: Dict[str, float] = {}
+_monitoring_chat_send_in_progress: set = set()
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
@@ -528,6 +532,44 @@ def _monitoring_end_user_send(dispatch_key: str, success: bool) -> None:
         _monitoring_user_send_in_progress.discard(dk)
         if success:
             _monitoring_user_reply_sent_at[dk] = time.monotonic()
+
+
+def _monitoring_try_begin_chat_send(chat_key: str) -> bool:
+    """
+    Coarse safety gate by conversation key (chat/open_id).
+    This blocks envelope variants that accidentally bypass dispatch-key dedupe.
+    """
+    ck = (chat_key or "").strip()
+    if not ck:
+        return True
+    sec = _cfg_float("MONITORING_CHAT_COALESCE_SECONDS", 10.0)
+    if sec <= 0:
+        return True
+    now = time.monotonic()
+    with _monitoring_reply_dispatch_lock:
+        if ck in _monitoring_chat_send_in_progress:
+            return False
+        prev = _monitoring_chat_reply_sent_at.get(ck, 0.0)
+        if prev > 0.0 and (now - prev) < sec:
+            return False
+        _monitoring_chat_send_in_progress.add(ck)
+        if len(_monitoring_chat_reply_sent_at) > 800:
+            for k, t1 in sorted(_monitoring_chat_reply_sent_at.items(), key=lambda kv: kv[1])[:300]:
+                try:
+                    del _monitoring_chat_reply_sent_at[k]
+                except KeyError:
+                    pass
+    return True
+
+
+def _monitoring_end_chat_send(chat_key: str, success: bool) -> None:
+    ck = (chat_key or "").strip()
+    if not ck:
+        return
+    with _monitoring_reply_dispatch_lock:
+        _monitoring_chat_send_in_progress.discard(ck)
+        if success:
+            _monitoring_chat_reply_sent_at[ck] = time.monotonic()
 
 
 def _lark_skip_http_im_message_when_ws_mode() -> bool:
@@ -2238,10 +2280,18 @@ def _monitoring_background_worker(
     Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
     """
     logger.info("monitoring background job start mid=%r chat=%r open=%r", mid, bool(chat_id), bool(open_id))
+    conv_key = (chat_id or "").strip() or (f"open:{(open_id or '').strip()}" if (open_id or "").strip() else "")
+    if conv_key and not _monitoring_try_begin_chat_send(conv_key):
+        logger.warning(
+            "monitoring: blocked duplicate by conversation gate key=%r (MONITORING_CHAT_COALESCE_SECONDS)",
+            conv_key[:96],
+        )
+        return
     if dispatch_key and not _monitoring_try_begin_user_send(dispatch_key):
         logger.warning(
             "monitoring: blocked duplicate **user-visible** send (MONITORING_SEND_COALESCE_SECONDS or concurrent send)"
         )
+        _monitoring_end_chat_send(conv_key, False)
         return
 
     user_visible_send_ok = False
@@ -2430,6 +2480,8 @@ def _monitoring_background_worker(
     finally:
         if dispatch_key:
             _monitoring_end_user_send(dispatch_key, user_visible_send_ok)
+        if conv_key:
+            _monitoring_end_chat_send(conv_key, user_visible_send_ok)
 
 
 def _serialize_lark_user_id(uid: Any) -> Dict[str, Any]:
