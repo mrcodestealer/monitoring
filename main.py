@@ -18,7 +18,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（最近 10 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``now-10m`` 一致）。
+群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（默认最近 **15** 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``GRAFANA_DASHBOARD_FROM`` 一致）。
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
 
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
@@ -68,10 +68,10 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DEPOSIT_SERIES_KEYWORD": "createProposal",
     "GRAFANA_PANEL_TITLE_WITHDRAW": "提款 (Withdrawal)",
     "MONITORING_WITHDRAW_SERIES_KEYWORD": "InitiateWithdrawal",
-    "GRAFANA_DASHBOARD_FROM": "now-10m",
+    "GRAFANA_DASHBOARD_FROM": "now-15m",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
-    "GRAFANA_QUERY_LOOKBACK_SECONDS": 600,
+    "GRAFANA_QUERY_LOOKBACK_SECONDS": 900,
     # Prometheus 最近分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，最新点落在「约前两分钟」
     "GRAFANA_QUERY_END_LAG_SECONDS": 120,
     # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
@@ -92,8 +92,10 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": 1600,
     # 1=点击折叠的 dashboard 行（如只显示 KPI 标题无图时）
     "GRAFANA_SCREENSHOT_EXPAND_ROWS": "1",
-    # 截图 URL 用 now-10m / now（与浏览器一致）；0 则用 Prometheus 窗口的绝对毫秒时间戳
+    # 截图 URL 用 GRAFANA_DASHBOARD_FROM/TO（默认 now-15m / now）；0 则用 Prometheus 窗口的绝对毫秒时间戳
     "GRAFANA_SCREENSHOT_RELATIVE_RANGE": "1",
+    # 截图 URL 追加 timezone=…（与 Grafana 时间栏一致）；设为 none / - 可省略该参数
+    "GRAFANA_SCREENSHOT_TIMEZONE": "browser",
     # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
     "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 4500,
     # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
@@ -382,12 +384,12 @@ GRAFANA_PANEL_TITLE_DEPOSIT = _cfg_str("GRAFANA_PANEL_TITLE_DEPOSIT", "主站充
 MONITORING_DEPOSIT_SERIES_KEYWORD = _cfg_str("MONITORING_DEPOSIT_SERIES_KEYWORD", "createProposal").strip()
 GRAFANA_PANEL_TITLE_WITHDRAW = _cfg_str("GRAFANA_PANEL_TITLE_WITHDRAW", "提款 (Withdrawal)")
 MONITORING_WITHDRAW_SERIES_KEYWORD = _cfg_str("MONITORING_WITHDRAW_SERIES_KEYWORD", "InitiateWithdrawal").strip()
-# Browser URL time range: last 10 minutes (matches “latest 10 mins”). Override e.g. now-1m if you want.
-GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-10m")
+# Browser URL time range for screenshots (default last 15 minutes, aligned with /monitoring tables).
+GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-15m")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
-# Prometheus query_range step (seconds); 60 → up to 10 buckets in 10m
+# Prometheus query_range step (seconds); 60 → up to 15 buckets in 15m when lookback=900
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
-GRAFANA_QUERY_LOOKBACK_SECONDS = _cfg_int("GRAFANA_QUERY_LOOKBACK_SECONDS", 600)
+GRAFANA_QUERY_LOOKBACK_SECONDS = _cfg_int("GRAFANA_QUERY_LOOKBACK_SECONDS", 900)
 GRAFANA_QUERY_END_LAG_SECONDS = _cfg_int("GRAFANA_QUERY_END_LAG_SECONDS", 120)
 GRAFANA_SCREENSHOT_WIDTH = _cfg_int("GRAFANA_SCREENSHOT_WIDTH", 1400)
 GRAFANA_SCREENSHOT_HEIGHT = _cfg_int("GRAFANA_SCREENSHOT_HEIGHT", 1080)
@@ -424,6 +426,8 @@ GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS = max(
 )
 GRAFANA_SCREENSHOT_KIOSK = _cfg_str("GRAFANA_SCREENSHOT_KIOSK", "").strip()
 GRAFANA_SCREENSHOT_RELATIVE_RANGE = _lark_env_truthy("GRAFANA_SCREENSHOT_RELATIVE_RANGE")
+# Screenshot URL ``timezone=`` (e.g. browser); none / - / off → omit parameter
+GRAFANA_SCREENSHOT_TIMEZONE = _cfg_str("GRAFANA_SCREENSHOT_TIMEZONE", "browser").strip()
 GRAFANA_USER = (
     _cfg_str("GRAFANA_USER")
     or _cfg_str("GRAFANA_ID")
@@ -1286,8 +1290,8 @@ def fetch_request_total_1m_series(
     end_unix: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Same data as Grafana panel「请求总数/1m」: last ``GRAFANA_QUERY_LOOKBACK_SECONDS`` (default **600 = 10m**),
-    step ``GRAFANA_QUERY_STEP``. Align with dashboard ``GRAFANA_DASHBOARD_FROM`` / ``now-10m`` for screenshots.
+    Same data as Grafana panel「请求总数/1m」: last ``GRAFANA_QUERY_LOOKBACK_SECONDS`` (default **900 = 15m**),
+    step ``GRAFANA_QUERY_STEP``. Align with dashboard ``GRAFANA_DASHBOARD_FROM`` / ``now-15m`` for screenshots.
     ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
     avoiding incomplete recent-minute series that look like a false drop.
     Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
@@ -2093,7 +2097,7 @@ def _grafana_build_screenshot_dashboard_url(
     rt_ov = (relative_to or "").strip()
     force_relative = bool(rf_ov or rt_ov)
     if GRAFANA_SCREENSHOT_RELATIVE_RANGE or force_relative:
-        rf = rf_ov or (GRAFANA_DASHBOARD_FROM or "now-10m").strip()
+        rf = rf_ov or (GRAFANA_DASHBOARD_FROM or "now-15m").strip()
         rt = rt_ov or (GRAFANA_DASHBOARD_TO or "now").strip()
         params.extend([("from", rf), ("to", rt)])
     else:
@@ -2104,6 +2108,10 @@ def _grafana_build_screenshot_dashboard_url(
             ]
         )
     tz = (timezone_param or "").strip()
+    if not tz:
+        tz = (GRAFANA_SCREENSHOT_TIMEZONE or "").strip()
+    if tz.lower() in ("none", "-", "off", "0", "false", "no"):
+        tz = ""
     if tz:
         params.append(("timezone", tz))
     k = (GRAFANA_SCREENSHOT_KIOSK or "").strip().lower()
@@ -4217,9 +4225,9 @@ def run_monitoring_bot() -> None:
         logger.warning(
             "MONITORING_AT_MENTION_ENABLE is on but LARK_BOT_OPEN_ID is empty — @-only triggers will not match; set LARK_BOT_OPEN_ID to this bot's open_id."
         )
-    if int(GRAFANA_QUERY_LOOKBACK_SECONDS) != 600:
+    if int(GRAFANA_QUERY_LOOKBACK_SECONDS) != 900:
         logger.warning(
-            "GRAFANA_QUERY_LOOKBACK_SECONDS=%s (default 600 = 10m) — /monitoring Prometheus window is not 10 minutes",
+            "GRAFANA_QUERY_LOOKBACK_SECONDS=%s (default 900 = 15m) — /monitoring Prometheus window differs from default 15 minutes",
             GRAFANA_QUERY_LOOKBACK_SECONDS,
         )
     raw_mode = _cfg_str("LARK_EVENT_MODE", "http").strip().lower()
