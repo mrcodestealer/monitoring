@@ -130,11 +130,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MESSAGE_CARD_ENABLE": "1",
     # 1=把截图嵌进卡片；0=卡片仅文字，截图在下一条消息单独发送
     "MONITORING_CARD_EMBED_SCREENSHOT": "0",
-    # 1=在监控卡片底部展示按钮（Open Grafana）
-    "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "0",
-    "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Open Grafana",
-    # 留空则自动使用 GRAFANA_BASE_URL + GRAFANA_DASHBOARD_PATH + from/to
-    "MONITORING_MESSAGE_CARD_BUTTON_URL": "",
+    # 1=在监控卡片底部展示 callback 按钮（实现方式参考 Chatbox/jenkinsupdate 的 card JSON 2.0）
+    "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
+    "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Refresh screenshot",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -1356,19 +1354,37 @@ def _monitoring_card_body_md_strip_title(reply: str) -> str:
     return _monitoring_reply_to_card_md(r)
 
 
-def _monitoring_card_button_url() -> str:
-    manual = _cfg_str("MONITORING_MESSAGE_CARD_BUTTON_URL", "").strip()
-    if manual:
-        return manual
-    base = f"{GRAFANA_BASE_URL}{GRAFANA_DASHBOARD_PATH}"
-    q = urlencode(
-        [
-            ("orgId", "1"),
-            ("from", (GRAFANA_DASHBOARD_FROM or "now-10m").strip()),
-            ("to", (GRAFANA_DASHBOARD_TO or "now").strip()),
-        ]
-    )
-    return f"{base}?{q}"
+def _monitoring_card_callback_payload_strings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Match jenkinsupdate behavior: scalar callback values are stringified for client compatibility."""
+    out: Dict[str, Any] = {}
+    for k, v in payload.items():
+        ks = str(k)
+        if isinstance(v, (dict, list)):
+            out[ks] = v
+        elif v is None:
+            out[ks] = ""
+        else:
+            out[ks] = str(v)
+    return out
+
+
+def _monitoring_card_v2_callback_button(
+    label: str,
+    btn_type: str,
+    payload: Dict[str, Any],
+    *,
+    element_id: str = "mon_rfsh",
+) -> Dict[str, Any]:
+    btn: Dict[str, Any] = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": label},
+        "type": btn_type,
+        "behaviors": [{"type": "callback", "value": _monitoring_card_callback_payload_strings(payload)}],
+    }
+    eid = (element_id or "").strip()[:20]
+    if eid:
+        btn["element_id"] = eid
+    return btn
 
 
 def _monitoring_interactive_card_dict(
@@ -1390,6 +1406,15 @@ def _monitoring_interactive_card_dict(
                 "img_key": ik,
                 "alt": {"tag": "plain_text", "content": "Grafana"},
             }
+        )
+    if _lark_env_truthy("MONITORING_MESSAGE_CARD_BUTTON_ENABLE"):
+        elements.append(
+            _monitoring_card_v2_callback_button(
+                _cfg_str("MONITORING_MESSAGE_CARD_BUTTON_TEXT", "Refresh screenshot")[:40],
+                "primary",
+                {"k": "monitoring_btn", "v": "refresh"},
+                element_id="mon_rfsh",
+            )
         )
     return {
         "schema": "2.0",
@@ -2285,6 +2310,12 @@ def _lark_verify_event_token(data: Dict[str, Any]) -> bool:
     """True when ``_lark_extract_verification_token`` matches ``VERIFICATION_TOKEN`` (Chatbox pattern)."""
     if not VERIFICATION_TOKEN:
         return True
+    et = _lark_header_event_type(data)
+    if isinstance(et, str) and et.startswith("card.action"):
+        raw_tok = data.get("token")
+        if _lark_looks_like_lark_card_update_credential(raw_tok):
+            # Card callback webhooks may use c-/d- credential token instead of app verification token.
+            return True
     tok = _lark_extract_verification_token(data)
     return tok == VERIFICATION_TOKEN
 
