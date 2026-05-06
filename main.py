@@ -2241,24 +2241,22 @@ def _format_http_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
     thr = float(analysis.get("alert_threshold_pct") or MONITORING_HTTP_DROP_ALERT_PCT)
     lines: List[str] = [
         "",
-        f"【HTTP only 】ALERT will trigger when drop/spike >= {thr:g}%",
+        f"[HTTP only] alert threshold: drop/spike >= {thr:g}%",
     ]
 
     cd = analysis.get("consecutive_max_drop") or analysis.get("adjacent_max_drop")
     cs = analysis.get("consecutive_max_spike") or analysis.get("adjacent_max_spike")
     if isinstance(cd, dict) and cd.get("from_ts") is not None:
         p = cd.get("pct")
-        lines.append(
-            f"- max drop : {_fmt_ts_short(cd['from_ts'])} → {_fmt_ts_short(cd['to_ts'])}  -{p}%"
-        )
+        lines.append(f"max drop : {_fmt_ts_short(cd['from_ts'])} -> {_fmt_ts_short(cd['to_ts'])}  -{p}%")
     else:
-        lines.append("- max drop : n/a")
+        lines.append("max drop : n/a")
 
     if isinstance(cs, dict) and cs.get("from_ts") is not None:
         p = cs.get("pct")
-        lines.append(f"- max spike: {_fmt_ts_short(cs['from_ts'])} → {_fmt_ts_short(cs['to_ts'])}  +{p}%")
+        lines.append(f"max spike: {_fmt_ts_short(cs['from_ts'])} -> {_fmt_ts_short(cs['to_ts'])}  +{p}%")
     else:
-        lines.append("- max spike: n/a")
+        lines.append("max spike: n/a")
 
     return lines
 
@@ -2295,13 +2293,17 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
             legend = _compact_http_legend(m, str(ref))
             vals = r.get("values") or []
             if not vals:
-                lines.append(f"- {legend}\n  (empty)")
+                lines.append(f"[{ref}] {legend}: (empty)")
                 continue
-            lines.append(f"- [{ref}] {legend}")
+            lines.append("")
+            lines.append(f"[{ref}] {legend}")
             tail = vals[-max_rows:]
-            lines.append("  time          value")
+            rows: List[str] = ["time           value", "-------------  ------------"]
             for pair in tail:
-                lines.append(f"  {_fmt_ts_short(pair[0]):<14} {_fmt_num(pair[1])}")
+                rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+            lines.append("```text")
+            lines.extend(rows)
+            lines.append("```")
 
     if http_ex.get("hit_alert") and TARGET_USER_OPEN_ID:
         lines.append(f'<at user_id="{TARGET_USER_OPEN_ID}"> </at>')
