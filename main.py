@@ -1400,9 +1400,14 @@ def _lark_resolve_card_action(data: Dict[str, Any]) -> Optional[Tuple[Optional[s
     return (chat_id, sender_id, val, eid)
 
 
-def _monitoring_reply_to_card_md(reply: str) -> str:
+def _monitoring_reply_to_card_md(reply: str, *, preserve_code_fences: bool = False) -> str:
+    """
+    Card body text (length-capped). Legacy ``tag: markdown`` disliked raw ``` fences — we strip/replace unless
+    ``preserve_code_fences`` (used with ``div`` + ``lark_md`` per Feishu card JSON v2).
+    """
     s = (reply or "")[:3800]
-    s = s.replace("```", "'''")
+    if not preserve_code_fences:
+        s = s.replace("```", "'''")
     if len(reply or "") > 3800:
         s += "\n\n…(truncated)"
     return s
@@ -1414,13 +1419,15 @@ def _monitoring_card_title_plain() -> str:
     return f"📊 【{pt}】graph"
 
 
-def _monitoring_card_body_md_strip_title(reply: str) -> str:
+def _monitoring_card_body_md_strip_title(
+    reply: str, *, preserve_code_fences: bool = False
+) -> str:
     """Remove the first line if it duplicates the card header (``【面板】graph``)."""
     r = (reply or "").strip()
     dup = f"【{GRAFANA_PANEL_TITLE}】graph"
     if r.startswith(dup):
         r = r[len(dup) :].lstrip("\n")
-    return _monitoring_reply_to_card_md(r)
+    return _monitoring_reply_to_card_md(r, preserve_code_fences=preserve_code_fences)
 
 
 def _monitoring_interactive_card_dict(
@@ -1429,10 +1436,19 @@ def _monitoring_interactive_card_dict(
     receive_id: str,
     lark_img_key: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Feishu **card JSON v2** (``schema: "2.0"``): body text uses ``div`` + ``lark_md`` (supports fenced code blocks).
+    Buttons sit as **top-level** ``body.elements`` with ``behaviors`` callbacks — v2 does not wrap them in the v1
+    ``action`` module.
+    """
     btn_val = {"m": "shot", "t": (receive_id_type or "chat_id").strip(), "i": (receive_id or "").strip()}
     title = _monitoring_card_title_plain()
+    md_body = _monitoring_card_body_md_strip_title(reply, preserve_code_fences=True)
     elements: List[Dict[str, Any]] = [
-        {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": md_body},
+        },
     ]
     ik = (lark_img_key or "").strip()
     if ik:
