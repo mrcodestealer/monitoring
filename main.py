@@ -2565,9 +2565,9 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             debounce_sec = float(raw_db)
         except (TypeError, ValueError):
             debounce_sec = 5.0
-    # Some duplicated Feishu deliveries for the same human message can differ in ``message_id``/``msg_time``.
-    # Keep debounce key independent from message timestamp so those variants still collapse into one worker.
-    debounce_key = f"{(chat_id or '').strip()}\n{sender_debounce}\n{body_key}"
+    # Some duplicated Feishu deliveries for the same human message can differ in sender/message envelope fields.
+    # Keep debounce/send key stable on chat + normalized command body only, so variants collapse into one worker.
+    debounce_key = f"{(chat_id or '').strip()}\n{body_key}"
     now_m = time.monotonic()
     with _monitoring_reply_dispatch_lock:
         if im_event_id and im_event_id in _processed_lark_im_event_ids:
