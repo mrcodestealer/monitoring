@@ -1408,22 +1408,38 @@ def _monitoring_reply_to_card_md(reply: str) -> str:
     return s
 
 
+def _monitoring_card_title_plain() -> str:
+    """Match on-dashboard line ``【{panel}】graph`` with emoji so the card reads as a monitoring card."""
+    pt = (GRAFANA_PANEL_TITLE or "Monitoring").strip()
+    return f"📊 【{pt}】graph"
+
+
+def _monitoring_card_body_md_strip_title(reply: str) -> str:
+    """Remove the first line if it duplicates the card header (``【面板】graph``)."""
+    r = (reply or "").strip()
+    dup = f"【{GRAFANA_PANEL_TITLE}】graph"
+    if r.startswith(dup):
+        r = r[len(dup) :].lstrip("\n")
+    return _monitoring_reply_to_card_md(r)
+
+
 def _monitoring_interactive_card_dict(reply: str, receive_id_type: str, receive_id: str) -> Dict[str, Any]:
     btn_val = {"m": "shot", "t": (receive_id_type or "chat_id").strip(), "i": (receive_id or "").strip()}
+    title = _monitoring_card_title_plain()
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "wide_screen_mode": True},
         "header": {
             "template": "blue",
-            "title": {"tag": "plain_text", "content": "Grafana /monitoring"},
+            "title": {"tag": "plain_text", "content": title},
+            "subtitle": {"tag": "plain_text", "content": "Grafana · 下方按钮可重新截图"},
         },
         "body": {
             "elements": [
-                # 使用官方 markdown 块（div+lark_md 在部分租户下发会降级或校验失败）
-                {"tag": "markdown", "content": _monitoring_reply_to_card_md(reply)},
+                {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
                 {
                     "tag": "button",
-                    "text": {"tag": "plain_text", "content": "重新截图"},
+                    "text": {"tag": "plain_text", "content": "📷 重新截图"},
                     "type": "primary",
                     "behaviors": [{"type": "callback", "value": btn_val}],
                 },
@@ -1433,29 +1449,38 @@ def _monitoring_interactive_card_dict(reply: str, receive_id_type: str, receive_
 
 
 def _lark_send_interactive_card(receive_id_type: str, receive_id: str, card: Dict[str, Any]) -> None:
-    from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
-    from lark_oapi.api.im.v1.model.create_message_request_body import CreateMessageRequestBody
-
-    client = _get_lark_oapi_client()
-    content = json.dumps(card, ensure_ascii=False)
-    body = (
-        CreateMessageRequestBody.builder()
-        .receive_id(receive_id)
-        .msg_type("interactive")
-        .content(content)
-        .build()
+    """
+    Send ``msg_type=interactive`` via **HTTP** (same pattern as :func:`_lark_upload_png_image_key` / Chatbox),
+    not lark-oapi ``message.create`` — some SDK builds mishandle ``interactive`` ``content`` encoding.
+    """
+    tok = _lark_tenant_access_token_string()
+    url = f"{_lark_api_domain()}/open-apis/im/v1/messages"
+    content_str = json.dumps(card, ensure_ascii=False)
+    payload = {
+        "receive_id": receive_id,
+        "msg_type": "interactive",
+        "content": content_str,
+    }
+    r = requests.post(
+        url,
+        params={"receive_id_type": receive_id_type},
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        json=payload,
+        timeout=60,
     )
-    req = (
-        CreateMessageRequest.builder()
-        .receive_id_type(receive_id_type)
-        .request_body(body)
-        .build()
+    r.raise_for_status()
+    j = r.json()
+    if int(j.get("code", -1)) != 0:
+        raise RuntimeError(f"im/v1/messages interactive failed: {j}")
+    mid = (j.get("data") or {}).get("message_id")
+    logger.info(
+        "Lark interactive card sent (HTTP) message_id=%r receive_id_type=%r",
+        mid,
+        receive_id_type,
     )
-    resp = client.im.v1.message.create(req)
-    if not resp.success():
-        raise RuntimeError(
-            f"Lark interactive card send failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
-        )
 
 
 def _lark_send_monitoring_user_message(receive_id_type: str, receive_id: str, reply: str) -> None:
