@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
+Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``LARK_EVENT_MODE`` 决定）+ Grafana。
 
 启动: ``python main.py``
 
 **配置**：编辑本文件顶部 ``_CFG`` 字典（不再读取 ``.env``）。也可用 **systemd ``Environment=KEY=value``** 覆盖同名键。
 
-**默认 ``LARK_EVENT_MODE=ws``** — 长连接；可选 ``ENABLE_HTTP=1`` 并行 HTTP。
-若同一条触发出现 **两条回复**：多为 WS 上 **v1+v2 双投** 或 **长连接 + HTTP Request URL 各收一次** — 见 ``LARK_WS_REGISTER_IM_MESSAGE_V2``、``LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS``、``MONITORING_IM_DEBOUNCE_SECONDS``。
+**``LARK_EVENT_MODE=http``（纯 HTTP，不启 WebSocket）** — 监听 ``PORT``，事件只走 ``POST /webhook/event``。飞书后台请选 **「将事件发送至开发者服务器」** Request URL，**不要**再选「使用长连接接收事件」，否则事件可能仍发到别处或产生混淆。
 
-**``LARK_EVENT_MODE=http``** — 监听 ``PORT``（本仓库默认 **5002**，与同机运行的 ``Chatbox/main.py``（常用 **5000**）错开端口），事件走 ``POST /webhook/event``。
+**``LARK_EVENT_MODE=ws``** — 仅 Lark **长连接**收事件；可选 ``ENABLE_HTTP=1`` 并行起 HTTP 侧车（健康检查等），此时建议 ``LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS=1``，避免 IM 在 HTTP+WS 各收一次。
+若同一条触发出现 **两条回复**：见 ``LARK_WS_REGISTER_IM_MESSAGE_V2``、``LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS``、``MONITORING_IM_DEBOUNCE_SECONDS``。
+
+**HTTP 模式** — 监听 ``PORT``（本仓库默认 **5002**，与同机运行的 ``Chatbox/main.py``（常用 **5000**）错开端口），事件走 ``POST /webhook/event``。
 默认 HTTP 栈为 **Flask ``threaded=True``**（实现方式对齐 Chatbox）；生产可设 ``HTTP_SERVER=waitress``。
 
 端口解析顺序：**环境变量 ``PORT`` → ``LARKBOT_PORT`` → ``_CFG["PORT"]``**（与 Chatbox 的 ``PORT``/``LARKBOT_PORT`` 习惯一致）。
@@ -432,7 +434,7 @@ def _lark_im_payload_event_id(data: Dict[str, Any]) -> str:
 def _lark_skip_http_im_message_when_ws_mode() -> bool:
     if not _lark_env_truthy("LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS"):
         return False
-    return _cfg_str("LARK_EVENT_MODE", "ws").strip().lower() == "ws"
+    return _cfg_str("LARK_EVENT_MODE", "http").strip().lower() == "ws"
 
 
 def _lark_im_sender_debounce_token(sender: Dict[str, Any], open_id: str) -> str:
@@ -2881,8 +2883,8 @@ def run_monitoring_bot() -> None:
             "GRAFANA_QUERY_LOOKBACK_SECONDS=%s (default 600 = 10m) — /monitoring Prometheus window is not 10 minutes",
             GRAFANA_QUERY_LOOKBACK_SECONDS,
         )
-    raw_mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower()
-    mode = raw_mode if raw_mode else "ws"
+    raw_mode = _cfg_str("LARK_EVENT_MODE", "http").strip().lower()
+    mode = raw_mode if raw_mode else "http"
 
     def run_http() -> None:
         stack = _cfg_str("HTTP_SERVER", "flask").strip().lower()
@@ -2915,7 +2917,10 @@ def run_monitoring_bot() -> None:
             app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False, debug=False)
 
     if mode == "http":
-        logger.info("LARK_EVENT_MODE=http — Feishu events via POST /webhook/event only")
+        logger.info(
+            "LARK_EVENT_MODE=http — **WebSocket disabled**; Feishu IM/events only via POST /webhook/event. "
+            "Use Request URL mode in the developer console (not long-connection)."
+        )
         hint = _cfg_str("LARK_WEBHOOK_PUBLIC_URL", "").strip()
         if hint:
             logger.info("Feishu developer console → 事件与回调 → Request URL (示例配置): %s", hint)
@@ -2944,7 +2949,7 @@ def run_monitoring_bot() -> None:
         return
 
     if mode != "ws":
-        raise SystemExit(f"Unknown LARK_EVENT_MODE={mode!r} (use ws or http)")
+        raise SystemExit(f"Unknown LARK_EVENT_MODE={mode!r} (use ``http`` for webhook-only, or ``ws`` for long connection)")
 
     http_on = _cfg_str("ENABLE_HTTP", "1").strip().lower() in ("1", "true", "yes", "on")
     http_thread: Optional[threading.Thread] = None
