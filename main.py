@@ -117,11 +117,11 @@ _CFG: Dict[str, Any] = {
     # 同一 chat+发送者+触发正文在 N 秒内只跑一次监控任务；0=关闭（默认 5）
     "MONITORING_IM_DEBOUNCE_SECONDS": "5",
     # 同一会话在 N 秒内仅接受一次 monitoring 触发（在启动后台线程前兜底，拦同秒双 envelope）
-    "MONITORING_CHAT_TRIGGER_DEBOUNCE_SECONDS": "8",
+    "MONITORING_CHAT_TRIGGER_DEBOUNCE_SECONDS": "0",
     # 同一触发在 N 秒内只允许 **一次** 真正发到飞书（拦双 POST / 双进程竞态）；0=关闭（默认 12）
     "MONITORING_SEND_COALESCE_SECONDS": "12",
     # 同一会话(chat_id/open_id)在 N 秒内只允许一次用户可见发送（兜底拦截同秒双 envelope）；0=关闭
-    "MONITORING_CHAT_COALESCE_SECONDS": "10",
+    "MONITORING_CHAT_COALESCE_SECONDS": "0",
     # 1=且 LARK_EVENT_MODE=ws 时忽略 HTTP webhook 上的 im.message（避免与长连接重复处理）
     "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     # 1=监控摘要用 **一条** 飞书交互卡片（schema 2.0）；截图开启时先上传 image_key **嵌进卡片**，不再跟一条独立图片
