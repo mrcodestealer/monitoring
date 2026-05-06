@@ -2352,6 +2352,29 @@ def _format_trigger_lines(
     return out
 
 
+def _format_trigger_fallback_line(
+    graph_label: str,
+    series_label: str,
+    analysis: Dict[str, Any],
+    threshold_pct: float,
+) -> Optional[str]:
+    """
+    Fallback reason when concise consecutive drop/spike lines are empty but ``hit_alert`` is true.
+    Uses avg-drop window details so alert messages are never reasonless.
+    """
+    w = analysis.get("worst_avg_drop_window")
+    if isinstance(w, dict) and float(w.get("avg_drop_pct") or 0.0) >= float(threshold_pct):
+        return (
+            f"[{graph_label}] {series_label} AVG-DROP {w.get('avg_drop_pct')}% "
+            f"({w.get('n_minutes')}m): {_fmt_num(w.get('avg_baseline'))} -> {_fmt_num(w.get('avg_recent'))} "
+            f"[{_fmt_ts_short(w.get('baseline_from_ts'))}..{_fmt_ts_short(w.get('baseline_to_ts'))} -> "
+            f"{_fmt_ts_short(w.get('recent_from_ts'))}..{_fmt_ts_short(w.get('recent_to_ts'))}]"
+        )
+    if bool(analysis.get("hit_alert")):
+        return f"[{graph_label}] {series_label} alert triggered (reason details unavailable)"
+    return None
+
+
 def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     """
     Alert-only concise content:
@@ -2359,20 +2382,35 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     """
     lines: List[str] = ["[ALERT] Threshold reached"]
     a_http = _http_analysis_for_payload(payload)
-    lines.extend(_format_trigger_lines(GRAFANA_PANEL_TITLE, "HTTP", a_http, MONITORING_HTTP_DROP_ALERT_PCT))
+    reasons = _format_trigger_lines(GRAFANA_PANEL_TITLE, "HTTP", a_http, MONITORING_HTTP_DROP_ALERT_PCT)
+    if not reasons:
+        fb = _format_trigger_fallback_line(GRAFANA_PANEL_TITLE, "HTTP", a_http, MONITORING_HTTP_DROP_ALERT_PCT)
+        if fb:
+            reasons.append(fb)
+    lines.extend(reasons)
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict) or (ex.get("kind") or "") != "9280_push":
             continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
         a2 = _analysis_for_9280_payload(p2)
-        lines.extend(
-            _format_trigger_lines(
+        reasons2 = _format_trigger_lines(
+            GRAFANA_PANEL_TITLE_9280,
+            MONITORING_9280_SERIES_KEYWORD,
+            a2,
+            MONITORING_9280_ALERT_PCT,
+        )
+        if not reasons2:
+            fb2 = _format_trigger_fallback_line(
                 GRAFANA_PANEL_TITLE_9280,
                 MONITORING_9280_SERIES_KEYWORD,
                 a2,
                 MONITORING_9280_ALERT_PCT,
             )
-        )
+            if fb2:
+                reasons2.append(fb2)
+        lines.extend(reasons2)
+    if len(lines) == 1:
+        lines.append("alert triggered but no analyzable timeseries points were found")
     if TARGET_USER_OPEN_ID:
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
     return "\n".join(lines)
