@@ -2157,7 +2157,14 @@ def _best_consecutive_drop_run(vals: List[float], ts: List[float]) -> Optional[D
         if j > i and vals[i] > 0 and vals[j] < vals[i]:
             pct = (vals[i] - vals[j]) / vals[i] * 100.0
             buckets = j - i + 1
-            cand = {"pct": round(pct, 2), "from_ts": ts[i], "to_ts": ts[j], "buckets": buckets}
+            cand = {
+                "pct": round(pct, 2),
+                "from_ts": ts[i],
+                "to_ts": ts[j],
+                "from_val": vals[i],
+                "to_val": vals[j],
+                "buckets": buckets,
+            }
             if best is None or pct > float(best["pct"]) or (
                 pct == float(best["pct"]) and buckets > int(best["buckets"])
             ):
@@ -2180,7 +2187,14 @@ def _best_consecutive_spike_run(vals: List[float], ts: List[float]) -> Optional[
         if j > i and vals[i] > 0 and vals[j] > vals[i]:
             pct = (vals[j] - vals[i]) / vals[i] * 100.0
             buckets = j - i + 1
-            cand = {"pct": round(pct, 2), "from_ts": ts[i], "to_ts": ts[j], "buckets": buckets}
+            cand = {
+                "pct": round(pct, 2),
+                "from_ts": ts[i],
+                "to_ts": ts[j],
+                "from_val": vals[i],
+                "to_val": vals[j],
+                "buckets": buckets,
+            }
             if best is None or pct > float(best["pct"]) or (
                 pct == float(best["pct"]) and buckets > int(best["buckets"])
             ):
@@ -2222,6 +2236,8 @@ def _http_drop_spike_analysis(
             "pct": drop_run["pct"],
             "from_ts": drop_run["from_ts"],
             "to_ts": drop_run["to_ts"],
+            "from_val": drop_run.get("from_val"),
+            "to_val": drop_run.get("to_val"),
             "buckets": drop_run["buckets"],
         }
         if float(drop_run.get("pct") or 0.0) >= float(alert_threshold_pct):
@@ -2232,6 +2248,8 @@ def _http_drop_spike_analysis(
             "pct": spike_run["pct"],
             "from_ts": spike_run["from_ts"],
             "to_ts": spike_run["to_ts"],
+            "from_val": spike_run.get("from_val"),
+            "to_val": spike_run.get("to_val"),
             "buckets": spike_run["buckets"],
         }
         if float(spike_run.get("pct") or 0.0) >= float(alert_threshold_pct):
@@ -2304,6 +2322,56 @@ def _format_9280_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
     else:
         lines.append("max spike: n/a")
     return lines
+
+
+def _format_trigger_lines(
+    graph_label: str,
+    series_label: str,
+    analysis: Dict[str, Any],
+    threshold_pct: float,
+) -> List[str]:
+    out: List[str] = []
+    cd = analysis.get("consecutive_max_drop") or analysis.get("adjacent_max_drop")
+    cs = analysis.get("consecutive_max_spike") or analysis.get("adjacent_max_spike")
+    if isinstance(cd, dict) and float(cd.get("pct") or 0.0) >= float(threshold_pct):
+        out.append(
+            f"[{graph_label}] {series_label} DROP {cd.get('pct')}%: "
+            f"{_fmt_num(cd.get('from_val'))} ({_fmt_ts_short(cd.get('from_ts'))}) -> "
+            f"{_fmt_num(cd.get('to_val'))} ({_fmt_ts_short(cd.get('to_ts'))})"
+        )
+    if isinstance(cs, dict) and float(cs.get("pct") or 0.0) >= float(threshold_pct):
+        out.append(
+            f"[{graph_label}] {series_label} SPIKE {cs.get('pct')}%: "
+            f"{_fmt_num(cs.get('from_val'))} ({_fmt_ts_short(cs.get('from_ts'))}) -> "
+            f"{_fmt_num(cs.get('to_val'))} ({_fmt_ts_short(cs.get('to_ts'))})"
+        )
+    return out
+
+
+def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
+    """
+    Alert-only concise content:
+    which graph/series, spike or drop, from value/time -> to value/time.
+    """
+    lines: List[str] = ["[ALERT] Threshold reached"]
+    a_http = _http_analysis_for_payload(payload)
+    lines.extend(_format_trigger_lines(GRAFANA_PANEL_TITLE, "HTTP", a_http, MONITORING_HTTP_DROP_ALERT_PCT))
+    for ex in payload.get("extraPanels") or []:
+        if not isinstance(ex, dict) or (ex.get("kind") or "") != "9280_push":
+            continue
+        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+        a2 = _analysis_for_9280_payload(p2)
+        lines.extend(
+            _format_trigger_lines(
+                GRAFANA_PANEL_TITLE_9280,
+                MONITORING_9280_SERIES_KEYWORD,
+                a2,
+                MONITORING_9280_ALERT_PCT,
+            )
+        )
+    if TARGET_USER_OPEN_ID:
+        lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
+    return "\n".join(lines)
 
 
 def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
@@ -2431,7 +2499,7 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
         lines.extend(_format_9280_analysis_lines(a2))
 
     if _monitoring_payload_hit_alert(payload) and TARGET_USER_OPEN_ID:
-        lines.append(f'<at user_id="{TARGET_USER_OPEN_ID}"> </at>')
+        lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
     lines.extend(_format_http_analysis_lines(http_ex))
 
     out = "\n".join(lines)
@@ -2589,7 +2657,7 @@ def _monitoring_watchdog_loop() -> None:
                     continue
                 _monitoring_watch_last_alert_at = now_m
 
-            reply = _format_monitoring_reply(payload)
+            reply = _format_alert_trigger_reply(payload)
             pre_key: Optional[str] = None
             if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                 w0 = payload.get("window") or {}
@@ -2762,17 +2830,18 @@ def _monitoring_background_worker(
                 )
 
             alert_chat_id = (MONITORING_ALERT_CHAT_ID or "").strip()
+            alert_reply = _format_alert_trigger_reply(payload) if alert_hit and payload is not None else reply
             src_alias = {str(x).strip() for x in (source_chat_aliases or []) if str(x).strip()}
             if (chat_id or "").strip():
                 src_alias.add((chat_id or "").strip())
             suppress_alert_copy = alert_chat_id in src_alias
             if alert_hit and alert_chat_id and not suppress_alert_copy:
                 try:
-                    _lark_send_text("chat_id", alert_chat_id, reply)
+                    _lark_send_text("chat_id", alert_chat_id, alert_reply)
                     logger.info(
                         "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
                         alert_chat_id[:16],
-                        len(reply),
+                        len(alert_reply),
                     )
                 except Exception:
                     logger.exception(
