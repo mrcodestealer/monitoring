@@ -132,7 +132,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_CARD_EMBED_SCREENSHOT": "0",
     # 1=在监控卡片底部展示 callback 按钮（实现方式参考 Chatbox/jenkinsupdate 的 card JSON 2.0）
     "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
-    "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Refresh screenshot",
+    "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Resend screenshot",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -1409,11 +1409,17 @@ def _monitoring_interactive_card_dict(
             }
         )
     if _lark_env_truthy("MONITORING_MESSAGE_CARD_BUTTON_ENABLE"):
+        cb_payload: Dict[str, Any] = {"k": "monitoring_btn", "v": "refresh"}
+        rt = (receive_id_type or "").strip()
+        rv = (receive_id or "").strip()
+        if rt in ("chat_id", "open_id") and rv:
+            cb_payload["rid_t"] = rt
+            cb_payload["rid"] = rv
         elements.append(
             _monitoring_card_v2_callback_button(
-                _cfg_str("MONITORING_MESSAGE_CARD_BUTTON_TEXT", "Refresh screenshot")[:40],
+                _cfg_str("MONITORING_MESSAGE_CARD_BUTTON_TEXT", "Resend screenshot")[:40],
                 "primary",
-                {"k": "monitoring_btn", "v": "refresh"},
+                cb_payload,
                 element_id="mon_rfsh",
             )
         )
@@ -2400,6 +2406,15 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
                 _monitoring_card_action_event_ids.clear()
                 _monitoring_card_action_event_ids.add(ev_id)
     chat_id, open_id = _lark_card_action_target_ids(data)
+    # Prefer original card target from callback payload so group-card clicks reply in the same group
+    # instead of falling back to operator open_id (private message).
+    rid_t = _lark_dict_pick_str(val, "rid_t", "receive_id_type")
+    rid = _lark_dict_pick_str(val, "rid", "receive_id")
+    if rid_t == "chat_id" and rid:
+        chat_id = rid
+        open_id = ""
+    elif rid_t == "open_id" and rid:
+        open_id = rid
     logger.info("card.action refresh accepted chat=%r open=%r event_id=%r", bool(chat_id), bool(open_id), ev_id or None)
     threading.Thread(
         target=_monitoring_send_screenshot_on_card_click,
