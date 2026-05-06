@@ -103,7 +103,7 @@ _CFG: Dict[str, Any] = {
     "APP_SECRET": "NwAi6xJxMYDHMFAQcTG8ZfJxpeTOibvy",
     "MONITORING_TRIGGER": "/monitoring",
     # 1=仅 @ 机器人且无其它正文也触发（与 /monitoring 同）；1+下面 ANY=1 则 @ 且带任意文字也触发
-    "MONITORING_AT_MENTION_ENABLE": "1",
+    "MONITORING_AT_MENTION_ENABLE": "0",
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
     # HTTP 均值告警命中时，除原群外再发一份文字到该群（chat_id，常为 oc_…）；空=关闭
     "MONITORING_ALERT_CHAT_ID": "",
