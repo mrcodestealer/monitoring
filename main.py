@@ -7,6 +7,7 @@ Lark events (WebSocket 长连接, 推荐) 或 HTTP webhook + Grafana。
 **配置**：编辑本文件顶部 ``_CFG`` 字典（不再读取 ``.env``）。也可用 **systemd ``Environment=KEY=value``** 覆盖同名键。
 
 **默认 ``LARK_EVENT_MODE=ws``** — 长连接；可选 ``ENABLE_HTTP=1`` 并行 HTTP。
+若同一条触发出现 **两条回复**：多为 WS 上 **v1+v2 双投** 或 **长连接 + HTTP Request URL 各收一次** — 见 ``LARK_WS_REGISTER_IM_MESSAGE_V2``、``LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS``、``MONITORING_IM_DEBOUNCE_SECONDS``。
 
 **``LARK_EVENT_MODE=http``** — 监听 ``PORT``（本仓库默认 **5002**，与同机运行的 ``Chatbox/main.py``（常用 **5000**）错开端口），事件走 ``POST /webhook/event``。
 默认 HTTP 栈为 **Flask ``threaded=True``**（实现方式对齐 Chatbox）；生产可设 ``HTTP_SERVER=waitress``。
@@ -107,6 +108,12 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_LOG_LEVEL": "INFO",
     "LARK_WS_USE_HTTP_KEYS": "0",
     "LARK_WS_EXTRA_IM_TYPES": "",
+    # 1=同时订阅 im.message.receive_v2（易与 v1 对同一条消息各投递一次 → 两条回复）；默认 0
+    "LARK_WS_REGISTER_IM_MESSAGE_V2": "0",
+    # 同一 chat+发送者+触发正文在 N 秒内只跑一次监控任务；0=关闭（默认 5）
+    "MONITORING_IM_DEBOUNCE_SECONDS": "5",
+    # 1=且 LARK_EVENT_MODE=ws 时忽略 HTTP webhook 上的 im.message（避免与长连接重复处理）
+    "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -283,6 +290,10 @@ def _lark_webhook_request_timer_end(response: Response):
 _processed_lark_message_ids: set = set()
 _PROCESSED_LARK_IDS_CAP = 4000
 _monitoring_reply_dispatch_lock = threading.Lock()
+_monitoring_im_trigger_last: Dict[str, float] = {}
+_monitoring_inflight_keys: set = set()
+_processed_lark_im_event_ids: set = set()
+_PROCESSED_IM_EVENT_IDS_CAP = 4000
 _lark_oapi_client: Optional[Any] = None
 _lark_oapi_client_lock = threading.Lock()
 # Set when WebSocket picks a working open.feishu.cn vs open.larksuite.com (``_get_lark_oapi_client`` must match).
@@ -405,6 +416,33 @@ def _lark_message_chat_id(msg: Dict[str, Any]) -> str:
     if isinstance(c, dict):
         return _lark_dict_pick_str(c, "chat_id", "chatId", "open_chat_id", "openChatId")
     return ""
+
+
+def _lark_im_message_dedupe_id(msg: Dict[str, Any]) -> str:
+    return _lark_dict_pick_str(
+        msg, "message_id", "messageId", "open_message_id", "openMessageId"
+    )
+
+
+def _lark_im_payload_event_id(data: Dict[str, Any]) -> str:
+    h = data.get("header") if isinstance(data.get("header"), dict) else {}
+    return _lark_dict_pick_str(h, "event_id", "eventId")
+
+
+def _lark_skip_http_im_message_when_ws_mode() -> bool:
+    if not _lark_env_truthy("LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS"):
+        return False
+    return _cfg_str("LARK_EVENT_MODE", "ws").strip().lower() == "ws"
+
+
+def _lark_im_sender_debounce_token(sender: Dict[str, Any], open_id: str) -> str:
+    u = _lark_dict_pick_str(sender, "union_id", "unionId")
+    if u:
+        return u
+    o = (open_id or "").strip()
+    if o:
+        return o
+    return _lark_dict_pick_str(sender, "user_id", "userId")
 
 
 def _feishu_decrypt_encrypt_field(ciphertext_b64: str, encrypt_key: str) -> str:
@@ -1954,6 +1992,17 @@ def _lark_verify_event_token(data: Dict[str, Any]) -> bool:
     return tok == VERIFICATION_TOKEN
 
 
+def _run_monitoring_background_job(
+    chat_id: str, open_id: str, mid: str, dispatch_key: str
+) -> None:
+    try:
+        _monitoring_background_worker(chat_id, open_id, mid)
+    finally:
+        if dispatch_key:
+            with _monitoring_reply_dispatch_lock:
+                _monitoring_inflight_keys.discard(dispatch_key)
+
+
 def _monitoring_background_worker(chat_id: str, open_id: str, mid: str) -> None:
     """
     Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
@@ -2133,7 +2182,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     event = data.get("event") if isinstance(data.get("event"), dict) else {}
     raw_msg = event.get("message")
     msg = raw_msg if isinstance(raw_msg, dict) else {}
-    mid = _lark_dict_pick_str(msg, "message_id", "messageId")
+    mid = _lark_im_message_dedupe_id(msg)
     mtype = (_lark_dict_pick_str(msg, "message_type", "messageType") or "").lower()
     chat_resolved = _lark_message_chat_id(msg)
     logger.info(
@@ -2181,24 +2230,65 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     chat_id = chat_resolved
     open_id = sender_open
+    sender_debounce = _lark_im_sender_debounce_token(sender, open_id)
+    im_event_id = _lark_im_payload_event_id(data)
 
     logger.info(
-        "monitoring trigger matched — background job mid=%r chat_id=%r open_id_prefix=%r",
+        "monitoring trigger matched — background job mid=%r event_id=%r chat_id=%r open_id_prefix=%r",
         mid,
+        im_event_id or None,
         bool(chat_id),
         (open_id[:12] + "…") if len(open_id) > 12 else open_id,
     )
 
+    debounce_sec = 0.0
+    raw_db = _cfg_raw("MONITORING_IM_DEBOUNCE_SECONDS")
+    if raw_db is not None and str(raw_db).strip() != "":
+        try:
+            debounce_sec = float(raw_db)
+        except (TypeError, ValueError):
+            debounce_sec = 5.0
+    debounce_key = f"{(chat_id or '').strip()}\n{sender_debounce}\n{(clean or '').strip()[:320]}"
+    now_m = time.monotonic()
     with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            logger.info("duplicate IM event_id=%s — skip", im_event_id)
+            return
         if mid and mid in _processed_lark_message_ids:
             logger.info("duplicate message_id=%s — skip (already dispatched)", mid)
             return
+        if debounce_key in _monitoring_inflight_keys:
+            logger.info("monitoring skip — same trigger already **in flight** (wait for job to finish)")
+            return
+        if debounce_sec > 0:
+            prev_t = _monitoring_im_trigger_last.get(debounce_key, 0.0)
+            if now_m - prev_t < debounce_sec:
+                logger.info(
+                    "monitoring debounce skip (%.2fs) chat=%r",
+                    debounce_sec,
+                    bool(chat_id),
+                )
+                return
+            _monitoring_im_trigger_last[debounce_key] = now_m
+            if len(_monitoring_im_trigger_last) > 600:
+                for k, _ in sorted(_monitoring_im_trigger_last.items(), key=lambda kv: kv[1])[:220]:
+                    try:
+                        del _monitoring_im_trigger_last[k]
+                    except KeyError:
+                        pass
+                _monitoring_im_trigger_last[debounce_key] = now_m
+        _monitoring_inflight_keys.add(debounce_key)
         if mid:
             _processed_lark_message_ids.add(mid)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
 
     threading.Thread(
-        target=_monitoring_background_worker,
-        args=(chat_id, open_id, mid),
+        target=_run_monitoring_background_job,
+        args=(chat_id, open_id, mid, debounce_key),
         daemon=True,
         name="monitoring-reply",
     ).start()
@@ -2210,7 +2300,7 @@ def _ws_log_message_snip(data: Dict[str, Any]) -> Tuple[Any, Any, str]:
     msg = ev.get("message") or {}
     if not isinstance(msg, dict):
         msg = {}
-    mid = _lark_dict_pick_str(msg, "message_id", "messageId") or None
+    mid = _lark_im_message_dedupe_id(msg) or None
     mtype = _lark_dict_pick_str(msg, "message_type", "messageType") or None
     chat = (_lark_message_chat_id(msg) or "")[:12]
     return mid, mtype, chat
@@ -2481,11 +2571,18 @@ def start_lark_ws_client_blocking() -> None:
         logger.info(
             "Lark WS EventDispatcherHandler.builder('', '') — HTTP 的 VERIFICATION_TOKEN/LARK_ENCRYPT_KEY 不用于长连接"
         )
-    bld = (
-        EventDispatcherHandler.builder(enc, ver)
-        .register_p2_im_message_receive_v1(_on_ws_p2_im_message_receive_v1)
-        .register_p2_customized_event("im.message.receive_v2", _on_ws_im_message_p2_customized)
+    bld = EventDispatcherHandler.builder(enc, ver).register_p2_im_message_receive_v1(
+        _on_ws_p2_im_message_receive_v1
     )
+    if _lark_env_truthy("LARK_WS_REGISTER_IM_MESSAGE_V2"):
+        bld = bld.register_p2_customized_event(
+            "im.message.receive_v2", _on_ws_im_message_p2_customized
+        )
+        logger.info("LARK_WS_REGISTER_IM_MESSAGE_V2=1 — also handling im.message.receive_v2")
+    else:
+        logger.info(
+            "LARK_WS_REGISTER_IM_MESSAGE_V2=0 — not subscribing to im.message.receive_v2 (avoids duplicate v1+v2)."
+        )
     for raw_t in _cfg_str("LARK_WS_EXTRA_IM_TYPES", "").replace(";", ",").split(","):
         t = raw_t.strip()
         if not t:
@@ -2528,10 +2625,15 @@ def start_lark_ws_client_blocking() -> None:
             domain=dnorm,
             auto_reconnect=True,
         )
+        _v2 = (
+            " + im.message.receive_v2"
+            if _lark_env_truthy("LARK_WS_REGISTER_IM_MESSAGE_V2")
+            else ""
+        )
         logger.info(
-            "Lark WebSocket client starting (domain=%s); WS handlers: "
-            "p2 im.message.receive_v1 (typed SDK) + p2 im.message.receive_v2 (customized)",
+            "Lark WebSocket client starting (domain=%s); WS IM: p2 im.message.receive_v1%s",
             dnorm,
+            _v2,
         )
         try:
             cli.start()
@@ -2715,6 +2817,12 @@ def webhook_event():
         return _lark_feishu_webhook_ack_immediate()
 
     if et in ("im.message.receive_v1", "im.message.receive_v2"):
+        if _lark_skip_http_im_message_when_ws_mode():
+            logger.info(
+                "webhook: skip %s (HTTP IM ignored while LARK_EVENT_MODE=ws; set LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS=0 to allow).",
+                et,
+            )
+            return _lark_feishu_webhook_ack_immediate()
         return _handle_im_message_receive(data)
 
     logger.debug(
@@ -2759,6 +2867,10 @@ def run_monitoring_bot() -> None:
     Process entrypoint: HTTP-only, WebSocket-only, or WS + HTTP sidecar (see module docstring).
     Uses :data:`app`, :data:`logger`, :func:`start_lark_ws_client_blocking` from this module.
     """
+    logger.info(
+        "monitoring bot pid=%s — duplicate replies: check two processes (same APP_ID) or IM dedupe logs.",
+        os.getpid(),
+    )
     port = _cfg_listen_port(5002)
     if MONITORING_AT_MENTION_ENABLE and not (LARK_BOT_OPEN_ID or "").strip():
         logger.warning(
