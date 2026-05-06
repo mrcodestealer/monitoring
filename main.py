@@ -124,6 +124,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_CHAT_COALESCE_SECONDS": "0",
     # 1=且 LARK_EVENT_MODE=ws 时忽略 HTTP webhook 上的 im.message（避免与长连接重复处理）
     "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
+    # 1=当配置 ws 模式但尚未收到任何 WS DATA 帧时，允许 HTTP IM 回退处理（避免 200 但无回复）
+    "LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA": "1",
     # 1=监控摘要用 **一条** 飞书交互卡片（schema 2.0）；截图开启时先上传 image_key **嵌进卡片**，不再跟一条独立图片
     "MONITORING_MESSAGE_CARD_ENABLE": "1",
     "LARK_WS_TRANSPORT_LOG": "1",
@@ -578,7 +580,17 @@ def _monitoring_end_chat_send(chat_key: str, success: bool) -> None:
 def _lark_skip_http_im_message_when_ws_mode() -> bool:
     if not _lark_env_truthy("LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS"):
         return False
-    return _cfg_str("LARK_EVENT_MODE", "http").strip().lower() == "ws"
+    if _cfg_str("LARK_EVENT_MODE", "http").strip().lower() != "ws":
+        return False
+    # Fail-safe: if WS path is configured but we haven't seen any WS DATA frame yet,
+    # do not drop HTTP IM events (otherwise webhook returns 200 but bot never replies).
+    if _lark_env_truthy("LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA") and not _lark_ws_saw_data_frame:
+        logger.warning(
+            "ws mode configured but no WS DATA frame observed yet — allowing HTTP IM fallback "
+            "(set LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA=0 to force skip)."
+        )
+        return False
+    return True
 
 
 def _lark_im_sender_debounce_token(sender: Dict[str, Any], open_id: str) -> str:
