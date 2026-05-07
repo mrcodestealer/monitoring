@@ -88,7 +88,7 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_QUERY_STEP": 60,
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 900,
     # Prometheus 最近分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，最新点落在「约前两分钟」
-    "GRAFANA_QUERY_END_LAG_SECONDS": 120,
+    "GRAFANA_QUERY_END_LAG_SECONDS": 60,
     # 合并后再丢掉尾部 N 个「分钟桶」（最后一两分钟常为未完成 scrape / 延迟，易出现畸形偏低）；0=不丢
     "MONITORING_DROP_LAST_MERGED_MINUTES": "1",
     # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
