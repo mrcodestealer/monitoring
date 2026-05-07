@@ -1383,6 +1383,144 @@ def _prometheus_query_range(
     return r.json()
 
 
+def _grafana_ds_query(
+    session: requests.Session,
+    datasource_uid: str,
+    target: Dict[str, Any],
+    start_unix: int,
+    end_unix: int,
+    step: int,
+) -> Dict[str, Any]:
+    """
+    Generic Grafana datasource query fallback (for non-Prometheus targets, e.g. SQL/log-like queries).
+    Returns Grafana /api/ds/query JSON.
+    """
+    q = copy.deepcopy(target or {})
+    q["datasource"] = {"uid": datasource_uid}
+    q["refId"] = str(q.get("refId") or "A")
+    q["intervalMs"] = max(1000, int(step) * 1000)
+    q["maxDataPoints"] = max(200, int((max(1, end_unix - start_unix) // max(1, step)) + 8))
+    payload = {
+        "from": str(int(start_unix) * 1000),
+        "to": str(int(end_unix) * 1000),
+        "queries": [q],
+    }
+    r = session.post(
+        f"{GRAFANA_BASE_URL}/api/ds/query",
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=120,
+    )
+    r.raise_for_status()
+    return r.json() or {}
+
+
+def _ds_query_to_prometheus_like(raw: Dict[str, Any], ref_id: str) -> Dict[str, Any]:
+    """
+    Convert Grafana /api/ds/query frames into a Prometheus-like shape:
+    {"data":{"result":[{"metric": {...}, "values":[[ts,val], ...]}, ...]}}
+    so existing merge/analyze logic can stay unchanged.
+    """
+    out: List[Dict[str, Any]] = []
+    results = raw.get("results") if isinstance(raw.get("results"), dict) else {}
+    bucket = results.get(ref_id) if isinstance(results.get(ref_id), dict) else {}
+    frames = bucket.get("frames") if isinstance(bucket.get("frames"), list) else []
+
+    for fr in frames:
+        if not isinstance(fr, dict):
+            continue
+        schema = fr.get("schema") if isinstance(fr.get("schema"), dict) else {}
+        fields = schema.get("fields") if isinstance(schema.get("fields"), list) else []
+        data = fr.get("data") if isinstance(fr.get("data"), dict) else {}
+        cols = data.get("values") if isinstance(data.get("values"), list) else []
+        if not fields or not cols:
+            continue
+        n = min(len(fields), len(cols))
+        if n <= 0:
+            continue
+
+        names: List[str] = []
+        for i in range(n):
+            f = fields[i] if isinstance(fields[i], dict) else {}
+            names.append(str(f.get("name") or f"f{i}"))
+
+        row_len = 0
+        for i in range(n):
+            c = cols[i]
+            if isinstance(c, list):
+                row_len = max(row_len, len(c))
+        if row_len <= 0:
+            continue
+
+        ts_idx = -1
+        val_idx = -1
+        label_idx = -1
+        for i, nm in enumerate(names):
+            nl = nm.strip().lower()
+            if ts_idx < 0 and nl in ("time", "t", "ts", "timestamp", "datetime"):
+                ts_idx = i
+            if val_idx < 0 and nl in ("value", "val", "count", "total"):
+                val_idx = i
+            if label_idx < 0 and nl in ("gameid", "game_id", "providerid", "provider_id", "name", "series"):
+                label_idx = i
+        if ts_idx < 0:
+            for i in range(n):
+                c = cols[i]
+                if not isinstance(c, list) or not c:
+                    continue
+                vv = c[0]
+                try:
+                    fv = float(vv)
+                except (TypeError, ValueError):
+                    continue
+                if fv > 1e9:
+                    ts_idx = i
+                    break
+        if val_idx < 0:
+            for i in range(n):
+                if i == ts_idx:
+                    continue
+                c = cols[i]
+                if not isinstance(c, list) or not c:
+                    continue
+                try:
+                    float(c[0])
+                    val_idx = i
+                    break
+                except (TypeError, ValueError):
+                    continue
+        if ts_idx < 0 or val_idx < 0:
+            continue
+
+        by_label: Dict[str, List[List[float]]] = {}
+        for r_i in range(row_len):
+            try:
+                ts_raw = cols[ts_idx][r_i]
+                val_raw = cols[val_idx][r_i]
+            except Exception:
+                continue
+            try:
+                ts = float(ts_raw)
+                val = float(val_raw)
+            except (TypeError, ValueError):
+                continue
+            if ts > 1e12:
+                ts = ts / 1000.0
+            lbl = "value"
+            if label_idx >= 0:
+                try:
+                    lbl = str(cols[label_idx][r_i]).strip() or "value"
+                except Exception:
+                    lbl = "value"
+            by_label.setdefault(lbl, []).append([ts, val])
+
+        for lbl, pairs in by_label.items():
+            pairs.sort(key=lambda p: p[0])
+            out.append({"metric": {"series": lbl, "name": lbl}, "values": pairs})
+
+    return {"data": {"result": out}}
+
+
 def _fetch_panel_series_by_title(
     panel_title: str,
     session: Optional[requests.Session] = None,
@@ -1420,7 +1558,22 @@ def _fetch_panel_series_by_title(
         if not ds_uid:
             logger.warning("skip target without datasource uid: %s", t.get("refId"))
             continue
-        raw = _prometheus_query_range(sess, ds_uid, expr, start, end, GRAFANA_QUERY_STEP)
+        try:
+            raw = _prometheus_query_range(sess, ds_uid, expr, start, end, GRAFANA_QUERY_STEP)
+        except requests.HTTPError as e:
+            # Non-Prometheus datasource often returns 405 on /api/v1/query_range.
+            code = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
+            if code in (400, 404, 405, 415, 422):
+                logger.info(
+                    'panel "%s" target %s query_range HTTP %s -> fallback api/ds/query',
+                    panel_title,
+                    t.get("refId"),
+                    code,
+                )
+                raw_ds = _grafana_ds_query(sess, ds_uid, t, start, end, GRAFANA_QUERY_STEP)
+                raw = _ds_query_to_prometheus_like(raw_ds, str(t.get("refId") or "A"))
+            else:
+                raise
         series_out.append(
             {
                 "refId": t.get("refId"),
