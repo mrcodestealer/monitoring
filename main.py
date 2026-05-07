@@ -3958,8 +3958,9 @@ def _merge_digit_keyword_rows_max_bucketed(
     ``max`` on **exact unix seconds** fails when duplicates scrape on slightly different offsets:
     a ghost row can own ``03:48:00`` (~2.6k) while the real line only has ``03:47:58`` (~19.5k),
     producing absurd fast spikes. Bucket by **local wall-clock minute** (same basis as
-    :func:`_fmt_ts_short`), take ``max`` inside each bucket per row (last wins if a row has several
-    samples in that minute), then ``max`` across rows.
+    :func:`_fmt_ts_short`), take ``max(value)`` inside each bucket **per row** (Prometheus may emit
+    several samples per minute; the last must not overwrite an earlier higher point), then ``max``
+    across rows.
     """
     by_bucket: Dict[float, float] = {}
     for row in rows:
@@ -3973,7 +3974,9 @@ def _merge_digit_keyword_rows_max_bucketed(
                 continue
             tsf = float(ts)
             b = _bucket_ts_local_minute(tsf)
-            row_b[b] = v
+            prev_r = row_b.get(b)
+            if prev_r is None or v > prev_r:
+                row_b[b] = v
         for b, v in row_b.items():
             prev = by_bucket.get(b)
             if prev is None or v > prev:
