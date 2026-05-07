@@ -621,6 +621,36 @@ def _bucket_ts_monitoring_minute(ts: float) -> float:
     return dt.timestamp()
 
 
+def _collapse_points_to_monitoring_minute_floor(
+    points: List[Tuple[float, float]],
+    *,
+    how: str,
+) -> List[Tuple[float, float]]:
+    """
+    Normalize every sample onto the **start of its calendar minute** (seconds = 0) in
+    ``MONITORING_ZONEINFO`` / process local — timestamps shown in bot tables are always :00.
+
+    - ``how=\"sum\"``: add values that share the same minute (HTTP totals across instant scrapes).
+    - ``how=\"max\"``: keep the largest value per minute (gauges / keyword panels).
+    """
+    by_b: Dict[float, float] = {}
+    for ts, val in points:
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v):
+            continue
+        b = _bucket_ts_monitoring_minute(float(ts))
+        if how == "sum":
+            by_b[b] = by_b.get(b, 0.0) + v
+        else:
+            prev = by_b.get(b)
+            if prev is None or v > prev:
+                by_b[b] = v
+    return sorted(by_b.items(), key=lambda x: x[0])
+
+
 LARK_ENCRYPT_KEY = (
     _cfg_str("LARK_ENCRYPT_KEY")
     or _cfg_str("ENCRYPT_KEY")
@@ -4388,6 +4418,7 @@ def _http_drop_spike_analysis(
 
 def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_http_timeseries_points(payload)
+    pts = _collapse_points_to_monitoring_minute_floor(pts, how="sum")
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_HTTP_DROP_ALERT_PCT,
@@ -4401,6 +4432,7 @@ def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_9280_push_points(payload)
+    pts = _collapse_points_to_monitoring_minute_floor(pts, how="max")
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_9280_ALERT_PCT,
@@ -4414,6 +4446,7 @@ def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_deposit_points(payload)
+    pts = _collapse_points_to_monitoring_minute_floor(pts, how="sum")
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_DEPOSIT_ALERT_PCT,
@@ -4427,6 +4460,7 @@ def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_withdraw_points(payload)
+    pts = _collapse_points_to_monitoring_minute_floor(pts, how="sum")
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_WITHDRAW_ALERT_PCT,
@@ -4451,6 +4485,7 @@ def _analysis_for_keyword_payload(
             len(pts),
             len(pts_filtered),
         )
+    pts_filtered = _collapse_points_to_monitoring_minute_floor(pts_filtered, how="max")
     a = _http_drop_spike_analysis(
         pts_filtered,
         fast_threshold_pct,
@@ -4856,7 +4891,8 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
 
 def _fmt_ts_short(ts: Any) -> str:
     try:
-        return _monitoring_calendar_dt(float(ts)).strftime("%m-%d %H:%M")
+        ft = _bucket_ts_monitoring_minute(float(ts))
+        return _monitoring_calendar_dt(ft).strftime("%m-%d %H:%M")
     except (TypeError, ValueError, OSError):
         return str(ts)
 
