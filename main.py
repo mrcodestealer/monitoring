@@ -1325,6 +1325,44 @@ def _fetch_dashboard_model(session: requests.Session, uid: str) -> Dict[str, Any
     return r.json().get("dashboard") or {}
 
 
+def _fetch_library_panel_model(session: requests.Session, library_uid: str) -> Dict[str, Any]:
+    """Best-effort fetch of Grafana library panel model by uid."""
+    u = (library_uid or "").strip()
+    if not u:
+        return {}
+    try:
+        r = session.get(f"{GRAFANA_BASE_URL}/api/library-elements/{u}", params={"orgId": "1"}, timeout=60)
+        r.raise_for_status()
+        j = r.json() or {}
+        # Common shapes: {"result":{"model":{...}}} or {"model":{...}}
+        if isinstance(j.get("result"), dict) and isinstance(j["result"].get("model"), dict):
+            return j["result"]["model"] or {}
+        if isinstance(j.get("model"), dict):
+            return j["model"] or {}
+    except Exception:
+        logger.exception("library panel fetch failed uid=%r", u[:32])
+    return {}
+
+
+def _panel_query_model(session: requests.Session, panel: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return panel model carrying query targets.
+    For library panels, Grafana dashboard JSON may only keep a lightweight ref with no targets.
+    """
+    if not isinstance(panel, dict):
+        return {}
+    targets = panel.get("targets") or []
+    if isinstance(targets, list) and len(targets) > 0:
+        return panel
+    lp = panel.get("libraryPanel") if isinstance(panel.get("libraryPanel"), dict) else {}
+    lib_uid = str(lp.get("uid") or "").strip()
+    if lib_uid:
+        m = _fetch_library_panel_model(session, lib_uid)
+        if m:
+            return m
+    return panel
+
+
 def _prometheus_query_range(
     session: requests.Session,
     datasource_uid: str,
@@ -1366,10 +1404,16 @@ def _fetch_panel_series_by_title(
     if not panel:
         raise ValueError(f'Panel titled "{panel_title}" not found on dashboard {GRAFANA_DASHBOARD_UID}')
 
-    panel_ds = _datasource_uid(panel.get("datasource"))
+    q_panel = _panel_query_model(sess, panel)
+    panel_ds = _datasource_uid(q_panel.get("datasource")) or _datasource_uid(panel.get("datasource"))
     series_out: List[Dict[str, Any]] = []
-    for t in panel.get("targets") or []:
-        expr = (t.get("expr") or "").strip()
+    for t in q_panel.get("targets") or []:
+        expr = (
+            (t.get("expr") or "")
+            or (t.get("query") or "")
+            or (t.get("rawSql") or "")
+        )
+        expr = str(expr).strip()
         if not expr:
             continue
         ds_uid = _datasource_uid(t.get("datasource")) or panel_ds
@@ -1387,7 +1431,12 @@ def _fetch_panel_series_by_title(
             }
         )
     if not series_out:
-        raise ValueError(f'No Prometheus expr targets on panel "{panel_title}"')
+        logger.warning(
+            'No queryable Prometheus targets on panel "%s" (direct targets=%s, library_uid=%r)',
+            panel_title,
+            len(panel.get("targets") or []),
+            ((panel.get("libraryPanel") or {}).get("uid") if isinstance(panel.get("libraryPanel"), dict) else ""),
+        )
     return {
         "panelTitle": panel_title,
         "dashboardUid": GRAFANA_DASHBOARD_UID,
