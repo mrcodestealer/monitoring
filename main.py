@@ -3834,19 +3834,42 @@ def _merge_http_timeseries_points(payload: Dict[str, Any]) -> List[Tuple[float, 
     return sorted(by_ts.items(), key=lambda x: x[0])
 
 
+def _keyword_matches_series_labels(keyword: str, legend_format: str, metric: Dict[str, Any]) -> bool:
+    """
+    Match a panel ``keyword`` to a Prometheus-like series row.
+
+    Purely **numeric** keywords (e.g. ``3201``, ``1492288``) use **token-boundary** matching so
+    ``3201`` does **not** match ``13201`` / ``32012`` when those appear in legend or label text —
+    substring-only matching caused bogus baselines (e.g. ~6096) vs Grafana's selected series (~21k).
+    Non-numeric keywords keep substring behavior (e.g. ``9280 + Push``).
+    """
+    kw_raw = (keyword or "").strip()
+    if not kw_raw:
+        return True
+    lg = str(legend_format or "").strip()
+    metric_blob = " ".join(str(v) for v in metric.values() if v is not None)
+    kw_cf = kw_raw.casefold()
+    lg_cf = lg.casefold()
+    mb_cf = metric_blob.casefold()
+    if lg_cf == kw_cf or mb_cf.strip() == kw_cf:
+        return True
+    if kw_raw.isdigit():
+        boundary = re.compile(r"(^|[^0-9])" + re.escape(kw_raw) + r"([^0-9]|$)")
+        return bool(boundary.search(lg_cf) or boundary.search(mb_cf))
+    return kw_cf in lg_cf or kw_cf in mb_cf
+
+
 def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
     """Pick/merge points for '9280 + Push' from panel targets/results."""
-    kw = (MONITORING_9280_SERIES_KEYWORD or "9280 + Push").strip().casefold()
+    kw = (MONITORING_9280_SERIES_KEYWORD or "9280 + Push").strip()
     by_ts: Dict[float, float] = {}
     for s in payload.get("series") or []:
-        lg = str(s.get("legendFormat") or "").casefold()
+        lg = str(s.get("legendFormat") or "")
         prom = s.get("prometheus") or {}
         pdata = prom.get("data") or {}
         for r in pdata.get("result") or []:
             metric = r.get("metric") or {}
-            metric_blob = " ".join([str(v) for v in metric.values()]).casefold()
-            # Primary: legendFormat matches keyword; fallback: metric labels include keyword.
-            if kw and not (kw in lg or kw in metric_blob):
+            if kw and not _keyword_matches_series_labels(kw, lg, metric if isinstance(metric, dict) else {}):
                 continue
             for pair in r.get("values") or []:
                 if len(pair) < 2:
@@ -3863,17 +3886,15 @@ def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]
 
 
 def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> List[Tuple[float, float]]:
-    kw = (keyword or "").strip().casefold()
+    kw = (keyword or "").strip()
     by_ts: Dict[float, float] = {}
     for s in payload.get("series") or []:
-        lg = str(s.get("legendFormat") or "").casefold()
+        lg = str(s.get("legendFormat") or "")
         prom = s.get("prometheus") or {}
         pdata = prom.get("data") or {}
         for r in pdata.get("result") or []:
             metric = r.get("metric") or {}
-            metric_blob = " ".join([str(v) for v in metric.values()]).casefold()
-            # Primary: legendFormat matches keyword; fallback: metric labels include keyword.
-            if kw and not (kw in lg or kw in metric_blob):
+            if kw and not _keyword_matches_series_labels(kw, lg, metric if isinstance(metric, dict) else {}):
                 continue
             for pair in r.get("values") or []:
                 if len(pair) < 2:
