@@ -215,6 +215,10 @@ _CFG: Dict[str, Any] = {
     "MONITORING_GAMES_INHOUSE_ALERT_PCT": 15,
     "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT": 15,
     "MONITORING_ALERT_WINDOW_SECONDS": 120,
+    # 1=alert text skips Fast/Continuous SPIKE/DROP lines; only a short time/value tail (Grafana-like).
+    "MONITORING_SIMPLE_ALERT_TEXT": "0",
+    # 1=/mo hides extra-panel ``within Xm drop/spike`` footer lines; tables only.
+    "MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS": "0",
     "MONITORING_WATCH_ENABLE": "1",
     "MONITORING_WATCH_INTERVAL_SECONDS": "60",
     # 自动告警最短间隔（防刷屏）；默认 300=5 分钟
@@ -579,6 +583,10 @@ MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
     "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
 )
 MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 120))
+MONITORING_SIMPLE_ALERT_TEXT = _lark_env_truthy("MONITORING_SIMPLE_ALERT_TEXT")
+MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS = _lark_env_truthy(
+    "MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS"
+)
 MONITORING_TIME_BUCKET_TZ = _cfg_str("MONITORING_TIME_BUCKET_TZ", "").strip()
 
 
@@ -4531,6 +4539,8 @@ def _analysis_for_games_inhouse_payload(payload: Dict[str, Any]) -> Dict[str, An
 
 
 def _format_extra_analysis_lines(section_label: str, analysis: Dict[str, Any]) -> List[str]:
+    if MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS:
+        return []
     fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_9280_ALERT_PCT)
     cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_9280_CONTINUOUS_ALERT_PCT)
     win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
@@ -4607,6 +4617,32 @@ def _format_trigger_lines(
     return out
 
 
+def _format_simple_series_alert_block(
+    graph_label: str,
+    series_label: str,
+    analysis: Dict[str, Any],
+    *,
+    max_rows: int = 8,
+) -> str:
+    """
+    Grafana-style snippet: latest timestamps and values from the same merged series the bot analyzed.
+    English-only user-visible lines (product convention).
+    """
+    pts = analysis.get("merged_points") or []
+    head = [
+        f"[{graph_label}] {series_label}",
+        "Threshold exceeded. Recent points (bot merged series, oldest → newest):",
+    ]
+    if not pts:
+        return "\n".join(head + ["(no points in window)"])
+    tail = pts[-max(1, min(max_rows, 24)) :]
+    rows = ["```text", "time           value", "-------------  ------------"]
+    for pair in tail:
+        rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+    rows.append("```")
+    return "\n".join(head + rows)
+
+
 def _format_trigger_fallback_line(
     graph_label: str,
     series_label: str,
@@ -4657,6 +4693,8 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             )
             if fb:
                 reasons.append(fb)
+        if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(a_http.get("hit_alert"))):
+            reasons = [_format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "HTTP", a_http)]
         reason_blocks.extend(reasons)
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
@@ -4740,6 +4778,8 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             )
             if fb2:
                 reasons2.append(fb2)
+        if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or bool(a2.get("hit_alert"))):
+            reasons2 = [_format_simple_series_alert_block(g_lbl, s_lbl, a2)]
         reason_blocks.extend(reasons2)
     if not reason_blocks:
         lines.append("alert triggered but no analyzable timeseries points were found")
