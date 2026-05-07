@@ -3637,7 +3637,7 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
     """
     Lark-friendly compact layout: ``【panel】graph`` + short ``Dashboard: …/d/{uid}`` + HTTP table + footer.
     """
-    max_rows = 11
+    max_rows = 9
     uid = str(payload.get("dashboardUid") or GRAFANA_DASHBOARD_UID)
     base = str(GRAFANA_BASE_URL).rstrip("/")
     http_ex = _http_analysis_for_payload(payload)
@@ -3646,37 +3646,7 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
         f"【{payload.get('panelTitle')}】graph",
         f"Dashboard: {base}/d/{uid}",
     ]
-    for s in payload.get("series") or []:
-        prom = s.get("prometheus") or {}
-        pdata = prom.get("data") or {}
-        results = pdata.get("result") or []
-        ref = s.get("refId") or "?"
-        if not results:
-            lines.append(f"- [{ref}] no data")
-            continue
-        http_results = [
-            r for r in results[:24] if _metric_series_is_http_leg(r.get("metric") or {})
-        ]
-        if not http_results:
-            lines.append(f"- [{ref}] no http-labeled series (skipped {len(results)} rows)")
-            continue
-        for r in http_results[:12]:
-            m = r.get("metric") or {}
-            legend = _compact_http_legend(m, str(ref))
-            vals = r.get("values") or []
-            if not vals:
-                lines.append(f"[{ref}] {legend}: (empty)")
-                continue
-            lines.append("")
-            lines.append(f"[{ref}] {legend}")
-            tail = vals[-max_rows:]
-            rows: List[str] = ["time           value", "-------------  ------------"]
-            for pair in tail:
-                rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
-            lines.append("```text")
-            lines.extend(rows)
-            lines.append("```")
-
+    # Show optional monitored series first so they are not truncated away by long HTTP tables.
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
@@ -3743,6 +3713,37 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
         else:
             lines.append(f"(no {series} points matched)")
         lines.extend(extra_footer)
+
+    for s in payload.get("series") or []:
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        results = pdata.get("result") or []
+        ref = s.get("refId") or "?"
+        if not results:
+            lines.append(f"- [{ref}] no data")
+            continue
+        http_results = [
+            r for r in results[:24] if _metric_series_is_http_leg(r.get("metric") or {})
+        ]
+        if not http_results:
+            lines.append(f"- [{ref}] no http-labeled series (skipped {len(results)} rows)")
+            continue
+        for r in http_results[:6]:
+            m = r.get("metric") or {}
+            legend = _compact_http_legend(m, str(ref))
+            vals = r.get("values") or []
+            if not vals:
+                lines.append(f"[{ref}] {legend}: (empty)")
+                continue
+            lines.append("")
+            lines.append(f"[{ref}] {legend}")
+            tail = vals[-max_rows:]
+            rows: List[str] = ["time           value", "-------------  ------------"]
+            for pair in tail:
+                rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+            lines.append("```text")
+            lines.extend(rows)
+            lines.append("```")
 
     if _monitoring_payload_hit_alert(payload) and TARGET_USER_OPEN_ID:
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
