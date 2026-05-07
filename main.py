@@ -19,6 +19,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
 群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（默认最近 **15** 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``GRAFANA_DASHBOARD_FROM`` 一致）。
+发 ``/mute`` → 交互卡片多选监控项并选择静音时长；``/cancelmute`` → 立刻清除全部静音（进程内状态，重启后失效）。
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
 
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
@@ -43,7 +44,7 @@ import re
 import threading
 import time
 import warnings
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
 import requests
 from flask import Flask, Response, g, jsonify, request
@@ -143,6 +144,8 @@ _CFG: Dict[str, Any] = {
     "APP_ID": "cli_a97fcc6df7615ed1",
     "APP_SECRET": "NwAi6xJxMYDHMFAQcTG8ZfJxpeTOibvy",
     "MONITORING_TRIGGER": "/monitoring",
+    "MONITORING_MUTE_TRIGGER": "/mute",
+    "MONITORING_CANCELMUTE_TRIGGER": "/cancelmute",
     # 1=仅 @ 机器人且无其它正文也触发（与 /monitoring 同）；1+下面 ANY=1 则 @ 且带任意文字也触发
     "MONITORING_AT_MENTION_ENABLE": "0",
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
@@ -215,6 +218,8 @@ _CFG: Dict[str, Any] = {
     # Watchdog：Prometheus 判窗对齐到整分钟，相对「当前分钟起点」向回偏移（分钟）。例：6 与 1 → 12:46:xx 只评 12:40:00..12:45:00
     "MONITORING_WATCH_EVAL_START_OFFSET_MINUTES": "6",
     "MONITORING_WATCH_EVAL_END_OFFSET_MINUTES": "1",
+    # Watchdog 判警是否使用与 /monitoring 相同的拉数窗口（默认 0：窄窗口 eval；设为 1 则与报表一致，避免「报表有大波动但自动告警未扫到」）
+    "MONITORING_WATCH_MATCH_REPORT_WINDOW": "0",
     # Watchdog 告警附带截图的 Grafana URL（相对时间）；与判窗数据窗口无关，默认最近 15 分钟整页
     "MONITORING_WATCH_SCREENSHOT_FROM": "now-15m",
     "MONITORING_WATCH_SCREENSHOT_TO": "now",
@@ -409,6 +414,9 @@ _monitoring_chat_send_in_progress: set = set()
 _monitoring_card_action_event_ids: set = set()
 _monitoring_watch_last_alert_at: float = 0.0
 _monitoring_watch_started: bool = False
+# --- Alert mute (「告警静音」：进程内；按监控通道粒度，供 watchdog / 告警转发过滤) ---
+_MONITORING_MUTE_UNTIL: Dict[str, float] = {}
+_mute_pending_selections: Dict[str, Set[str]] = {}
 _grafana_pw_keeper: Optional[Any] = None
 _grafana_pw_keeper_lock = threading.Lock()
 _grafana_pw_keeper_start_attempted: bool = False
@@ -531,6 +539,8 @@ APP_SECRET = _cfg_str("APP_SECRET", "").strip() or None
 # Default matches ``lark_oapi.core.const.FEISHU_DOMAIN`` — 国际 Lark 用 ``https://open.larksuite.com``（见 ``_CFG``）
 LARK_HOST = _cfg_str("LARK_HOST", "https://open.feishu.cn").rstrip("/")
 MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/monitoring")
+MONITORING_MUTE_TRIGGER = _cfg_str("MONITORING_MUTE_TRIGGER", "/mute").strip()
+MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/cancelmute").strip()
 TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
 MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
 MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 15.0)
@@ -1744,12 +1754,18 @@ def fetch_monitoring_payload(
     w_start: Optional[int] = None
     w_end: Optional[int] = None
     if for_watchdog:
-        w_start, w_end = _monitoring_watch_eval_window_unix()
-        logger.info(
-            "fetch_monitoring_payload watchdog eval window unix %s..%s (aligned minutes)",
-            w_start,
-            w_end,
-        )
+        if _lark_env_truthy("MONITORING_WATCH_MATCH_REPORT_WINDOW"):
+            logger.info(
+                "fetch_monitoring_payload watchdog eval uses **report** window "
+                "(MONITORING_WATCH_MATCH_REPORT_WINDOW=1; same lookback/lag as /monitoring)"
+            )
+        else:
+            w_start, w_end = _monitoring_watch_eval_window_unix()
+            logger.info(
+                "fetch_monitoring_payload watchdog eval window unix %s..%s (aligned minutes)",
+                w_start,
+                w_end,
+            )
     primary = fetch_request_total_1m_series(session=sess, start_unix=w_start, end_unix=w_end)
     extra: List[Dict[str, Any]] = []
     if _lark_env_truthy("MONITORING_9280_ENABLE"):
@@ -1911,7 +1927,7 @@ def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
         )
 
 
-def _split_text_for_lark(text: str, max_chars: int = 9000) -> List[str]:
+def _split_text_for_lark(text: str, max_chars: int = 3200) -> List[str]:
     """
     Split long text into multiple chunks to avoid platform length truncation.
     Prefer paragraph/line boundaries; hard-cut only when necessary.
@@ -1973,7 +1989,7 @@ def _split_text_for_lark(text: str, max_chars: int = 9000) -> List[str]:
     return chunks or [raw[:max_chars]]
 
 
-def _lark_send_text_auto(receive_id_type: str, receive_id: str, text: str, max_chars: int = 9000) -> None:
+def _lark_send_text_auto(receive_id_type: str, receive_id: str, text: str, max_chars: int = 3200) -> None:
     chunks = _split_text_for_lark(text, max_chars=max_chars)
     total = len(chunks)
     for i, c in enumerate(chunks, 1):
@@ -2096,6 +2112,427 @@ def _monitoring_card_v2_callback_button(
     return btn
 
 
+# ---------------------------------------------------------------------------
+# /mute — per-channel alert suppression (in-process)
+# ---------------------------------------------------------------------------
+_MUTE_DURATION_CHOICES: List[Tuple[str, int]] = [
+    ("15 分钟", 900),
+    ("30 分钟", 1800),
+    ("1 小时", 3600),
+    ("2 小时", 7200),
+    ("3 小时", 10800),
+    ("4 小时", 14400),
+    ("8 小时", 28800),
+    ("12 小时", 43200),
+    ("1 天", 86400),
+]
+
+
+def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
+    """
+    (channel_id, short_label) for enabled monitors. channel_id matches extraPanels ``kind`` or ``http``.
+    """
+    out: List[Tuple[str, str]] = [("http", f"HTTP · {GRAFANA_PANEL_TITLE}")]
+    if _lark_env_truthy("MONITORING_9280_ENABLE"):
+        out.append(("9280_push", f"9280 · {GRAFANA_PANEL_TITLE_9280}"))
+    if _lark_env_truthy("MONITORING_DEPOSIT_ENABLE"):
+        out.append(("deposit", f"充值 · {GRAFANA_PANEL_TITLE_DEPOSIT}"))
+    if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
+        out.append(("withdraw", f"提款 · {GRAFANA_PANEL_TITLE_WITHDRAW}"))
+    if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
+        out.append(("provider_jili", f"Provider JILI"))
+    if _lark_env_truthy("MONITORING_PROVIDER_GENERAL_ENABLE"):
+        out.append(("provider_general", f"Provider GEN"))
+    if _lark_env_truthy("MONITORING_PROVIDER_INHOUSE_ENABLE"):
+        out.append(("provider_inhouse", f"Provider IN"))
+    if _lark_env_truthy("MONITORING_GAMES_JILI_ENABLE"):
+        out.append(("games_jili", f"Games JILI"))
+    if _lark_env_truthy("MONITORING_GAMES_GENERAL_ENABLE"):
+        out.append(("games_general", f"Games GEN"))
+    if _lark_env_truthy("MONITORING_GAMES_INHOUSE_ENABLE"):
+        out.append(("games_inhouse", f"Games INH"))
+    return out
+
+
+def _monitoring_mutable_channel_ids() -> Set[str]:
+    return {c for c, _ in _monitoring_mutable_channels()}
+
+
+def _mute_session_key(chat_id: str, operator_open_id: str) -> str:
+    c = (chat_id or "").strip()
+    o = (operator_open_id or "").strip()
+    return f"{c}\n{o}"
+
+
+def _monitoring_alert_channel_muted(channel: str) -> bool:
+    until = _MONITORING_MUTE_UNTIL.get((channel or "").strip(), 0.0)
+    return time.time() < float(until or 0.0)
+
+
+def _mute_purge_expired() -> None:
+    now = time.time()
+    dead = [k for k, t in _MONITORING_MUTE_UNTIL.items() if float(t or 0.0) <= now]
+    for k in dead:
+        try:
+            del _MONITORING_MUTE_UNTIL[k]
+        except KeyError:
+            pass
+
+
+def _mute_apply_channels(channels: Set[str], duration_sec: float) -> Dict[str, float]:
+    """Returns channel -> expiry unix for confirmation text."""
+    now = time.time()
+    dur = max(1.0, float(duration_sec))
+    applied: Dict[str, float] = {}
+    with _monitoring_reply_dispatch_lock:
+        allowed = _monitoring_mutable_channel_ids()
+        for ch in channels:
+            c = (ch or "").strip()
+            if c not in allowed:
+                continue
+            exp = now + dur
+            prev = float(_MONITORING_MUTE_UNTIL.get(c, 0.0) or 0.0)
+            if prev > exp:
+                exp = prev
+            _MONITORING_MUTE_UNTIL[c] = exp
+            applied[c] = exp
+    return applied
+
+
+def _mute_clear_all_locked() -> None:
+    _MONITORING_MUTE_UNTIL.clear()
+    _mute_pending_selections.clear()
+
+
+def _mute_toast_response(content: str, toast_type: str = "info") -> Dict[str, Any]:
+    """HTTP card.action synchronous response body (Feishu shows a small toast)."""
+    return {"toast": {"type": toast_type, "content": (content or "")[:500]}}
+
+
+def _mute_channel_display_label(ch: str) -> str:
+    for cid, lbl in _monitoring_mutable_channels():
+        if cid == ch:
+            return lbl
+    return ch
+
+
+def _mute_selection_card_elements(rid_t: str, rid: str) -> List[Dict[str, Any]]:
+    rt = (rid_t or "").strip()
+    rv = (rid or "").strip()
+    base_rid: Dict[str, Any] = {}
+    if rt in ("chat_id", "open_id") and rv:
+        base_rid = {"rid_t": rt, "rid": rv}
+
+    elements: List[Dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": (
+                "**静音告警（多选）**\n\n"
+                "1. 多次点击下列监控项可 **加入/移除** 选择（见 Toast 提示）。\n"
+                "2. 点 **全选并选时长** 可一键选中当前列表全部项。\n"
+                "3. 选好后点 **下一步：选择时长**。\n"
+                "4. **取消** 清空本次选择。"
+            ),
+        }
+    ]
+    for ch, short_lbl in _monitoring_mutable_channels():
+        payload = dict(base_rid)
+        payload.update({"k": "mute_btn", "v": "toggle", "ch": ch})
+        elements.append(
+            _monitoring_card_v2_callback_button(
+                short_lbl[:80],
+                "default",
+                _monitoring_card_callback_payload_strings(payload),
+                element_id=f"mt_{hashlib.sha256(ch.encode()).hexdigest()[:10]}",
+            )
+        )
+
+    row_advance = dict(base_rid)
+    row_advance.update({"k": "mute_btn", "v": "next"})
+    row_all = dict(base_rid)
+    row_all.update({"k": "mute_btn", "v": "all"})
+    row_cancel = dict(base_rid)
+    row_cancel.update({"k": "mute_btn", "v": "cancel_sel"})
+    elements.append(
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "default",
+            "horizontal_align": "left",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        _monitoring_card_v2_callback_button(
+                            "下一步：选择时长",
+                            "primary",
+                            _monitoring_card_callback_payload_strings(row_advance),
+                            element_id="mute_next",
+                        )
+                    ],
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        _monitoring_card_v2_callback_button(
+                            "全选并选时长",
+                            "danger",
+                            _monitoring_card_callback_payload_strings(row_all),
+                            element_id="mute_all",
+                        )
+                    ],
+                },
+            ],
+        }
+    )
+    elements.append(
+        _monitoring_card_v2_callback_button(
+            "取消",
+            "default",
+            _monitoring_card_callback_payload_strings(row_cancel),
+            element_id="mute_cancel",
+        )
+    )
+    return elements
+
+
+def _mute_duration_card_elements(
+    rid_t: str, rid: str, operator_open_id: str, chat_id: str
+) -> List[Dict[str, Any]]:
+    rt = (rid_t or "").strip()
+    rv = (rid or "").strip()
+    oid = (operator_open_id or "").strip()
+    cid = (chat_id or "").strip()
+    base: Dict[str, Any] = {"k": "mute_btn", "oid": oid, "cid": cid}
+    if rt in ("chat_id", "open_id") and rv:
+        base["rid_t"] = rt
+        base["rid"] = rv
+
+    elements: List[Dict[str, Any]] = [
+        {"tag": "markdown", "content": "**选择静音时长**（对已选监控生效）"},
+    ]
+    for label, secs in _MUTE_DURATION_CHOICES:
+        pl = dict(base)
+        pl["v"] = "apply"
+        pl["sec"] = str(int(secs))
+        elements.append(
+            _monitoring_card_v2_callback_button(
+                label,
+                "primary",
+                _monitoring_card_callback_payload_strings(pl),
+                element_id=f"mute_d_{secs}"[:20],
+            )
+        )
+    pl_cancel = dict(base)
+    pl_cancel["v"] = "cancel_sel"
+    elements.append(
+        _monitoring_card_v2_callback_button(
+            "返回/取消选择",
+            "default",
+            _monitoring_card_callback_payload_strings(pl_cancel),
+            element_id="mute_back",
+        )
+    )
+    return elements
+
+
+def _mute_selection_card_dict(rid_t: str, rid: str) -> Dict[str, Any]:
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": "监控告警静音"},
+            "subtitle": {"tag": "plain_text", "content": "/mute"},
+        },
+        "body": {"elements": _mute_selection_card_elements(rid_t, rid)},
+    }
+
+
+def _mute_duration_card_dict(rid_t: str, rid: str, operator_open_id: str, chat_id: str) -> Dict[str, Any]:
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": "选择静音时长"},
+            "subtitle": {"tag": "plain_text", "content": "/mute"},
+        },
+        "body": {"elements": _mute_duration_card_elements(rid_t, rid, operator_open_id, chat_id)},
+    }
+
+
+def _mute_send_duration_card_async(
+    rid_t: str, rid: str, operator_open_id: str, chat_id: str
+) -> None:
+    def _run() -> None:
+        try:
+            rt = (rid_t or "").strip()
+            rv = (rid or "").strip()
+            if rt not in ("chat_id", "open_id") or not rv:
+                return
+            card = _mute_duration_card_dict(rt, rv, operator_open_id, chat_id)
+            _lark_send_interactive_card(rt, rv, card)
+        except Exception:
+            logger.exception("mute: send duration card failed")
+
+    threading.Thread(target=_run, daemon=True, name="mute-duration-card").start()
+
+
+def _mute_send_selection_card_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
+    try:
+        rt = "chat_id" if (chat_id or "").strip() else "open_id"
+        rv = (chat_id or open_id or "").strip()
+        if not rv:
+            logger.warning("mute: missing receive_id")
+            return
+        card = _mute_selection_card_dict(rt, rv)
+        _lark_send_interactive_card(rt, rv, card)
+    except Exception:
+        logger.exception("mute: send selection card failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _cancelmute_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
+    try:
+        rt = "chat_id" if (chat_id or "").strip() else "open_id"
+        rv = (chat_id or open_id or "").strip()
+        if not rv:
+            return
+        with _monitoring_reply_dispatch_lock:
+            _mute_clear_all_locked()
+        _lark_send_text(
+            rt,
+            rv,
+            "已清除 **全部** 监控告警静音（新告警将正常推送）。\n"
+            "（静音保存在进程内存，重启服务后会清空。）",
+        )
+    except Exception:
+        logger.exception("cancelmute failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return HTTP response dict for card.action when toast should be shown synchronously."""
+    ev_id = _lark_im_payload_event_id(data)
+    with _monitoring_reply_dispatch_lock:
+        if ev_id and ev_id in _monitoring_card_action_event_ids:
+            return _mute_toast_response("重复点击已忽略", "info")
+        if ev_id:
+            _monitoring_card_action_event_ids.add(ev_id)
+            if len(_monitoring_card_action_event_ids) > 2000:
+                _monitoring_card_action_event_ids.clear()
+                _monitoring_card_action_event_ids.add(ev_id)
+
+    chat_id, open_id = _lark_card_action_target_ids(data)
+    rid_t = _lark_dict_pick_str(val, "rid_t", "receive_id_type")
+    rid = _lark_dict_pick_str(val, "rid", "receive_id")
+    if rid_t == "chat_id" and rid:
+        chat_id = rid
+        open_id = ""
+    elif rid_t == "open_id" and rid:
+        open_id = rid
+
+    op_open = open_id
+    if not op_open:
+        ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+        op = ev.get("operator") if isinstance(ev.get("operator"), dict) else {}
+        op_id = op.get("operator_id") if isinstance(op.get("operator_id"), dict) else {}
+        op_open = _lark_dict_pick_str(op_id, "open_id", "openId", "user_id", "userId")
+
+    sk = _mute_session_key(chat_id, op_open or "")
+    v = _lark_dict_pick_str(val, "v")
+    allowed = _monitoring_mutable_channel_ids()
+
+    if v == "toggle":
+        ch = _lark_dict_pick_str(val, "ch").strip()
+        if ch not in allowed:
+            return _mute_toast_response("未知监控项", "warning")
+        with _monitoring_reply_dispatch_lock:
+            pend = _mute_pending_selections.setdefault(sk, set())
+            if ch in pend:
+                pend.discard(ch)
+                msg = f"已移除：{_mute_channel_display_label(ch)}（剩余 {len(pend)} 项）"
+            else:
+                pend.add(ch)
+                msg = f"已加入：{_mute_channel_display_label(ch)}（共 {len(pend)} 项）"
+        return _mute_toast_response(msg, "success")
+
+    if v == "all":
+        with _monitoring_reply_dispatch_lock:
+            _mute_pending_selections[sk] = set(allowed)
+        _mute_send_duration_card_async(rid_t, rid, op_open or "", chat_id)
+        return _mute_toast_response("已全选，请选择时长", "success")
+
+    if v == "cancel_sel":
+        with _monitoring_reply_dispatch_lock:
+            _mute_pending_selections.pop(sk, None)
+        return _mute_toast_response("已取消选择", "info")
+
+    if v == "next":
+        with _monitoring_reply_dispatch_lock:
+            pend = _mute_pending_selections.get(sk) or set()
+            pend = set(pend)
+        if not pend:
+            return _mute_toast_response("请先选择至少一项监控", "warning")
+        _mute_send_duration_card_async(rid_t, rid, op_open or "", chat_id)
+        return _mute_toast_response("请选择静音时长", "success")
+
+    if v == "apply":
+        oid = _lark_dict_pick_str(val, "oid").strip()
+        cid = _lark_dict_pick_str(val, "cid").strip()
+        sk2 = _mute_session_key(cid, oid)
+        try:
+            sec = int(float(_lark_dict_pick_str(val, "sec") or "0"))
+        except (TypeError, ValueError):
+            sec = 0
+        if sec <= 0:
+            return _mute_toast_response("无效的时长", "warning")
+        with _monitoring_reply_dispatch_lock:
+            pend = set(_mute_pending_selections.pop(sk2, set()) or set())
+        if not pend:
+            return _mute_toast_response("没有待静音项（请从 /mute 重新选择）", "warning")
+        applied = _mute_apply_channels(pend, float(sec))
+        if not applied:
+            return _mute_toast_response("未能应用静音", "warning")
+        lines = [f"已对 {len(applied)} 项开启告警静音："]
+        for ch, exp in sorted(applied.items(), key=lambda kv: kv[0]):
+            lines.append(f"- {_mute_channel_display_label(ch)} → 至 {_fmt_ts_short(exp)}")
+        summary = "\n".join(lines)
+        try:
+            rt = (rid_t or "").strip()
+            rv = (rid or "").strip()
+            if rt in ("chat_id", "open_id") and rv:
+                _lark_send_text(rt, rv, summary)
+        except Exception:
+            logger.exception("mute: confirmation text send failed")
+        return _mute_toast_response("静音已生效", "success")
+
+    return _mute_toast_response("未知操作", "warning")
+
+
+def _lark_dispatch_card_action(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Route card.action; optional dict → merge into HTTP 200 JSON (toast)."""
+    val = _lark_card_action_value(data)
+    k = _lark_dict_pick_str(val, "k")
+    if k == "mute_btn":
+        _mute_purge_expired()
+        return _mute_card_action_dispatch(data, val)
+    if k == "monitoring_btn":
+        _handle_monitoring_card_action(data)
+        return None
+    logger.info("card.action ignored value=%r", val or None)
+    return None
+
+
 def _monitoring_interactive_card_dict(
     reply: str,
     receive_id_type: str,
@@ -2186,7 +2623,7 @@ def _lark_send_monitoring_user_message(
     # Card markdown body has strict cap; for long replies, send split text messages directly.
     # Keep this threshold conservative to avoid card-side clipping.
     if len(reply or "") > 3000:
-        _lark_send_text_auto(receive_id_type, rid, reply, max_chars=9000)
+        _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3200)
         return False, False
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
@@ -2199,7 +2636,7 @@ def _lark_send_monitoring_user_message(
                 "check app permission「发送消息卡片」.",
                 e,
             )
-    _lark_send_text_auto(receive_id_type, rid, reply, max_chars=9000)
+    _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3200)
     return False, False
 
 
@@ -3864,19 +4301,12 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     Alert-only concise content:
     which graph/series, spike or drop, from value/time -> to value/time.
     """
+    _mute_purge_expired()
     lines: List[str] = ["[ALERT] Threshold reached"]
     reason_blocks: List[str] = []
     a_http = _http_analysis_for_payload(payload)
-    reasons = _format_trigger_lines(
-        GRAFANA_PANEL_TITLE,
-        "HTTP",
-        a_http,
-        MONITORING_HTTP_DROP_ALERT_PCT,
-        MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
-    )
-    if not reasons:
-        fb = _format_trigger_fallback_line(
+    if not _monitoring_alert_channel_muted("http"):
+        reasons = _format_trigger_lines(
             GRAFANA_PANEL_TITLE,
             "HTTP",
             a_http,
@@ -3884,13 +4314,24 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
             MONITORING_ALERT_WINDOW_SECONDS,
         )
-        if fb:
-            reasons.append(fb)
-    reason_blocks.extend(reasons)
+        if not reasons:
+            fb = _format_trigger_fallback_line(
+                GRAFANA_PANEL_TITLE,
+                "HTTP",
+                a_http,
+                MONITORING_HTTP_DROP_ALERT_PCT,
+                MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
+                MONITORING_ALERT_WINDOW_SECONDS,
+            )
+            if fb:
+                reasons.append(fb)
+        reason_blocks.extend(reasons)
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
         kind = (ex.get("kind") or "")
+        if _monitoring_alert_channel_muted(kind):
+            continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
         if kind == "9280_push":
             g_lbl = GRAFANA_PANEL_TITLE_9280
@@ -3980,12 +4421,17 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
 
 
 def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
-    if bool(_http_analysis_for_payload(payload).get("hit_alert")):
+    _mute_purge_expired()
+    if not _monitoring_alert_channel_muted("http") and bool(
+        _http_analysis_for_payload(payload).get("hit_alert")
+    ):
         return True
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
         k = (ex.get("kind") or "")
+        if _monitoring_alert_channel_muted(k):
+            continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
         if k == "9280_push" and bool(_analysis_for_9280_payload(p2).get("hit_alert")):
             return True
@@ -4053,9 +4499,12 @@ def _format_http_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
     return lines
 
 
-def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
+def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention: bool = True) -> str:
     """
     Lark-friendly compact layout: ``【panel】graph`` + short ``Dashboard: …/d/{uid}`` + HTTP table + footer.
+
+    When the caller prepends ``_format_alert_trigger_reply`` (already contains ``<at>``), pass
+    ``include_target_mention=False`` to avoid duplicate mentions.
     """
     max_rows = 9
     uid = str(payload.get("dashboardUid") or GRAFANA_DASHBOARD_UID)
@@ -4165,7 +4614,11 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
             lines.extend(rows)
             lines.append("```")
 
-    if _monitoring_payload_hit_alert(payload) and TARGET_USER_OPEN_ID:
+    if (
+        include_target_mention
+        and _monitoring_payload_hit_alert(payload)
+        and TARGET_USER_OPEN_ID
+    ):
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
     lines.extend(_format_http_analysis_lines(http_ex))
 
@@ -4252,7 +4705,6 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
     k = _lark_dict_pick_str(val, "k")
     v = _lark_dict_pick_str(val, "v")
     if not (k == "monitoring_btn" and v == "refresh"):
-        logger.info("card.action ignored value=%r", val or None)
         return
     ev_id = _lark_im_payload_event_id(data)
     with _monitoring_reply_dispatch_lock:
@@ -4441,7 +4893,9 @@ def _monitoring_background_worker(
             grafana_session = grafana_login_session()
             payload = fetch_monitoring_payload(session=grafana_session)
             alert_hit = _monitoring_payload_hit_alert(payload)
-            reply = _format_monitoring_reply(payload)
+            reply = _format_monitoring_reply(payload, include_target_mention=not alert_hit)
+            if alert_hit and payload is not None:
+                reply = _format_alert_trigger_reply(payload) + "\n\n---\n\n" + reply
         except Exception as e:
             logger.exception("monitoring fetch failed (background)")
             reply = f"监控数据拉取失败：{e}"
@@ -4511,7 +4965,7 @@ def _monitoring_background_worker(
             suppress_alert_copy = alert_chat_id in src_alias
             if alert_hit and alert_chat_id and not suppress_alert_copy:
                 try:
-                    _lark_send_text_auto("chat_id", alert_chat_id, alert_reply, max_chars=9000)
+                    _lark_send_text_auto("chat_id", alert_chat_id, alert_reply, max_chars=3200)
                     logger.info(
                         "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
                         alert_chat_id[:16],
@@ -4713,21 +5167,79 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     mentions = mentions_raw if isinstance(mentions_raw, list) else []
     clean = _lark_clean_command_text(raw_text, mentions)
 
-    if not _text_should_run_monitoring(raw_text, clean, mentions):
-        logger.info(
-            "im.message no trigger raw=%r clean=%r (need %r or @bot per MONITORING_AT_MENTION_*)",
-            (raw_text or "")[:160],
-            (clean or "")[:160],
-            MONITORING_TRIGGER,
-        )
-        return
-
     chat_id = chat_resolved
     open_id = sender_open
     chat_aliases = _lark_message_chat_id_aliases(msg)
     sender_debounce = _lark_im_sender_debounce_token(sender, open_id)
     im_event_id = _lark_im_payload_event_id(data)
     msg_time = _lark_im_message_time_token(msg)
+
+    clean_l = (clean or "").strip().lower()
+    mute_tri = (MONITORING_MUTE_TRIGGER or "/mute").strip().lower()
+    cancel_tri = (MONITORING_CANCELMUTE_TRIGGER or "/cancelmute").strip().lower()
+
+    def _cmd_hit(c: str, tri_s: str) -> bool:
+        return bool(tri_s) and (c == tri_s or c.startswith(tri_s + " "))
+
+    sp_cmd: Optional[str] = None
+    if _cmd_hit(clean_l, mute_tri):
+        sp_cmd = "mute"
+    elif _cmd_hit(clean_l, cancel_tri):
+        sp_cmd = "cancelmute"
+
+    if sp_cmd:
+        processed_stick_m = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        body_key_m = "__mute_cmd__" if sp_cmd == "mute" else "__cancelmute_cmd__"
+        debounce_key_m = f"{(chat_id or '').strip()}\n{body_key_m}"
+        now_mm = time.monotonic()
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                logger.info("duplicate IM event_id=%s — skip (%s)", im_event_id, sp_cmd)
+                return
+            if processed_stick_m and processed_stick_m in _processed_lark_message_ids:
+                logger.info("duplicate %s dispatch stick=%r — skip", sp_cmd, processed_stick_m[:96])
+                return
+            if debounce_key_m in _monitoring_inflight_keys:
+                logger.info("%s skip — already in flight", sp_cmd)
+                return
+            _monitoring_inflight_keys.add(debounce_key_m)
+            if processed_stick_m:
+                _processed_lark_message_ids.add(processed_stick_m)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                    _processed_lark_im_event_ids.clear()
+                    _processed_lark_im_event_ids.add(im_event_id)
+        logger.info("%s command accepted chat=%r open=%r", sp_cmd, bool(chat_id), bool(open_id))
+        if sp_cmd == "mute":
+            threading.Thread(
+                target=_mute_send_selection_card_worker,
+                args=(chat_id, open_id, debounce_key_m),
+                daemon=True,
+                name="mute-selection-card",
+            ).start()
+        else:
+            threading.Thread(
+                target=_cancelmute_worker,
+                args=(chat_id, open_id, debounce_key_m),
+                daemon=True,
+                name="cancelmute",
+            ).start()
+        return
+
+    if not _text_should_run_monitoring(raw_text, clean, mentions):
+        logger.info(
+            "im.message no trigger raw=%r clean=%r (need %r, %r, %r or @bot per MONITORING_AT_MENTION_*)",
+            (raw_text or "")[:160],
+            (clean or "")[:160],
+            MONITORING_TRIGGER,
+            MONITORING_MUTE_TRIGGER,
+            MONITORING_CANCELMUTE_TRIGGER,
+        )
+        return
+
     body_key = _monitoring_dispatch_body_key(clean, raw_text, mentions)
     processed_stick = _monitoring_processed_stick(
         mid, im_event_id, chat_id or "", sender_debounce, msg_time
@@ -5336,7 +5848,9 @@ def webhook_event():
     # Card interactions also require a fast 200; business logic should update the card asynchronously via Open API.
     if et_l.startswith("card.action"):
         try:
-            _handle_monitoring_card_action(data)
+            extra = _lark_dispatch_card_action(data)
+            if isinstance(extra, dict) and extra:
+                return _lark_min_json_response(extra)
         except Exception:
             logger.exception("card.action handler failed")
         return _lark_feishu_webhook_ack_immediate()
