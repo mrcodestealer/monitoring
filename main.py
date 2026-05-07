@@ -3701,7 +3701,7 @@ def _format_trigger_lines(
         sign = "+" if direction == "SPIKE" else "-"
         pct = _pct_text(ev.get("pct"))
         return (
-            f"{direction} {sign}{pct}% (>{threshold_pct:g}%): "
+            f"{direction} {sign}{pct}% (>{threshold_pct:g}%) "
             f"{_fmt_num(ev.get('from_val'))} ({_fmt_ts_short(ev.get('from_ts'))}) -> "
             f"{_fmt_num(ev.get('to_val'))} ({_fmt_ts_short(ev.get('to_ts'))})"
         )
@@ -3721,9 +3721,9 @@ def _format_trigger_lines(
     if fast_hits or cont_hits:
         block: List[str] = [f"[{graph_label}] {series_label}"]
         if fast_hits:
-            block.append(f"- Fast ({win_m}m): {' | '.join(fast_hits)}")
+            block.append(f"Fast ({win_m}m): {' | '.join(fast_hits)}")
         if cont_hits:
-            block.append(f"- Continuous    : {' | '.join(cont_hits)}")
+            block.append(f"Continuous: {' | '.join(cont_hits)}")
         out.append("\n".join(block))
     return out
 
@@ -3862,7 +3862,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         lines.append("alert triggered but no analyzable timeseries points were found")
     else:
         lines.append("")
-        lines.extend(reason_blocks)
+        lines.append("\n\n".join(reason_blocks))
     if TARGET_USER_OPEN_ID:
         lines.append("")
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
