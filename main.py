@@ -621,17 +621,20 @@ def _bucket_ts_monitoring_minute(ts: float) -> float:
     return dt.timestamp()
 
 
-def _keep_only_monitoring_minute_boundary_samples(
+def _snap_series_to_monitoring_minutes(
     points: List[Tuple[float, float]],
     *,
+    how: str,
     tol_sec: float = 0.5,
 ) -> List[Tuple[float, float]]:
     """
-    Drop sub-minute scrapes (e.g. ``04:35:45``); keep only samples near **minute start**
-    (``04:35:00``). Output timestamps are canonical **bucket** unix times so tables match :00 rows,
-    not offset points Grafana may hover.
+    One point per calendar minute (``MONITORING_ZONEINFO`` / local), keyed at minute start ``b``.
+
+    - If any sample lies within ``tol_sec`` of ``b``, prefer those (``max`` or ``sum`` of their values).
+    - Otherwise fall back so Prometheus offsets (:30 / :45) still produce data: ``max`` → value at the
+      timestamp **closest** to ``b``; ``sum`` → **sum every** sample in that minute (HTTP additive).
     """
-    out: List[Tuple[float, float]] = []
+    by_b: Dict[float, List[Tuple[float, float]]] = {}
     for ts, val in points:
         try:
             tsf = float(ts)
@@ -641,10 +644,23 @@ def _keep_only_monitoring_minute_boundary_samples(
         if not math.isfinite(tsf) or not math.isfinite(v):
             continue
         b = _bucket_ts_monitoring_minute(tsf)
-        if abs(tsf - b) > float(tol_sec):
-            continue
-        out.append((b, v))
-    return sorted(out, key=lambda x: x[0])
+        by_b.setdefault(b, []).append((tsf, v))
+    out: List[Tuple[float, float]] = []
+    tol = float(tol_sec)
+    for b in sorted(by_b.keys()):
+        cand = by_b[b]
+        near = [(t, v) for t, v in cand if abs(t - b) <= tol]
+        if near:
+            if how == "sum":
+                out.append((b, sum(v for _, v in near)))
+            else:
+                out.append((b, max(v for _, v in near)))
+        elif how == "sum":
+            out.append((b, sum(v for _, v in cand)))
+        else:
+            _t_pick, v_pick = min(cand, key=lambda x: abs(x[0] - b))
+            out.append((b, v_pick))
+    return out
 
 
 LARK_ENCRYPT_KEY = (
@@ -4020,10 +4036,11 @@ def _merge_digit_keyword_rows_max_bucketed(
     tol_sec: float = 0.5,
 ) -> List[Tuple[float, float]]:
     """
-    Merge duplicate numeric-id rows using **only** samples aligned to minute start (``…:00``),
-    then ``max`` across rows per minute bucket — avoids taking ``04:35:45`` when ``04:35:00`` exists.
+    Duplicate numeric-id rows: for each minute, prefer samples near ``…:00`` (``max`` across those);
+    if none, use the value at the timestamp **closest** to minute start (still one row per minute).
     """
-    by_bucket: Dict[float, float] = {}
+    by_b: Dict[float, List[Tuple[float, float]]] = {}
+    tol = float(tol_sec)
     for row in rows:
         for ts, val in row:
             try:
@@ -4034,12 +4051,17 @@ def _merge_digit_keyword_rows_max_bucketed(
                 continue
             tsf = float(ts)
             b = _bucket_ts_monitoring_minute(tsf)
-            if abs(tsf - b) > float(tol_sec):
-                continue
-            prev = by_bucket.get(b)
-            if prev is None or v > prev:
-                by_bucket[b] = v
-    return sorted(by_bucket.items(), key=lambda x: x[0])
+            by_b.setdefault(b, []).append((tsf, v))
+    out: List[Tuple[float, float]] = []
+    for b in sorted(by_b.keys()):
+        cand = by_b[b]
+        near = [v for t, v in cand if abs(t - b) <= tol]
+        if near:
+            out.append((b, max(near)))
+        else:
+            _, v_pick = min(cand, key=lambda x: abs(x[0] - b))
+            out.append((b, v_pick))
+    return out
 
 
 def _merge_result_rows_max_per_ts(rows: List[List[Tuple[float, float]]]) -> List[Tuple[float, float]]:
@@ -4407,7 +4429,7 @@ def _http_drop_spike_analysis(
 
 def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_http_timeseries_points(payload)
-    pts = _keep_only_monitoring_minute_boundary_samples(pts)
+    pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_HTTP_DROP_ALERT_PCT,
@@ -4421,7 +4443,7 @@ def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_9280_push_points(payload)
-    pts = _keep_only_monitoring_minute_boundary_samples(pts)
+    pts = _snap_series_to_monitoring_minutes(pts, how="max")
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_9280_ALERT_PCT,
@@ -4435,7 +4457,7 @@ def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_deposit_points(payload)
-    pts = _keep_only_monitoring_minute_boundary_samples(pts)
+    pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_DEPOSIT_ALERT_PCT,
@@ -4449,7 +4471,7 @@ def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_withdraw_points(payload)
-    pts = _keep_only_monitoring_minute_boundary_samples(pts)
+    pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_WITHDRAW_ALERT_PCT,
@@ -4474,7 +4496,7 @@ def _analysis_for_keyword_payload(
             len(pts),
             len(pts_filtered),
         )
-    pts_filtered = _keep_only_monitoring_minute_boundary_samples(pts_filtered)
+    pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="max")
     a = _http_drop_spike_analysis(
         pts_filtered,
         fast_threshold_pct,
