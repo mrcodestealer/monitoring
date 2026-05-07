@@ -88,7 +88,13 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_QUERY_STEP": 60,
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 900,
     # Prometheus 最近分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，最新点落在「约前两分钟」
-    "GRAFANA_QUERY_END_LAG_SECONDS": 1,
+    "GRAFANA_QUERY_END_LAG_SECONDS": 60,
+    # 二者均 >0 且 START>END 时：不用 LOOKBACK+LAG，改用对齐窗口（见 MONITORING_TIME_BUCKET_TZ）
+    # start = 当前日历分钟起点 − START 分钟，end = 当前日历分钟起点 − END 分钟（均为 …:00）。
+    # 例 NOW=5:35:23 → cur_min=5:35:00，START=6 END=1 → start=5:29:00 end=5:34:00（最后一桶 5:34:00 非 5:34:23）
+    # 设 START=0 或 END=0 则退回 GRAFANA_QUERY_LOOKBACK_SECONDS + GRAFANA_QUERY_END_LAG_SECONDS
+    "MONITORING_QUERY_ALIGNED_START_OFFSET_MINUTES": "6",
+    "MONITORING_QUERY_ALIGNED_END_OFFSET_MINUTES": "1",
     # 合并后再丢掉尾部 N 个「分钟桶」（最后一两分钟常为未完成 scrape / 延迟，易出现畸形偏低）；0=不丢
     "MONITORING_DROP_LAST_MERGED_MINUTES": "1",
     # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
@@ -499,6 +505,12 @@ GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
 GRAFANA_QUERY_LOOKBACK_SECONDS = _cfg_int("GRAFANA_QUERY_LOOKBACK_SECONDS", 900)
 GRAFANA_QUERY_END_LAG_SECONDS = _cfg_int("GRAFANA_QUERY_END_LAG_SECONDS", 120)
+MONITORING_QUERY_ALIGNED_START_OFFSET_MINUTES = max(
+    0, _cfg_int("MONITORING_QUERY_ALIGNED_START_OFFSET_MINUTES", 0)
+)
+MONITORING_QUERY_ALIGNED_END_OFFSET_MINUTES = max(
+    0, _cfg_int("MONITORING_QUERY_ALIGNED_END_OFFSET_MINUTES", 0)
+)
 GRAFANA_SCREENSHOT_WIDTH = _cfg_int("GRAFANA_SCREENSHOT_WIDTH", 1400)
 GRAFANA_SCREENSHOT_HEIGHT = _cfg_int("GRAFANA_SCREENSHOT_HEIGHT", 1080)
 GRAFANA_SCREENSHOT_TIMEOUT_MS = _cfg_int("GRAFANA_SCREENSHOT_TIMEOUT_MS", 90000)
@@ -1727,9 +1739,26 @@ def _fetch_panel_series_by_title(
         if start >= end:
             raise ValueError("query window: start_unix must be < end_unix")
     else:
-        lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
-        end = int(time.time()) - lag
-        start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
+        ao = int(MONITORING_QUERY_ALIGNED_START_OFFSET_MINUTES)
+        bo = int(MONITORING_QUERY_ALIGNED_END_OFFSET_MINUTES)
+        if ao > 0 and bo > 0 and ao > bo:
+            cur_m = float(_bucket_ts_monitoring_minute(time.time()))
+            end = int(cur_m - bo * 60)
+            start = int(cur_m - ao * 60)
+            if start >= end:
+                raise ValueError(
+                    "aligned query window: start must be < end "
+                    f"(start_offset={ao} end_offset={bo} start={start} end={end})"
+                )
+        else:
+            if ao > 0 or bo > 0:
+                logger.warning(
+                    "MONITORING_QUERY_ALIGNED_* ignored (need START>0, END>0, START>END); "
+                    "using GRAFANA_QUERY_LOOKBACK_SECONDS + GRAFANA_QUERY_END_LAG_SECONDS"
+                )
+            lag = max(0, int(GRAFANA_QUERY_END_LAG_SECONDS))
+            end = int(time.time()) - lag
+            start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
     sess = session or grafana_login_session()
     dash = _fetch_dashboard_model(sess, GRAFANA_DASHBOARD_UID)
     panel = _find_panel(dash, panel_title)
@@ -1798,12 +1827,16 @@ def fetch_request_total_1m_series(
     end_unix: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Same data as Grafana panel「请求总数/1m」: last ``GRAFANA_QUERY_LOOKBACK_SECONDS`` (default **900 = 15m**),
-    step ``GRAFANA_QUERY_STEP``. Align with dashboard ``GRAFANA_DASHBOARD_FROM`` / ``now-15m`` for screenshots.
-    ``end`` = now − ``GRAFANA_QUERY_END_LAG_SECONDS`` (default 120) so the newest bucket is ~2 minutes old,
-    avoiding incomplete recent-minute series that look like a false drop.
-    Uses dashboard JSON + Prometheus query_range via Grafana proxy (not HTML scraping).
-    If ``start_unix`` and ``end_unix`` are set, both are used instead of lag/lookback (watchdog eval window).
+    Same data as Grafana panel「请求总数/1m」via Prometheus ``query_range`` (Grafana proxy).
+
+    Default window (unless ``start_unix``/``end_unix`` passed, or watchdog overrides):
+
+    - If ``MONITORING_QUERY_ALIGNED_START_OFFSET_MINUTES`` and ``…_END_…`` are both **> 0** and
+      **START > END**: use minute-aligned bounds from :func:`_bucket_ts_monitoring_minute` —
+      ``start = cur_min − START×60``, ``end = cur_min − END×60`` (both ``…:00`` in the configured TZ).
+    - Else: ``end = now − GRAFANA_QUERY_END_LAG_SECONDS``, ``start = end − GRAFANA_QUERY_LOOKBACK_SECONDS``.
+
+    Step is ``GRAFANA_QUERY_STEP``. Watchdog passes explicit ``start_unix``/``end_unix`` unchanged.
     """
     return _fetch_panel_series_by_title(
         GRAFANA_PANEL_TITLE,
