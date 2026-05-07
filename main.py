@@ -89,6 +89,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 900,
     # Prometheus 最近分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，最新点落在「约前两分钟」
     "GRAFANA_QUERY_END_LAG_SECONDS": 120,
+    # 合并后再丢掉尾部 N 个「分钟桶」（最后一两分钟常为未完成 scrape / 延迟，易出现畸形偏低）；0=不丢
+    "MONITORING_DROP_LAST_MERGED_MINUTES": "1",
     # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
     "GRAFANA_SCREENSHOT_ENABLE": "1",
     "GRAFANA_SCREENSHOT_WIDTH": 1400,
@@ -583,6 +585,9 @@ MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
     "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
 )
 MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 120))
+MONITORING_DROP_LAST_MERGED_MINUTES = max(
+    0, min(60, _cfg_int("MONITORING_DROP_LAST_MERGED_MINUTES", 1))
+)
 MONITORING_SIMPLE_ALERT_TEXT = _lark_env_truthy("MONITORING_SIMPLE_ALERT_TEXT")
 MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS = _lark_env_truthy(
     "MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS"
@@ -661,6 +666,21 @@ def _snap_series_to_monitoring_minutes(
             _t_pick, v_pick = min(cand, key=lambda x: abs(x[0] - b))
             out.append((b, v_pick))
     return out
+
+
+def _trim_trailing_minute_buckets(
+    points: List[Tuple[float, float]],
+    n: int,
+) -> List[Tuple[float, float]]:
+    """
+    Drop the newest ``n`` minute buckets after snap — closing incomplete Prometheus tail rows.
+    Keeps at least ``n + 3`` points when possible so short windows do not go empty.
+    """
+    if n <= 0 or not points:
+        return points
+    if len(points) <= n + 2:
+        return points
+    return points[:-n]
 
 
 LARK_ENCRYPT_KEY = (
@@ -4430,6 +4450,7 @@ def _http_drop_spike_analysis(
 def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_http_timeseries_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
+    pts = _trim_trailing_minute_buckets(pts, MONITORING_DROP_LAST_MERGED_MINUTES)
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_HTTP_DROP_ALERT_PCT,
@@ -4444,6 +4465,7 @@ def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_9280_push_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="max")
+    pts = _trim_trailing_minute_buckets(pts, MONITORING_DROP_LAST_MERGED_MINUTES)
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_9280_ALERT_PCT,
@@ -4458,6 +4480,7 @@ def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_deposit_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
+    pts = _trim_trailing_minute_buckets(pts, MONITORING_DROP_LAST_MERGED_MINUTES)
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_DEPOSIT_ALERT_PCT,
@@ -4472,6 +4495,7 @@ def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_withdraw_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
+    pts = _trim_trailing_minute_buckets(pts, MONITORING_DROP_LAST_MERGED_MINUTES)
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_WITHDRAW_ALERT_PCT,
@@ -4497,6 +4521,7 @@ def _analysis_for_keyword_payload(
             len(pts_filtered),
         )
     pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="max")
+    pts_filtered = _trim_trailing_minute_buckets(pts_filtered, MONITORING_DROP_LAST_MERGED_MINUTES)
     a = _http_drop_spike_analysis(
         pts_filtered,
         fast_threshold_pct,
