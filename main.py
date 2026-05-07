@@ -621,34 +621,30 @@ def _bucket_ts_monitoring_minute(ts: float) -> float:
     return dt.timestamp()
 
 
-def _collapse_points_to_monitoring_minute_floor(
+def _keep_only_monitoring_minute_boundary_samples(
     points: List[Tuple[float, float]],
     *,
-    how: str,
+    tol_sec: float = 0.5,
 ) -> List[Tuple[float, float]]:
     """
-    Normalize every sample onto the **start of its calendar minute** (seconds = 0) in
-    ``MONITORING_ZONEINFO`` / process local — timestamps shown in bot tables are always :00.
-
-    - ``how=\"sum\"``: add values that share the same minute (HTTP totals across instant scrapes).
-    - ``how=\"max\"``: keep the largest value per minute (gauges / keyword panels).
+    Drop sub-minute scrapes (e.g. ``04:35:45``); keep only samples near **minute start**
+    (``04:35:00``). Output timestamps are canonical **bucket** unix times so tables match :00 rows,
+    not offset points Grafana may hover.
     """
-    by_b: Dict[float, float] = {}
+    out: List[Tuple[float, float]] = []
     for ts, val in points:
         try:
+            tsf = float(ts)
             v = float(val)
         except (TypeError, ValueError):
             continue
-        if not math.isfinite(v):
+        if not math.isfinite(tsf) or not math.isfinite(v):
             continue
-        b = _bucket_ts_monitoring_minute(float(ts))
-        if how == "sum":
-            by_b[b] = by_b.get(b, 0.0) + v
-        else:
-            prev = by_b.get(b)
-            if prev is None or v > prev:
-                by_b[b] = v
-    return sorted(by_b.items(), key=lambda x: x[0])
+        b = _bucket_ts_monitoring_minute(tsf)
+        if abs(tsf - b) > float(tol_sec):
+            continue
+        out.append((b, v))
+    return sorted(out, key=lambda x: x[0])
 
 
 LARK_ENCRYPT_KEY = (
@@ -4020,20 +4016,15 @@ def _pick_best_exact_keyword_series(candidates: List[List[Tuple[float, float]]])
 
 def _merge_digit_keyword_rows_max_bucketed(
     rows: List[List[Tuple[float, float]]],
+    *,
+    tol_sec: float = 0.5,
 ) -> List[Tuple[float, float]]:
     """
-    Merge several Prometheus ``result`` rows for the same numeric id (e.g. ``3201``).
-
-    ``max`` on **exact unix seconds** fails when duplicates scrape on slightly different offsets:
-    a ghost row can own ``03:48:00`` (~2.6k) while the real line only has ``03:47:58`` (~19.5k),
-    producing absurd fast spikes. Bucket by **calendar minute** in :data:`MONITORING_ZONEINFO`
-    (or process local when unset — same basis as :func:`_fmt_ts_short`), take ``max(value)`` inside each bucket **per row** (Prometheus may emit
-    several samples per minute; the last must not overwrite an earlier higher point), then ``max``
-    across rows.
+    Merge duplicate numeric-id rows using **only** samples aligned to minute start (``…:00``),
+    then ``max`` across rows per minute bucket — avoids taking ``04:35:45`` when ``04:35:00`` exists.
     """
     by_bucket: Dict[float, float] = {}
     for row in rows:
-        row_b: Dict[float, float] = {}
         for ts, val in row:
             try:
                 v = float(val)
@@ -4043,10 +4034,8 @@ def _merge_digit_keyword_rows_max_bucketed(
                 continue
             tsf = float(ts)
             b = _bucket_ts_monitoring_minute(tsf)
-            prev_r = row_b.get(b)
-            if prev_r is None or v > prev_r:
-                row_b[b] = v
-        for b, v in row_b.items():
+            if abs(tsf - b) > float(tol_sec):
+                continue
             prev = by_bucket.get(b)
             if prev is None or v > prev:
                 by_bucket[b] = v
@@ -4418,7 +4407,7 @@ def _http_drop_spike_analysis(
 
 def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_http_timeseries_points(payload)
-    pts = _collapse_points_to_monitoring_minute_floor(pts, how="sum")
+    pts = _keep_only_monitoring_minute_boundary_samples(pts)
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_HTTP_DROP_ALERT_PCT,
@@ -4432,7 +4421,7 @@ def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_9280_push_points(payload)
-    pts = _collapse_points_to_monitoring_minute_floor(pts, how="max")
+    pts = _keep_only_monitoring_minute_boundary_samples(pts)
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_9280_ALERT_PCT,
@@ -4446,7 +4435,7 @@ def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_deposit_points(payload)
-    pts = _collapse_points_to_monitoring_minute_floor(pts, how="sum")
+    pts = _keep_only_monitoring_minute_boundary_samples(pts)
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_DEPOSIT_ALERT_PCT,
@@ -4460,7 +4449,7 @@ def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_withdraw_points(payload)
-    pts = _collapse_points_to_monitoring_minute_floor(pts, how="sum")
+    pts = _keep_only_monitoring_minute_boundary_samples(pts)
     a = _http_drop_spike_analysis(
         pts,
         MONITORING_WITHDRAW_ALERT_PCT,
@@ -4485,7 +4474,7 @@ def _analysis_for_keyword_payload(
             len(pts),
             len(pts_filtered),
         )
-    pts_filtered = _collapse_points_to_monitoring_minute_floor(pts_filtered, how="max")
+    pts_filtered = _keep_only_monitoring_minute_boundary_samples(pts_filtered)
     a = _http_drop_spike_analysis(
         pts_filtered,
         fast_threshold_pct,
