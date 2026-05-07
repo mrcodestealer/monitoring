@@ -3687,30 +3687,44 @@ def _format_trigger_lines(
     cd = analysis.get("consecutive_max_drop")
     cs = analysis.get("consecutive_max_spike")
     win_m = max(1, int(round(float(window_seconds) / 60.0)))
+
+    def _pct_text(v: Any) -> str:
+        try:
+            f = float(v)
+            if abs(f - round(f)) < 1e-6:
+                return f"{int(round(f)):,}"
+            return f"{f:,.2f}"
+        except (TypeError, ValueError):
+            return str(v)
+
+    def _event_text(ev: Dict[str, Any], direction: str, threshold_pct: float) -> str:
+        sign = "+" if direction == "SPIKE" else "-"
+        pct = _pct_text(ev.get("pct"))
+        return (
+            f"{direction} {sign}{pct}% (>{threshold_pct:g}%): "
+            f"{_fmt_num(ev.get('from_val'))} ({_fmt_ts_short(ev.get('from_ts'))}) -> "
+            f"{_fmt_num(ev.get('to_val'))} ({_fmt_ts_short(ev.get('to_ts'))})"
+        )
+
+    fast_hits: List[str] = []
     if isinstance(wd, dict) and float(wd.get("pct") or 0.0) >= float(fast_threshold_pct):
-        out.append(
-            f"[{graph_label}] {series_label} DROP {wd.get('pct')}% within {win_m}m "
-            f"(>{fast_threshold_pct:g}%): {_fmt_num(wd.get('from_val'))} ({_fmt_ts_short(wd.get('from_ts'))}) -> "
-            f"{_fmt_num(wd.get('to_val'))} ({_fmt_ts_short(wd.get('to_ts'))})"
-        )
+        fast_hits.append(_event_text(wd, "DROP", fast_threshold_pct))
     if isinstance(ws, dict) and float(ws.get("pct") or 0.0) >= float(fast_threshold_pct):
-        out.append(
-            f"[{graph_label}] {series_label} SPIKE {ws.get('pct')}% within {win_m}m "
-            f"(>{fast_threshold_pct:g}%): {_fmt_num(ws.get('from_val'))} ({_fmt_ts_short(ws.get('from_ts'))}) -> "
-            f"{_fmt_num(ws.get('to_val'))} ({_fmt_ts_short(ws.get('to_ts'))})"
-        )
+        fast_hits.append(_event_text(ws, "SPIKE", fast_threshold_pct))
+
+    cont_hits: List[str] = []
     if isinstance(cd, dict) and float(cd.get("pct") or 0.0) >= float(continuous_threshold_pct):
-        out.append(
-            f"[{graph_label}] {series_label} CONTINUOUS DROP {cd.get('pct')}% "
-            f"(>{continuous_threshold_pct:g}%): {_fmt_num(cd.get('from_val'))} ({_fmt_ts_short(cd.get('from_ts'))}) -> "
-            f"{_fmt_num(cd.get('to_val'))} ({_fmt_ts_short(cd.get('to_ts'))})"
-        )
+        cont_hits.append(_event_text(cd, "DROP", continuous_threshold_pct))
     if isinstance(cs, dict) and float(cs.get("pct") or 0.0) >= float(continuous_threshold_pct):
-        out.append(
-            f"[{graph_label}] {series_label} CONTINUOUS SPIKE {cs.get('pct')}% "
-            f"(>{continuous_threshold_pct:g}%): {_fmt_num(cs.get('from_val'))} ({_fmt_ts_short(cs.get('from_ts'))}) -> "
-            f"{_fmt_num(cs.get('to_val'))} ({_fmt_ts_short(cs.get('to_ts'))})"
-        )
+        cont_hits.append(_event_text(cs, "SPIKE", continuous_threshold_pct))
+
+    if fast_hits or cont_hits:
+        block: List[str] = [f"[{graph_label}] {series_label}"]
+        if fast_hits:
+            block.append(f"- Fast ({win_m}m): {' | '.join(fast_hits)}")
+        if cont_hits:
+            block.append(f"- Continuous    : {' | '.join(cont_hits)}")
+        out.append("\n".join(block))
     return out
 
 
@@ -3741,6 +3755,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     which graph/series, spike or drop, from value/time -> to value/time.
     """
     lines: List[str] = ["[ALERT] Threshold reached"]
+    reason_blocks: List[str] = []
     a_http = _http_analysis_for_payload(payload)
     reasons = _format_trigger_lines(
         GRAFANA_PANEL_TITLE,
@@ -3761,7 +3776,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         )
         if fb:
             reasons.append(fb)
-    lines.extend(reasons)
+    reason_blocks.extend(reasons)
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
@@ -3842,10 +3857,14 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             )
             if fb2:
                 reasons2.append(fb2)
-        lines.extend(reasons2)
-    if len(lines) == 1:
+        reason_blocks.extend(reasons2)
+    if not reason_blocks:
         lines.append("alert triggered but no analyzable timeseries points were found")
+    else:
+        lines.append("")
+        lines.extend(reason_blocks)
     if TARGET_USER_OPEN_ID:
+        lines.append("")
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
     return "\n".join(lines)
 
