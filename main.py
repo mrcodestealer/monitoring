@@ -1440,9 +1440,41 @@ def _ds_query_to_prometheus_like(raw: Dict[str, Any], ref_id: str) -> Dict[str, 
             continue
 
         names: List[str] = []
+        field_objs: List[Dict[str, Any]] = []
         for i in range(n):
             f = fields[i] if isinstance(fields[i], dict) else {}
+            field_objs.append(f)
             names.append(str(f.get("name") or f"f{i}"))
+
+        def _field_series_name(idx: int, fallback: str) -> str:
+            if idx < 0 or idx >= n:
+                return fallback
+            f = field_objs[idx] if isinstance(field_objs[idx], dict) else {}
+            cfg = f.get("config") if isinstance(f.get("config"), dict) else {}
+            labels = f.get("labels") if isinstance(f.get("labels"), dict) else {}
+            for k in ("displayName", "displayNameFromDS"):
+                v = cfg.get(k)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+            for lk in ("series", "name", "providerid", "provider_id", "gameid", "game_id"):
+                if lk in labels and str(labels.get(lk) or "").strip():
+                    return str(labels.get(lk)).strip()
+            if labels:
+                if len(labels) == 1:
+                    try:
+                        only_v = next(iter(labels.values()))
+                        if str(only_v or "").strip():
+                            return str(only_v).strip()
+                    except Exception:
+                        pass
+                compact = ",".join(
+                    f"{str(k).strip()}={str(v).strip()}"
+                    for k, v in labels.items()
+                    if str(k).strip() and str(v).strip()
+                ).strip(",")
+                if compact:
+                    return compact
+            return fallback
 
         row_len = 0
         for i in range(n):
@@ -1532,7 +1564,7 @@ def _ds_query_to_prometheus_like(raw: Dict[str, Any], ref_id: str) -> Dict[str, 
                         val = float(cols[vi][r_i])
                     except Exception:
                         continue
-                    lbl = str(names[vi]).strip() or "value"
+                    lbl = _field_series_name(vi, str(names[vi]).strip() or "value")
                     by_label.setdefault(lbl, []).append([ts, val])
             else:
                 try:
@@ -1547,7 +1579,7 @@ def _ds_query_to_prometheus_like(raw: Dict[str, Any], ref_id: str) -> Dict[str, 
                     except Exception:
                         lbl = "value"
                 elif 0 <= val_idx < len(names):
-                    lbl = str(names[val_idx]).strip() or "value"
+                    lbl = _field_series_name(val_idx, str(names[val_idx]).strip() or "value")
                 by_label.setdefault(lbl, []).append([ts, val])
 
         for lbl, pairs in by_label.items():
@@ -3541,6 +3573,27 @@ def _analysis_for_keyword_payload(
     )
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
+    if not pts:
+        sample_labels: List[str] = []
+        for s in payload.get("series") or []:
+            prom = s.get("prometheus") if isinstance(s.get("prometheus"), dict) else {}
+            pdata = prom.get("data") if isinstance(prom.get("data"), dict) else {}
+            for r in pdata.get("result") or []:
+                metric = r.get("metric") if isinstance(r.get("metric"), dict) else {}
+                lbl = str(metric.get("series") or metric.get("name") or "").strip()
+                if not lbl:
+                    lbl = " ".join(str(v) for v in metric.values() if str(v).strip()).strip()
+                if lbl and lbl not in sample_labels:
+                    sample_labels.append(lbl)
+                if len(sample_labels) >= 20:
+                    break
+            if len(sample_labels) >= 20:
+                break
+        logger.info(
+            "keyword no match keyword=%r sample_series=%s",
+            keyword,
+            sample_labels[:20],
+        )
     return a
 
 
