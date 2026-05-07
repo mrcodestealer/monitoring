@@ -1911,6 +1911,78 @@ def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
         )
 
 
+def _split_text_for_lark(text: str, max_chars: int = 3000) -> List[str]:
+    """
+    Split long text into multiple chunks to avoid platform length truncation.
+    Prefer paragraph/line boundaries; hard-cut only when necessary.
+    """
+    raw = str(text or "")
+    if max_chars <= 200:
+        max_chars = 200
+    if len(raw) <= max_chars:
+        return [raw]
+
+    chunks: List[str] = []
+    cur = ""
+
+    def _flush() -> None:
+        nonlocal cur
+        if cur:
+            chunks.append(cur)
+            cur = ""
+
+    def _push_piece(piece: str, sep: str = "\n\n") -> None:
+        nonlocal cur
+        if not piece:
+            return
+        if len(piece) > max_chars:
+            _flush()
+            lines = piece.split("\n")
+            buf = ""
+            for ln in lines:
+                if len(ln) > max_chars:
+                    if buf:
+                        chunks.append(buf)
+                        buf = ""
+                    i = 0
+                    while i < len(ln):
+                        chunks.append(ln[i : i + max_chars])
+                        i += max_chars
+                    continue
+                trial = f"{buf}\n{ln}" if buf else ln
+                if len(trial) <= max_chars:
+                    buf = trial
+                else:
+                    if buf:
+                        chunks.append(buf)
+                    buf = ln
+            if buf:
+                chunks.append(buf)
+            return
+
+        trial = f"{cur}{sep}{piece}" if cur else piece
+        if len(trial) <= max_chars:
+            cur = trial
+        else:
+            _flush()
+            cur = piece
+
+    for para in raw.split("\n\n"):
+        _push_piece(para, "\n\n")
+    _flush()
+    return chunks or [raw[:max_chars]]
+
+
+def _lark_send_text_auto(receive_id_type: str, receive_id: str, text: str, max_chars: int = 3000) -> None:
+    chunks = _split_text_for_lark(text, max_chars=max_chars)
+    total = len(chunks)
+    for i, c in enumerate(chunks, 1):
+        body = c
+        if total > 1:
+            body = f"[{i}/{total}]\n{c}"
+        _lark_send_text(receive_id_type, receive_id, body)
+
+
 def _lark_tenant_access_token_string() -> str:
     """Same tenant token as SDK; used for multipart image upload (``requests``)."""
     if not APP_ID or not APP_SECRET:
@@ -2113,6 +2185,10 @@ def _lark_send_monitoring_user_message(
     rid = (receive_id or "").strip()
     if not rid:
         raise ValueError("empty receive_id for monitoring message")
+    # Card markdown body has strict cap; for very long replies, send split text messages directly.
+    if len(reply or "") > 3800:
+        _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3000)
+        return False, False
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
             card = _monitoring_interactive_card_dict(reply, receive_id_type, rid, lark_img_key)
@@ -2124,7 +2200,7 @@ def _lark_send_monitoring_user_message(
                 "check app permission「发送消息卡片」.",
                 e,
             )
-    _lark_send_text(receive_id_type, rid, reply)
+    _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3000)
     return False, False
 
 
@@ -4439,7 +4515,7 @@ def _monitoring_background_worker(
             suppress_alert_copy = alert_chat_id in src_alias
             if alert_hit and alert_chat_id and not suppress_alert_copy:
                 try:
-                    _lark_send_text("chat_id", alert_chat_id, alert_reply)
+                    _lark_send_text_auto("chat_id", alert_chat_id, alert_reply, max_chars=3000)
                     logger.info(
                         "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
                         alert_chat_id[:16],
