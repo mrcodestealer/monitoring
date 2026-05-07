@@ -3981,9 +3981,63 @@ def _merge_digit_keyword_rows_max_bucketed(
     return sorted(by_bucket.items(), key=lambda x: x[0])
 
 
+def _merge_result_rows_max_per_ts(rows: List[List[Tuple[float, float]]]) -> List[Tuple[float, float]]:
+    """Combine several Prometheus ``result`` rows that describe the same legend; ``max`` per timestamp."""
+    by_ts: Dict[float, float] = {}
+    for row in rows:
+        row_ts: Dict[float, float] = {}
+        for ts, val in row:
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(v):
+                continue
+            row_ts[float(ts)] = v
+        for ts, v in row_ts.items():
+            prev = by_ts.get(ts)
+            if prev is None or v > prev:
+                by_ts[ts] = v
+    return sorted(by_ts.items(), key=lambda x: x[0])
+
+
 def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
-    """Pick/merge points for '9280 + Push' from panel targets/results."""
+    """
+    Pick points for ``9280 + Push``.
+
+    Substring keyword matching also hits ``9280 + Push - 7Days`` / ``9280 + Push...``; summing those
+    with the highlighted series (~81k) yielded bogus totals (~238k). Prefer **exact** legend equality
+    first; fall back to fuzzy match only if nothing matches exactly.
+    """
     kw = (MONITORING_9280_SERIES_KEYWORD or "9280 + Push").strip()
+    kw_cf = kw.casefold()
+
+    exact_rows: List[List[Tuple[float, float]]] = []
+    for s in payload.get("series") or []:
+        lg = str(s.get("legendFormat") or "").strip()
+        if lg.casefold() != kw_cf:
+            continue
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
+            if pts:
+                exact_rows.append(pts)
+
+    if exact_rows:
+        if len(exact_rows) == 1:
+            by_one: Dict[float, float] = {}
+            for ts, val in exact_rows[0]:
+                try:
+                    v = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(v):
+                    continue
+                by_one[float(ts)] = v
+            return sorted(by_one.items(), key=lambda x: x[0])
+        return _merge_result_rows_max_per_ts(exact_rows)
+
     by_ts: Dict[float, float] = {}
     for s in payload.get("series") or []:
         lg = str(s.get("legendFormat") or "")
