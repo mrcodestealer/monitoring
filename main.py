@@ -196,9 +196,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_QUIET_END_HOUR": "0",
     "MONITORING_WATCH_QUIET_END_MINUTE": "10",
     # Tag person
-    "TARGET_USER_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
+    "TARGET_USER_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
     # In which group
-    "MONITORING_ALERT_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
+    "MONITORING_ALERT_CHAT_ID": "oc_9de3d63fc589df6feeb9b0bee9c45b72",
 }
 
 
