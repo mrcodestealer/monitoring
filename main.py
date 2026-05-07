@@ -3942,31 +3942,43 @@ def _pick_best_exact_keyword_series(candidates: List[List[Tuple[float, float]]])
     return best_pl or []
 
 
-def _merge_exact_digit_keyword_series_max_per_ts(
-    candidates: List[List[Tuple[float, float]]],
+def _bucket_ts_local_minute(ts: float) -> float:
+    """Floor ``ts`` to the start of the **local** calendar minute (matches alert time formatting)."""
+    dt = datetime.fromtimestamp(float(ts))
+    floored = dt.replace(second=0, microsecond=0)
+    return floored.timestamp()
+
+
+def _merge_digit_keyword_rows_max_bucketed(
+    rows: List[List[Tuple[float, float]]],
 ) -> List[Tuple[float, float]]:
     """
-    Duplicate legend/id rows for numeric keywords often disagree **per timestamp** (one stale ~11k,
-    another ~19k). Choosing one whole row by median still leaves dips at single buckets that Grafana's
-    line does not show. Take ``max(value)`` per unix bucket across rows (last duplicate within a row wins),
-    matching the **upper envelope** of overlapping duplicates — closer to the hovered series.
+    Merge several Prometheus ``result`` rows for the same numeric id (e.g. ``3201``).
+
+    ``max`` on **exact unix seconds** fails when duplicates scrape on slightly different offsets:
+    a ghost row can own ``03:48:00`` (~2.6k) while the real line only has ``03:47:58`` (~19.5k),
+    producing absurd fast spikes. Bucket by **local wall-clock minute** (same basis as
+    :func:`_fmt_ts_short`), take ``max`` inside each bucket per row (last wins if a row has several
+    samples in that minute), then ``max`` across rows.
     """
-    by_ts: Dict[float, float] = {}
-    for pl in candidates:
-        row_ts: Dict[float, float] = {}
-        for ts, val in pl:
+    by_bucket: Dict[float, float] = {}
+    for row in rows:
+        row_b: Dict[float, float] = {}
+        for ts, val in row:
             try:
                 v = float(val)
             except (TypeError, ValueError):
                 continue
             if not math.isfinite(v):
                 continue
-            row_ts[float(ts)] = v
-        for ts, v in row_ts.items():
-            prev = by_ts.get(ts)
+            tsf = float(ts)
+            b = _bucket_ts_local_minute(tsf)
+            row_b[b] = v
+        for b, v in row_b.items():
+            prev = by_bucket.get(b)
             if prev is None or v > prev:
-                by_ts[ts] = v
-    return sorted(by_ts.items(), key=lambda x: x[0])
+                by_bucket[b] = v
+    return sorted(by_bucket.items(), key=lambda x: x[0])
 
 
 def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
@@ -3999,8 +4011,8 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
     kw = (keyword or "").strip()
 
     # Exact-id rows: duplicate Prometheus ``result`` rows (same legend ``3201``) must NOT be blindly
-    # summed — sums like 5294+9483=14777 vs Grafana ~20k. Numeric ids: ``max`` per timestamp across
-    # duplicates (upper envelope); non-numeric: pick one series by median magnitude.
+    # summed — sums like 5294+9483=14777 vs Grafana ~20k. Numeric ids with multiple rows: ``max`` per
+    # **local minute** bucket across duplicates; non-numeric: pick one series by median magnitude.
     exact_candidates: List[List[Tuple[float, float]]] = []
     for s in payload.get("series") or []:
         lg = str(s.get("legendFormat") or "")
@@ -4018,7 +4030,7 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
         if len(exact_candidates) == 1:
             merged_pts = exact_candidates[0]
         elif kw.isdigit():
-            merged_pts = _merge_exact_digit_keyword_series_max_per_ts(exact_candidates)
+            merged_pts = _merge_digit_keyword_rows_max_bucketed(exact_candidates)
         else:
             merged_pts = _pick_best_exact_keyword_series(exact_candidates)
         by_one: Dict[float, float] = {}
@@ -4027,8 +4039,37 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
         return sorted(by_one.items(), key=lambda x: x[0])
 
     def _accumulate_fuzzy() -> Dict[float, float]:
-        by_ts: Dict[float, float] = {}
         digit_kw = bool(kw.isdigit())
+        if digit_kw:
+            digit_rows: List[List[Tuple[float, float]]] = []
+            for s in payload.get("series") or []:
+                lg = str(s.get("legendFormat") or "")
+                prom = s.get("prometheus") or {}
+                pdata = prom.get("data") or {}
+                for r in pdata.get("result") or []:
+                    metric = r.get("metric") or {}
+                    md = metric if isinstance(metric, dict) else {}
+                    if kw and not _keyword_matches_series_labels(kw, lg, md):
+                        continue
+                    pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
+                    if pts:
+                        digit_rows.append(pts)
+            if len(digit_rows) > 1:
+                return dict(_merge_digit_keyword_rows_max_bucketed(digit_rows))
+            by_ts: Dict[float, float] = {}
+            if len(digit_rows) == 1:
+                for ts, val in digit_rows[0]:
+                    try:
+                        v = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(v):
+                        continue
+                    by_ts[float(ts)] = v
+                return by_ts
+            return {}
+
+        by_ts_sum: Dict[float, float] = {}
         for s in payload.get("series") or []:
             lg = str(s.get("legendFormat") or "")
             prom = s.get("prometheus") or {}
@@ -4048,13 +4089,8 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
                         continue
                     row_ts[float(ts)] = v
                 for ts, v in row_ts.items():
-                    if digit_kw:
-                        prev = by_ts.get(ts)
-                        if prev is None or v > prev:
-                            by_ts[ts] = v
-                    else:
-                        by_ts[ts] = by_ts.get(ts, 0.0) + v
-        return by_ts
+                    by_ts_sum[ts] = by_ts_sum.get(ts, 0.0) + v
+        return by_ts_sum
 
     by_fuzzy = _accumulate_fuzzy()
     if not by_fuzzy:
@@ -4319,7 +4355,9 @@ def _analysis_for_keyword_payload(
     payload: Dict[str, Any], keyword: str, fast_threshold_pct: float, continuous_threshold_pct: float
 ) -> Dict[str, Any]:
     pts = _merge_series_points_by_keyword(payload, keyword)
-    pts_filtered = _filter_low_outlier_points(pts)
+    # Slightly stricter than HTTP panels: duplicate streams can leave single-row ghosts (~2.6k vs ~19k)
+    # that survive exact-second ``max``; drop points below ~14% of median before drop/spike math.
+    pts_filtered = _filter_low_outlier_points(pts, ratio_to_median=0.14)
     if len(pts_filtered) != len(pts):
         logger.info(
             "keyword baseline filter applied keyword=%r points=%s->%s",
