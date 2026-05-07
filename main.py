@@ -1911,7 +1911,7 @@ def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
         )
 
 
-def _split_text_for_lark(text: str, max_chars: int = 3000) -> List[str]:
+def _split_text_for_lark(text: str, max_chars: int = 9000) -> List[str]:
     """
     Split long text into multiple chunks to avoid platform length truncation.
     Prefer paragraph/line boundaries; hard-cut only when necessary.
@@ -1973,7 +1973,7 @@ def _split_text_for_lark(text: str, max_chars: int = 3000) -> List[str]:
     return chunks or [raw[:max_chars]]
 
 
-def _lark_send_text_auto(receive_id_type: str, receive_id: str, text: str, max_chars: int = 3000) -> None:
+def _lark_send_text_auto(receive_id_type: str, receive_id: str, text: str, max_chars: int = 9000) -> None:
     chunks = _split_text_for_lark(text, max_chars=max_chars)
     total = len(chunks)
     for i, c in enumerate(chunks, 1):
@@ -2187,7 +2187,7 @@ def _lark_send_monitoring_user_message(
         raise ValueError("empty receive_id for monitoring message")
     # Card markdown body has strict cap; for very long replies, send split text messages directly.
     if len(reply or "") > 3800:
-        _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3000)
+        _lark_send_text_auto(receive_id_type, rid, reply, max_chars=9000)
         return False, False
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
@@ -2200,7 +2200,7 @@ def _lark_send_monitoring_user_message(
                 "check app permission「发送消息卡片」.",
                 e,
             )
-    _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3000)
+    _lark_send_text_auto(receive_id_type, rid, reply, max_chars=9000)
     return False, False
 
 
@@ -4170,10 +4170,7 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
     lines.extend(_format_http_analysis_lines(http_ex))
 
-    out = "\n".join(lines)
-    if len(out) > 4500:
-        out = out[:4490] + "\n…(truncated)"
-    return out
+    return "\n".join(lines)
 
 
 def _lark_verify_event_token(data: Dict[str, Any]) -> bool:
@@ -4515,7 +4512,7 @@ def _monitoring_background_worker(
             suppress_alert_copy = alert_chat_id in src_alias
             if alert_hit and alert_chat_id and not suppress_alert_copy:
                 try:
-                    _lark_send_text_auto("chat_id", alert_chat_id, alert_reply, max_chars=3000)
+                    _lark_send_text_auto("chat_id", alert_chat_id, alert_reply, max_chars=9000)
                     logger.info(
                         "monitoring alert copy sent (background) alert_chat_id_prefix=%s... len=%s",
                         alert_chat_id[:16],
