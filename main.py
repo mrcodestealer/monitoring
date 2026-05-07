@@ -2050,10 +2050,8 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
 
 
 def _monitoring_reply_to_card_md(reply: str) -> str:
-    s = (reply or "")[:3800]
+    s = (reply or "")[:3000]
     s = s.replace("```", "'''")
-    if len(reply or "") > 3800:
-        s += "\n\n…(truncated)"
     return s
 
 
@@ -2185,8 +2183,9 @@ def _lark_send_monitoring_user_message(
     rid = (receive_id or "").strip()
     if not rid:
         raise ValueError("empty receive_id for monitoring message")
-    # Card markdown body has strict cap; for very long replies, send split text messages directly.
-    if len(reply or "") > 3800:
+    # Card markdown body has strict cap; for long replies, send split text messages directly.
+    # Keep this threshold conservative to avoid card-side clipping.
+    if len(reply or "") > 3000:
         _lark_send_text_auto(receive_id_type, rid, reply, max_chars=9000)
         return False, False
     if MONITORING_MESSAGE_CARD_ENABLE:
