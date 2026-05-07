@@ -3896,6 +3896,21 @@ def _series_row_exact_keyword_id(keyword: str, legend_format: str, metric: Dict[
     return False
 
 
+def _prometheus_result_value_pairs(result: Dict[str, Any]) -> List[Tuple[float, float]]:
+    """``values`` pairs from one Prometheus ``result`` row as ``(timestamp_unix, value)``."""
+    out: List[Tuple[float, float]] = []
+    for pair in result.get("values") or []:
+        if len(pair) < 2:
+            continue
+        try:
+            ts = float(pair[0])
+            val = float(pair[1])
+        except (TypeError, ValueError):
+            continue
+        out.append((ts, val))
+    return out
+
+
 def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
     """Pick/merge points for '9280 + Push' from panel targets/results."""
     kw = (MONITORING_9280_SERIES_KEYWORD or "9280 + Push").strip()
@@ -3925,7 +3940,33 @@ def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]
 def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> List[Tuple[float, float]]:
     kw = (keyword or "").strip()
 
-    def _accumulate(*, exact_id_only: bool) -> Dict[float, float]:
+    # Exact-id rows: Grafana tooltip shows ONE overlay series; duplicate Prometheus ``result`` rows
+    # (same legend ``3201`` from repeated targets) must NOT be ``+=`` merged — sums like 5294+9483=14777
+    # while each line alone is ~20k. Pick the single richest series (sample count, then mass).
+    exact_candidates: List[List[Tuple[float, float]]] = []
+    for s in payload.get("series") or []:
+        lg = str(s.get("legendFormat") or "")
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            metric = r.get("metric") or {}
+            md = metric if isinstance(metric, dict) else {}
+            if kw and not _series_row_exact_keyword_id(kw, lg, md):
+                continue
+            pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
+            if pts:
+                exact_candidates.append(pts)
+    if exact_candidates:
+        best = max(
+            exact_candidates,
+            key=lambda pl: (len(pl), sum(abs(v) for _, v in pl)),
+        )
+        by_one: Dict[float, float] = {}
+        for ts, val in best:
+            by_one[ts] = val
+        return sorted(by_one.items(), key=lambda x: x[0])
+
+    def _accumulate_fuzzy() -> Dict[float, float]:
         by_ts: Dict[float, float] = {}
         for s in payload.get("series") or []:
             lg = str(s.get("legendFormat") or "")
@@ -3934,28 +3975,13 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
             for r in pdata.get("result") or []:
                 metric = r.get("metric") or {}
                 md = metric if isinstance(metric, dict) else {}
-                if exact_id_only:
-                    if kw and not _series_row_exact_keyword_id(kw, lg, md):
-                        continue
-                else:
-                    if kw and not _keyword_matches_series_labels(kw, lg, md):
-                        continue
-                for pair in r.get("values") or []:
-                    if len(pair) < 2:
-                        continue
-                    try:
-                        ts = float(pair[0])
-                        val = float(pair[1])
-                    except (TypeError, ValueError):
-                        continue
+                if kw and not _keyword_matches_series_labels(kw, lg, md):
+                    continue
+                for ts, val in _prometheus_result_value_pairs(r if isinstance(r, dict) else {}):
                     by_ts[ts] = by_ts.get(ts, 0.0) + val
         return by_ts
 
-    # Prefer Grafana-selected semantics: legend / primary id label equals keyword exactly.
-    by_exact = _accumulate(exact_id_only=True)
-    if by_exact:
-        return sorted(by_exact.items(), key=lambda x: x[0])
-    by_fuzzy = _accumulate(exact_id_only=False)
+    by_fuzzy = _accumulate_fuzzy()
     if not by_fuzzy:
         return []
     return sorted(by_fuzzy.items(), key=lambda x: x[0])
