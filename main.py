@@ -70,6 +70,18 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DEPOSIT_SERIES_KEYWORD": "createProposal",
     "GRAFANA_PANEL_TITLE_WITHDRAW": "提款 (Withdrawal)",
     "MONITORING_WITHDRAW_SERIES_KEYWORD": "InitiateWithdrawal",
+    "GRAFANA_PANEL_TITLE_PROVIDER_JILI": "IGO Distributions of Providers JILI",
+    "MONITORING_PROVIDER_JILI_SERIES_KEYWORD": "3201",
+    "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL": "IGO Distributions of Providers GENERAL",
+    "MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD": "3204",
+    "GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE": "IGO Distributions of Providers INHOUSE",
+    "MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD": "3085",
+    "GRAFANA_PANEL_TITLE_GAMES_JILI": "IGO Distributions of Games（Jili）",
+    "MONITORING_GAMES_JILI_SERIES_KEYWORD": "49",
+    "GRAFANA_PANEL_TITLE_GAMES_GENERAL": "IGO Distributions of Games（General）",
+    "MONITORING_GAMES_GENERAL_SERIES_KEYWORD": "1492288",
+    "GRAFANA_PANEL_TITLE_GAMES_INHOUSE": "IGO Distributions of Games（Inhouse）",
+    "MONITORING_GAMES_INHOUSE_SERIES_KEYWORD": "6005",
     "GRAFANA_DASHBOARD_FROM": "now-30m",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
@@ -177,6 +189,24 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WITHDRAW_ENABLE": "1",
     "MONITORING_WITHDRAW_ALERT_PCT": 80,
     "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 120,
+    "MONITORING_PROVIDER_JILI_ENABLE": "1",
+    "MONITORING_PROVIDER_JILI_ALERT_PCT": 15,
+    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_PROVIDER_GENERAL_ENABLE": "1",
+    "MONITORING_PROVIDER_GENERAL_ALERT_PCT": 15,
+    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_PROVIDER_INHOUSE_ENABLE": "1",
+    "MONITORING_PROVIDER_INHOUSE_ALERT_PCT": 15,
+    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_GAMES_JILI_ENABLE": "1",
+    "MONITORING_GAMES_JILI_ALERT_PCT": 15,
+    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_GAMES_GENERAL_ENABLE": "1",
+    "MONITORING_GAMES_GENERAL_ALERT_PCT": 15,
+    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_GAMES_INHOUSE_ENABLE": "1",
+    "MONITORING_GAMES_INHOUSE_ALERT_PCT": 15,
+    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT": 15,
     "MONITORING_ALERT_WINDOW_SECONDS": 120,
     "MONITORING_WATCH_ENABLE": "1",
     "MONITORING_WATCH_INTERVAL_SECONDS": "60",
@@ -196,7 +226,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_QUIET_END_HOUR": "0",
     "MONITORING_WATCH_QUIET_END_MINUTE": "10",
     # Tag person
-    "TARGET_USER_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
+    "TARGET_USER_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
+    "JUNCHEN": "ou_5f660c0fb0769d184aca635d02209272",
     # In which group
     "MONITORING_ALERT_CHAT_ID": "oc_9de3d63fc589df6feeb9b0bee9c45b72",
 }
@@ -407,6 +438,42 @@ GRAFANA_PANEL_TITLE_DEPOSIT = _cfg_str("GRAFANA_PANEL_TITLE_DEPOSIT", "主站充
 MONITORING_DEPOSIT_SERIES_KEYWORD = _cfg_str("MONITORING_DEPOSIT_SERIES_KEYWORD", "createProposal").strip()
 GRAFANA_PANEL_TITLE_WITHDRAW = _cfg_str("GRAFANA_PANEL_TITLE_WITHDRAW", "提款 (Withdrawal)")
 MONITORING_WITHDRAW_SERIES_KEYWORD = _cfg_str("MONITORING_WITHDRAW_SERIES_KEYWORD", "InitiateWithdrawal").strip()
+GRAFANA_PANEL_TITLE_PROVIDER_JILI = _cfg_str(
+    "GRAFANA_PANEL_TITLE_PROVIDER_JILI", "IGO Distributions of Providers JILI"
+)
+MONITORING_PROVIDER_JILI_SERIES_KEYWORD = _cfg_str(
+    "MONITORING_PROVIDER_JILI_SERIES_KEYWORD", "3201"
+).strip()
+GRAFANA_PANEL_TITLE_PROVIDER_GENERAL = _cfg_str(
+    "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL", "IGO Distributions of Providers GENERAL"
+)
+MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD = _cfg_str(
+    "MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD", "3204"
+).strip()
+GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE = _cfg_str(
+    "GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE", "IGO Distributions of Providers INHOUSE"
+)
+MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD = _cfg_str(
+    "MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD", "3085"
+).strip()
+GRAFANA_PANEL_TITLE_GAMES_JILI = _cfg_str(
+    "GRAFANA_PANEL_TITLE_GAMES_JILI", "IGO Distributions of Games（Jili）"
+)
+MONITORING_GAMES_JILI_SERIES_KEYWORD = _cfg_str(
+    "MONITORING_GAMES_JILI_SERIES_KEYWORD", "49"
+).strip()
+GRAFANA_PANEL_TITLE_GAMES_GENERAL = _cfg_str(
+    "GRAFANA_PANEL_TITLE_GAMES_GENERAL", "IGO Distributions of Games（General）"
+)
+MONITORING_GAMES_GENERAL_SERIES_KEYWORD = _cfg_str(
+    "MONITORING_GAMES_GENERAL_SERIES_KEYWORD", "1492288"
+).strip()
+GRAFANA_PANEL_TITLE_GAMES_INHOUSE = _cfg_str(
+    "GRAFANA_PANEL_TITLE_GAMES_INHOUSE", "IGO Distributions of Games（Inhouse）"
+)
+MONITORING_GAMES_INHOUSE_SERIES_KEYWORD = _cfg_str(
+    "MONITORING_GAMES_INHOUSE_SERIES_KEYWORD", "6005"
+).strip()
 # Browser URL time range for screenshots (default last 15 minutes, aligned with /monitoring tables).
 GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-15m")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
@@ -464,9 +531,7 @@ APP_SECRET = _cfg_str("APP_SECRET", "").strip() or None
 # Default matches ``lark_oapi.core.const.FEISHU_DOMAIN`` — 国际 Lark 用 ``https://open.larksuite.com``（见 ``_CFG``）
 LARK_HOST = _cfg_str("LARK_HOST", "https://open.feishu.cn").rstrip("/")
 MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/monitoring")
-TARGET_USER_OPEN_ID = _cfg_str(
-    "TARGET_USER_OPEN_ID", "ou_d7bc33724e2d6ced4050c944c2ca5650"
-).strip()
+TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
 MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
 MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 15.0)
 MONITORING_HTTP_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_HTTP_CONTINUOUS_ALERT_PCT", 20.0)
@@ -475,6 +540,30 @@ MONITORING_DEPOSIT_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_ALERT_PCT", 60.0)
 MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT", 80.0)
 MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", 60.0)
 MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", 80.0)
+MONITORING_PROVIDER_JILI_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_JILI_ALERT_PCT", 15.0)
+MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT", 15.0
+)
+MONITORING_PROVIDER_GENERAL_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_GENERAL_ALERT_PCT", 15.0)
+MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT", 15.0
+)
+MONITORING_PROVIDER_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_INHOUSE_ALERT_PCT", 15.0)
+MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
+)
+MONITORING_GAMES_JILI_ALERT_PCT = _cfg_float("MONITORING_GAMES_JILI_ALERT_PCT", 15.0)
+MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT", 15.0
+)
+MONITORING_GAMES_GENERAL_ALERT_PCT = _cfg_float("MONITORING_GAMES_GENERAL_ALERT_PCT", 15.0)
+MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT", 15.0
+)
+MONITORING_GAMES_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_GAMES_INHOUSE_ALERT_PCT", 15.0)
+MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
+)
 MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 120))
 LARK_ENCRYPT_KEY = (
     _cfg_str("LARK_ENCRYPT_KEY")
@@ -1426,6 +1515,72 @@ def fetch_monitoring_payload(
             extra.append({"kind": "withdraw", "payload": pw})
         except Exception:
             logger.exception("fetch withdraw panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
+        try:
+            ppj = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_PROVIDER_JILI,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": "provider_jili", "payload": ppj})
+        except Exception:
+            logger.exception("fetch provider JILI panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_PROVIDER_GENERAL_ENABLE"):
+        try:
+            ppg = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_PROVIDER_GENERAL,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": "provider_general", "payload": ppg})
+        except Exception:
+            logger.exception("fetch provider GENERAL panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_PROVIDER_INHOUSE_ENABLE"):
+        try:
+            ppi = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": "provider_inhouse", "payload": ppi})
+        except Exception:
+            logger.exception("fetch provider INHOUSE panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_GAMES_JILI_ENABLE"):
+        try:
+            pgj = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_GAMES_JILI,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": "games_jili", "payload": pgj})
+        except Exception:
+            logger.exception("fetch games JILI panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_GAMES_GENERAL_ENABLE"):
+        try:
+            pgg = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_GAMES_GENERAL,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": "games_general", "payload": pgg})
+        except Exception:
+            logger.exception("fetch games GENERAL panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_GAMES_INHOUSE_ENABLE"):
+        try:
+            pgi = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_GAMES_INHOUSE,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": "games_inhouse", "payload": pgi})
+        except Exception:
+            logger.exception("fetch games INHOUSE panel failed (optional monitor)")
     if extra:
         primary["extraPanels"] = extra
     return primary
@@ -3136,6 +3291,75 @@ def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return a
 
 
+def _analysis_for_keyword_payload(
+    payload: Dict[str, Any], keyword: str, fast_threshold_pct: float, continuous_threshold_pct: float
+) -> Dict[str, Any]:
+    pts = _merge_series_points_by_keyword(payload, keyword)
+    a = _http_drop_spike_analysis(
+        pts,
+        fast_threshold_pct,
+        continuous_threshold_pct,
+        MONITORING_ALERT_WINDOW_SECONDS,
+    )
+    a["point_count"] = len(pts)
+    a["merged_points"] = [[t, v] for t, v in pts]
+    return a
+
+
+def _analysis_for_provider_jili_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _analysis_for_keyword_payload(
+        payload,
+        MONITORING_PROVIDER_JILI_SERIES_KEYWORD,
+        MONITORING_PROVIDER_JILI_ALERT_PCT,
+        MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT,
+    )
+
+
+def _analysis_for_provider_general_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _analysis_for_keyword_payload(
+        payload,
+        MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD,
+        MONITORING_PROVIDER_GENERAL_ALERT_PCT,
+        MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT,
+    )
+
+
+def _analysis_for_provider_inhouse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _analysis_for_keyword_payload(
+        payload,
+        MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD,
+        MONITORING_PROVIDER_INHOUSE_ALERT_PCT,
+        MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT,
+    )
+
+
+def _analysis_for_games_jili_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _analysis_for_keyword_payload(
+        payload,
+        MONITORING_GAMES_JILI_SERIES_KEYWORD,
+        MONITORING_GAMES_JILI_ALERT_PCT,
+        MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT,
+    )
+
+
+def _analysis_for_games_general_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _analysis_for_keyword_payload(
+        payload,
+        MONITORING_GAMES_GENERAL_SERIES_KEYWORD,
+        MONITORING_GAMES_GENERAL_ALERT_PCT,
+        MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT,
+    )
+
+
+def _analysis_for_games_inhouse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _analysis_for_keyword_payload(
+        payload,
+        MONITORING_GAMES_INHOUSE_SERIES_KEYWORD,
+        MONITORING_GAMES_INHOUSE_ALERT_PCT,
+        MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT,
+    )
+
+
 def _format_extra_analysis_lines(section_label: str, analysis: Dict[str, Any]) -> List[str]:
     fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_9280_ALERT_PCT)
     cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_9280_CONTINUOUS_ALERT_PCT)
@@ -3270,6 +3494,42 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             a2 = _analysis_for_withdraw_payload(p2)
             fast2 = MONITORING_WITHDRAW_ALERT_PCT
             cont2 = MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT
+        elif kind == "provider_jili":
+            g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_JILI
+            s_lbl = MONITORING_PROVIDER_JILI_SERIES_KEYWORD
+            a2 = _analysis_for_provider_jili_payload(p2)
+            fast2 = MONITORING_PROVIDER_JILI_ALERT_PCT
+            cont2 = MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT
+        elif kind == "provider_general":
+            g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_GENERAL
+            s_lbl = MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD
+            a2 = _analysis_for_provider_general_payload(p2)
+            fast2 = MONITORING_PROVIDER_GENERAL_ALERT_PCT
+            cont2 = MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT
+        elif kind == "provider_inhouse":
+            g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE
+            s_lbl = MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD
+            a2 = _analysis_for_provider_inhouse_payload(p2)
+            fast2 = MONITORING_PROVIDER_INHOUSE_ALERT_PCT
+            cont2 = MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT
+        elif kind == "games_jili":
+            g_lbl = GRAFANA_PANEL_TITLE_GAMES_JILI
+            s_lbl = MONITORING_GAMES_JILI_SERIES_KEYWORD
+            a2 = _analysis_for_games_jili_payload(p2)
+            fast2 = MONITORING_GAMES_JILI_ALERT_PCT
+            cont2 = MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT
+        elif kind == "games_general":
+            g_lbl = GRAFANA_PANEL_TITLE_GAMES_GENERAL
+            s_lbl = MONITORING_GAMES_GENERAL_SERIES_KEYWORD
+            a2 = _analysis_for_games_general_payload(p2)
+            fast2 = MONITORING_GAMES_GENERAL_ALERT_PCT
+            cont2 = MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT
+        elif kind == "games_inhouse":
+            g_lbl = GRAFANA_PANEL_TITLE_GAMES_INHOUSE
+            s_lbl = MONITORING_GAMES_INHOUSE_SERIES_KEYWORD
+            a2 = _analysis_for_games_inhouse_payload(p2)
+            fast2 = MONITORING_GAMES_INHOUSE_ALERT_PCT
+            cont2 = MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT
         else:
             continue
         reasons2 = _format_trigger_lines(
@@ -3312,6 +3572,18 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
         if k == "deposit" and bool(_analysis_for_deposit_payload(p2).get("hit_alert")):
             return True
         if k == "withdraw" and bool(_analysis_for_withdraw_payload(p2).get("hit_alert")):
+            return True
+        if k == "provider_jili" and bool(_analysis_for_provider_jili_payload(p2).get("hit_alert")):
+            return True
+        if k == "provider_general" and bool(_analysis_for_provider_general_payload(p2).get("hit_alert")):
+            return True
+        if k == "provider_inhouse" and bool(_analysis_for_provider_inhouse_payload(p2).get("hit_alert")):
+            return True
+        if k == "games_jili" and bool(_analysis_for_games_jili_payload(p2).get("hit_alert")):
+            return True
+        if k == "games_general" and bool(_analysis_for_games_general_payload(p2).get("hit_alert")):
+            return True
+        if k == "games_inhouse" and bool(_analysis_for_games_inhouse_payload(p2).get("hit_alert")):
             return True
     return False
 
@@ -3425,6 +3697,36 @@ def _format_monitoring_reply(payload: Dict[str, Any]) -> str:
             title = GRAFANA_PANEL_TITLE_WITHDRAW
             series = MONITORING_WITHDRAW_SERIES_KEYWORD
             extra_footer = _format_extra_analysis_lines("Withdraw", a2)
+        elif k == "provider_jili":
+            a2 = _analysis_for_provider_jili_payload(p2)
+            title = GRAFANA_PANEL_TITLE_PROVIDER_JILI
+            series = MONITORING_PROVIDER_JILI_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("Provider JILI", a2)
+        elif k == "provider_general":
+            a2 = _analysis_for_provider_general_payload(p2)
+            title = GRAFANA_PANEL_TITLE_PROVIDER_GENERAL
+            series = MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("Provider GENERAL", a2)
+        elif k == "provider_inhouse":
+            a2 = _analysis_for_provider_inhouse_payload(p2)
+            title = GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE
+            series = MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("Provider INHOUSE", a2)
+        elif k == "games_jili":
+            a2 = _analysis_for_games_jili_payload(p2)
+            title = GRAFANA_PANEL_TITLE_GAMES_JILI
+            series = MONITORING_GAMES_JILI_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("Games JILI", a2)
+        elif k == "games_general":
+            a2 = _analysis_for_games_general_payload(p2)
+            title = GRAFANA_PANEL_TITLE_GAMES_GENERAL
+            series = MONITORING_GAMES_GENERAL_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("Games GENERAL", a2)
+        elif k == "games_inhouse":
+            a2 = _analysis_for_games_inhouse_payload(p2)
+            title = GRAFANA_PANEL_TITLE_GAMES_INHOUSE
+            series = MONITORING_GAMES_INHOUSE_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("Games INHOUSE", a2)
         else:
             continue
         pts2 = a2.get("merged_points") or []
