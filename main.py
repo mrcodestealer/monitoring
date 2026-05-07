@@ -111,6 +111,10 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_RELATIVE_RANGE": "1",
     # 截图 URL 追加 timezone=…（与 Grafana 时间栏一致）；设为 none / - 可省略该参数
     "GRAFANA_SCREENSHOT_TIMEZONE": "browser",
+    # 数字面板分钟聚合 + 告警时间 ``mm-dd HH:MM`` 使用的 IANA 时区（如 Asia/Shanghai）。
+    # 与 Grafana 面板时区不一致且 bot 跑在 UTC 上时，不设会导致同一分钟的值错桶（假 SPIKE）。
+    # 空 / local / server = 使用进程本地时区。
+    "MONITORING_TIME_BUCKET_TZ": "",
     # 1=进程内常驻 Playwright Chromium（启动时预热 Grafana；/monitoring 与告警截图复用，不必每次冷启动）
     "GRAFANA_PERSISTENT_BROWSER": "1",
     # 常驻浏览器在空闲时点击 Refresh 的间隔（秒），保持会话与图表较新
@@ -575,6 +579,40 @@ MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
     "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
 )
 MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 120))
+MONITORING_TIME_BUCKET_TZ = _cfg_str("MONITORING_TIME_BUCKET_TZ", "").strip()
+
+
+def _parse_monitoring_zoneinfo() -> Optional[Any]:
+    from zoneinfo import ZoneInfo
+
+    tzn = MONITORING_TIME_BUCKET_TZ.strip()
+    if not tzn or tzn.lower() in ("local", "server", "-", "none"):
+        return None
+    try:
+        return ZoneInfo(tzn)
+    except Exception:
+        logger.warning(
+            "MONITORING_TIME_BUCKET_TZ=%r invalid; using process local time for buckets",
+            tzn,
+        )
+        return None
+
+
+MONITORING_ZONEINFO: Optional[Any] = _parse_monitoring_zoneinfo()
+
+
+def _monitoring_calendar_dt(ts: float) -> datetime:
+    zi = MONITORING_ZONEINFO
+    if zi is not None:
+        return datetime.fromtimestamp(float(ts), tz=zi)
+    return datetime.fromtimestamp(float(ts))
+
+
+def _bucket_ts_monitoring_minute(ts: float) -> float:
+    dt = _monitoring_calendar_dt(ts).replace(second=0, microsecond=0)
+    return dt.timestamp()
+
+
 LARK_ENCRYPT_KEY = (
     _cfg_str("LARK_ENCRYPT_KEY")
     or _cfg_str("ENCRYPT_KEY")
@@ -3942,13 +3980,6 @@ def _pick_best_exact_keyword_series(candidates: List[List[Tuple[float, float]]])
     return best_pl or []
 
 
-def _bucket_ts_local_minute(ts: float) -> float:
-    """Floor ``ts`` to the start of the **local** calendar minute (matches alert time formatting)."""
-    dt = datetime.fromtimestamp(float(ts))
-    floored = dt.replace(second=0, microsecond=0)
-    return floored.timestamp()
-
-
 def _merge_digit_keyword_rows_max_bucketed(
     rows: List[List[Tuple[float, float]]],
 ) -> List[Tuple[float, float]]:
@@ -3957,8 +3988,8 @@ def _merge_digit_keyword_rows_max_bucketed(
 
     ``max`` on **exact unix seconds** fails when duplicates scrape on slightly different offsets:
     a ghost row can own ``03:48:00`` (~2.6k) while the real line only has ``03:47:58`` (~19.5k),
-    producing absurd fast spikes. Bucket by **local wall-clock minute** (same basis as
-    :func:`_fmt_ts_short`), take ``max(value)`` inside each bucket **per row** (Prometheus may emit
+    producing absurd fast spikes. Bucket by **calendar minute** in :data:`MONITORING_ZONEINFO`
+    (or process local when unset — same basis as :func:`_fmt_ts_short`), take ``max(value)`` inside each bucket **per row** (Prometheus may emit
     several samples per minute; the last must not overwrite an earlier higher point), then ``max``
     across rows.
     """
@@ -3973,7 +4004,7 @@ def _merge_digit_keyword_rows_max_bucketed(
             if not math.isfinite(v):
                 continue
             tsf = float(ts)
-            b = _bucket_ts_local_minute(tsf)
+            b = _bucket_ts_monitoring_minute(tsf)
             prev_r = row_b.get(b)
             if prev_r is None or v > prev_r:
                 row_b[b] = v
@@ -4068,9 +4099,10 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
     kw = (keyword or "").strip()
 
     # Exact-id rows: duplicate Prometheus ``result`` rows (same legend ``3201``) must NOT be blindly
-    # summed — sums like 5294+9483=14777 vs Grafana ~20k. Numeric ids: ``max`` per **local minute**
-    # (even for a single ``result`` row) so sub-minute scrapes cannot leave a ghost low in the same
-    # minute as Grafana's tooltip; non-numeric multi-row: pick one series by median magnitude.
+    # summed — sums like 5294+9483=14777 vs Grafana ~20k. Numeric ids: ``max`` per **minute** via
+    # :func:`_bucket_ts_monitoring_minute` (``MONITORING_TIME_BUCKET_TZ``); even for a single
+    # ``result`` row so sub-minute scrapes cannot leave a ghost low in the same minute as Grafana's
+    # tooltip; non-numeric multi-row: pick one series by median magnitude.
     exact_candidates: List[List[Tuple[float, float]]] = []
     for s in payload.get("series") or []:
         lg = str(s.get("legendFormat") or "")
@@ -4756,7 +4788,7 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
 
 def _fmt_ts_short(ts: Any) -> str:
     try:
-        return datetime.fromtimestamp(int(float(ts))).strftime("%m-%d %H:%M")
+        return _monitoring_calendar_dt(float(ts)).strftime("%m-%d %H:%M")
     except (TypeError, ValueError, OSError):
         return str(ts)
 
