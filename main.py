@@ -3343,6 +3343,33 @@ def _merge_withdraw_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]
     return _merge_series_points_by_keyword(payload, MONITORING_WITHDRAW_SERIES_KEYWORD)
 
 
+def _filter_low_outlier_points(
+    points: List[Tuple[float, float]],
+    ratio_to_median: float = 0.10,
+    min_abs_floor: float = 5.0,
+) -> List[Tuple[float, float]]:
+    """
+    Remove tiny baseline outliers (e.g. 1/2/3/5) that can explode % change for
+    high-volume series (30k~50k). This is used for Provider/Games keyword panels.
+    """
+    if len(points) < 4:
+        return points
+    vals = sorted(float(v) for _, v in points if float(v) > 0.0)
+    if len(vals) < 3:
+        return points
+    mid = len(vals) // 2
+    if len(vals) % 2 == 1:
+        median_v = vals[mid]
+    else:
+        median_v = (vals[mid - 1] + vals[mid]) / 2.0
+    floor = max(float(min_abs_floor), float(median_v) * float(ratio_to_median))
+    filtered = [(t, v) for (t, v) in points if float(v) >= floor]
+    # Keep original if filtering is too aggressive.
+    if len(filtered) >= max(3, int(math.ceil(len(points) * 0.6))):
+        return filtered
+    return points
+
+
 def _best_consecutive_drop_run(vals: List[float], ts: List[float]) -> Optional[Dict[str, Any]]:
     """
     Longest weakly-decreasing runs (each step ``vals[k+1] <= vals[k]``); score each run by
@@ -3565,14 +3592,22 @@ def _analysis_for_keyword_payload(
     payload: Dict[str, Any], keyword: str, fast_threshold_pct: float, continuous_threshold_pct: float
 ) -> Dict[str, Any]:
     pts = _merge_series_points_by_keyword(payload, keyword)
+    pts_filtered = _filter_low_outlier_points(pts)
+    if len(pts_filtered) != len(pts):
+        logger.info(
+            "keyword baseline filter applied keyword=%r points=%s->%s",
+            keyword,
+            len(pts),
+            len(pts_filtered),
+        )
     a = _http_drop_spike_analysis(
-        pts,
+        pts_filtered,
         fast_threshold_pct,
         continuous_threshold_pct,
         MONITORING_ALERT_WINDOW_SECONDS,
     )
-    a["point_count"] = len(pts)
-    a["merged_points"] = [[t, v] for t, v in pts]
+    a["point_count"] = len(pts_filtered)
+    a["merged_points"] = [[t, v] for t, v in pts_filtered]
     if not pts:
         sample_labels: List[str] = []
         for s in payload.get("series") or []:
