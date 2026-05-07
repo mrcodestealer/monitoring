@@ -1493,26 +1493,62 @@ def _ds_query_to_prometheus_like(raw: Dict[str, Any], ref_id: str) -> Dict[str, 
             continue
 
         by_label: Dict[str, List[List[float]]] = {}
+        numeric_idxs: List[int] = []
+        for i in range(n):
+            if i == ts_idx or i == label_idx:
+                continue
+            c = cols[i]
+            if not isinstance(c, list) or not c:
+                continue
+            sample = None
+            for sv in c:
+                if sv is None or sv == "":
+                    continue
+                sample = sv
+                break
+            if sample is None:
+                continue
+            try:
+                float(sample)
+            except (TypeError, ValueError):
+                continue
+            numeric_idxs.append(i)
+        wide_mode = label_idx < 0 and len(numeric_idxs) > 1
+
         for r_i in range(row_len):
             try:
                 ts_raw = cols[ts_idx][r_i]
-                val_raw = cols[val_idx][r_i]
             except Exception:
                 continue
             try:
                 ts = float(ts_raw)
-                val = float(val_raw)
             except (TypeError, ValueError):
                 continue
             if ts > 1e12:
                 ts = ts / 1000.0
-            lbl = "value"
-            if label_idx >= 0:
+            if wide_mode:
+                for vi in numeric_idxs:
+                    try:
+                        val = float(cols[vi][r_i])
+                    except Exception:
+                        continue
+                    lbl = str(names[vi]).strip() or "value"
+                    by_label.setdefault(lbl, []).append([ts, val])
+            else:
                 try:
-                    lbl = str(cols[label_idx][r_i]).strip() or "value"
+                    val_raw = cols[val_idx][r_i]
+                    val = float(val_raw)
                 except Exception:
-                    lbl = "value"
-            by_label.setdefault(lbl, []).append([ts, val])
+                    continue
+                lbl = "value"
+                if label_idx >= 0:
+                    try:
+                        lbl = str(cols[label_idx][r_i]).strip() or "value"
+                    except Exception:
+                        lbl = "value"
+                elif 0 <= val_idx < len(names):
+                    lbl = str(names[val_idx]).strip() or "value"
+                by_label.setdefault(lbl, []).append([ts, val])
 
         for lbl, pairs in by_label.items():
             pairs.sort(key=lambda p: p[0])
