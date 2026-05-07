@@ -18,8 +18,8 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at 机器人发 ``/monitoring`` **或仅 @ 机器人（无其它正文）** → 同一条 Grafana 摘要（默认最近 **15** 分钟，与 ``GRAFANA_QUERY_LOOKBACK_SECONDS`` / ``GRAFANA_DASHBOARD_FROM`` 一致）。
-User-visible bot text (cards, toasts, monitoring summaries) is **English-only**. ``/mute`` opens cards to mute monitors by duration; ``/cancelmute`` clears all mutes (in-process; lost on restart).
+群/at 机器人发监控命令（默认 ``/mo``）**或仅 @ 机器人（无其它正文）** → Grafana 摘要（默认最近 **15** 分钟）。
+User-visible bot text is **English-only**. Short commands (configurable): ``/mo`` monitoring, ``/m`` mute card, ``/c`` cancel all mutes. **@bot + any other text** → bot replies with this command list.
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
 
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
@@ -143,10 +143,10 @@ _CFG: Dict[str, Any] = {
     "VERIFICATION_TOKEN": "QlZMYp7rogAS914dxxMVNgboUKxQP7jc",
     "APP_ID": "cli_a97fcc6df7615ed1",
     "APP_SECRET": "NwAi6xJxMYDHMFAQcTG8ZfJxpeTOibvy",
-    "MONITORING_TRIGGER": "/monitoring",
-    "MONITORING_MUTE_TRIGGER": "/mute",
-    "MONITORING_CANCELMUTE_TRIGGER": "/cancelmute",
-    # 1=仅 @ 机器人且无其它正文也触发（与 /monitoring 同）；1+下面 ANY=1 则 @ 且带任意文字也触发
+    "MONITORING_TRIGGER": "/mo",
+    "MONITORING_MUTE_TRIGGER": "/m",
+    "MONITORING_CANCELMUTE_TRIGGER": "/c",
+    # 1=仅 @ 机器人且无其它正文也触发（与 MONITORING_TRIGGER 默认 /mo 同）；1+ANY=1 时 @ 且任意正文也跑监控（非命令且带字会先收到命令说明）
     "MONITORING_AT_MENTION_ENABLE": "0",
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
     "LARK_ENCRYPT_KEY": "",
@@ -538,9 +538,9 @@ APP_ID = _cfg_str("APP_ID", "").strip() or None
 APP_SECRET = _cfg_str("APP_SECRET", "").strip() or None
 # Default matches ``lark_oapi.core.const.FEISHU_DOMAIN`` — 国际 Lark 用 ``https://open.larksuite.com``（见 ``_CFG``）
 LARK_HOST = _cfg_str("LARK_HOST", "https://open.feishu.cn").rstrip("/")
-MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/monitoring")
-MONITORING_MUTE_TRIGGER = _cfg_str("MONITORING_MUTE_TRIGGER", "/mute").strip()
-MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/cancelmute").strip()
+MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/mo")
+MONITORING_MUTE_TRIGGER = _cfg_str("MONITORING_MUTE_TRIGGER", "/m").strip()
+MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").strip()
 TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
 MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
 MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 15.0)
@@ -1065,14 +1065,23 @@ def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
     return text
 
 
-def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
-    tri = MONITORING_TRIGGER
-    raw = raw_text or ""
-    clean = clean or ""
-    if tri in raw or tri in clean:
+def _im_command_matches(clean: str, cmd: str) -> bool:
+    """
+    True when ``clean`` is exactly ``cmd`` or starts with ``cmd`` + whitespace.
+    Avoids ``/mo`` being mistaken for ``/m`` (prefix match without boundary).
+    """
+    c = re.sub(r"\s+", " ", (clean or "").strip().lower())
+    tri = (cmd or "").strip().lower()
+    if not tri or not c:
+        return False
+    if c == tri:
         return True
-    tl = tri.lower()
-    return tl in clean.lower() or tl in raw.lower()
+    return c.startswith(tri + " ") or c.startswith(tri + "\t")
+
+
+def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
+    _ = raw_text
+    return _im_command_matches(clean or "", MONITORING_TRIGGER)
 
 
 def _lark_message_mentions_bot(mentions: Any) -> bool:
@@ -1116,13 +1125,12 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
 
 def _monitoring_dispatch_body_key(clean: str, raw_text: str, mentions: Any) -> str:
     """
-    Normalize IM debounce key so ``/monitoring`` / @ 机器人 variants from different clients share one key
+    Normalize IM debounce key so explicit commands / @-mention variants share one key
     (avoids two background workers when ``clean`` whitespace or mention markup differs slightly).
     """
-    tri = (MONITORING_TRIGGER or "/monitoring").strip().lower()
-    raw_l = (raw_text or "").lower()
+    tri = (MONITORING_TRIGGER or "/mo").strip().lower()
     cl = re.sub(r"\s+", " ", (clean or "").strip().lower())
-    if tri in raw_l or tri in cl:
+    if _im_command_matches(clean or "", MONITORING_TRIGGER):
         return tri
     if MONITORING_AT_MENTION_ENABLE and _lark_message_mentions_bot(mentions):
         if MONITORING_AT_MENTION_ANY_TEXT:
@@ -2347,7 +2355,10 @@ def _mute_selection_card_dict(rid_t: str, rid: str) -> Dict[str, Any]:
         "header": {
             "template": "orange",
             "title": {"tag": "plain_text", "content": "Mute monitoring alerts"},
-            "subtitle": {"tag": "plain_text", "content": "/mute"},
+            "subtitle": {
+                "tag": "plain_text",
+                "content": (MONITORING_MUTE_TRIGGER or "/m").strip()[:190],
+            },
         },
         "body": {"elements": _mute_selection_card_elements(rid_t, rid)},
     }
@@ -2360,7 +2371,10 @@ def _mute_duration_card_dict(rid_t: str, rid: str, operator_open_id: str, chat_i
         "header": {
             "template": "orange",
             "title": {"tag": "plain_text", "content": "Choose mute duration"},
-            "subtitle": {"tag": "plain_text", "content": "/mute"},
+            "subtitle": {
+                "tag": "plain_text",
+                "content": (MONITORING_MUTE_TRIGGER or "/m").strip()[:190],
+            },
         },
         "body": {"elements": _mute_duration_card_elements(rid_t, rid, operator_open_id, chat_id)},
     }
@@ -2415,6 +2429,32 @@ def _cancelmute_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
         )
     except Exception:
         logger.exception("cancelmute failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _monitoring_at_mention_help_text() -> str:
+    mo = (MONITORING_TRIGGER or "/mo").strip()
+    m = (MONITORING_MUTE_TRIGGER or "/m").strip()
+    c = (MONITORING_CANCELMUTE_TRIGGER or "/c").strip()
+    return (
+        "Commands:\n"
+        f"- `{mo}` — Grafana monitoring summary\n"
+        f"- `{m}` — mute alerts (interactive card)\n"
+        f"- `{c}` — clear all mutes"
+    )
+
+
+def _monitoring_at_mention_help_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
+    try:
+        rt = "chat_id" if (chat_id or "").strip() else "open_id"
+        rv = (chat_id or open_id or "").strip()
+        if not rv:
+            return
+        _lark_send_text(rt, rv, _monitoring_at_mention_help_text())
+    except Exception:
+        logger.exception("at-mention command help send failed")
     finally:
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
@@ -2499,7 +2539,9 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
         with _monitoring_reply_dispatch_lock:
             pend = set(_mute_pending_selections.pop(sk2, set()) or set())
         if not pend:
-            return _mute_toast_response("Nothing to mute — run /mute and select monitors again", "warning")
+            return _mute_toast_response(
+                f"Nothing to mute — run {MONITORING_MUTE_TRIGGER} and select monitors again", "warning"
+            )
         applied = _mute_apply_channels(pend, float(sec))
         if not applied:
             return _mute_toast_response("Could not apply mute", "warning")
@@ -5174,17 +5216,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     im_event_id = _lark_im_payload_event_id(data)
     msg_time = _lark_im_message_time_token(msg)
 
-    clean_l = (clean or "").strip().lower()
-    mute_tri = (MONITORING_MUTE_TRIGGER or "/mute").strip().lower()
-    cancel_tri = (MONITORING_CANCELMUTE_TRIGGER or "/cancelmute").strip().lower()
-
-    def _cmd_hit(c: str, tri_s: str) -> bool:
-        return bool(tri_s) and (c == tri_s or c.startswith(tri_s + " "))
+    mute_tri = (MONITORING_MUTE_TRIGGER or "/m").strip().lower()
+    cancel_tri = (MONITORING_CANCELMUTE_TRIGGER or "/c").strip().lower()
 
     sp_cmd: Optional[str] = None
-    if _cmd_hit(clean_l, mute_tri):
+    if _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER):
         sp_cmd = "mute"
-    elif _cmd_hit(clean_l, cancel_tri):
+    elif _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER):
         sp_cmd = "cancelmute"
 
     if sp_cmd:
@@ -5227,6 +5265,46 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 daemon=True,
                 name="cancelmute",
             ).start()
+        return
+
+    cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
+    if (
+        (LARK_BOT_OPEN_ID or "").strip()
+        and _lark_message_mentions_bot(mentions)
+        and cn
+        and not _im_command_matches(clean or "", MONITORING_TRIGGER)
+        and not _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER)
+        and not _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER)
+    ):
+        processed_h = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        debounce_key_h = f"{(chat_id or '').strip()}\n__cmd_help__"
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                logger.info("duplicate IM event_id=%s — skip (cmd help)", im_event_id)
+                return
+            if processed_h and processed_h in _processed_lark_message_ids:
+                logger.info("duplicate cmd-help stick=%r — skip", processed_h[:96])
+                return
+            if debounce_key_h in _monitoring_inflight_keys:
+                logger.info("cmd help skip — already in flight")
+                return
+            _monitoring_inflight_keys.add(debounce_key_h)
+            if processed_h:
+                _processed_lark_message_ids.add(processed_h)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                    _processed_lark_im_event_ids.clear()
+                    _processed_lark_im_event_ids.add(im_event_id)
+        logger.info("at-mention non-command — sending cmd help chat=%r", bool(chat_id))
+        threading.Thread(
+            target=_monitoring_at_mention_help_worker,
+            args=(chat_id, open_id, debounce_key_h),
+            daemon=True,
+            name="cmd-help",
+        ).start()
         return
 
     if not _text_should_run_monitoring(raw_text, clean, mentions):
