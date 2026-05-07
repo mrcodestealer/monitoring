@@ -3942,6 +3942,33 @@ def _pick_best_exact_keyword_series(candidates: List[List[Tuple[float, float]]])
     return best_pl or []
 
 
+def _merge_exact_digit_keyword_series_max_per_ts(
+    candidates: List[List[Tuple[float, float]]],
+) -> List[Tuple[float, float]]:
+    """
+    Duplicate legend/id rows for numeric keywords often disagree **per timestamp** (one stale ~11k,
+    another ~19k). Choosing one whole row by median still leaves dips at single buckets that Grafana's
+    line does not show. Take ``max(value)`` per unix bucket across rows (last duplicate within a row wins),
+    matching the **upper envelope** of overlapping duplicates — closer to the hovered series.
+    """
+    by_ts: Dict[float, float] = {}
+    for pl in candidates:
+        row_ts: Dict[float, float] = {}
+        for ts, val in pl:
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(v):
+                continue
+            row_ts[float(ts)] = v
+        for ts, v in row_ts.items():
+            prev = by_ts.get(ts)
+            if prev is None or v > prev:
+                by_ts[ts] = v
+    return sorted(by_ts.items(), key=lambda x: x[0])
+
+
 def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
     """Pick/merge points for '9280 + Push' from panel targets/results."""
     kw = (MONITORING_9280_SERIES_KEYWORD or "9280 + Push").strip()
@@ -3971,9 +3998,9 @@ def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]
 def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> List[Tuple[float, float]]:
     kw = (keyword or "").strip()
 
-    # Exact-id rows: Grafana tooltip shows ONE overlay series; duplicate Prometheus ``result`` rows
-    # (same legend ``3201`` from repeated targets) must NOT be ``+=`` merged — sums like 5294+9483=14777
-    # while each line alone is ~20k. Pick the single richest series (sample count, then mass).
+    # Exact-id rows: duplicate Prometheus ``result`` rows (same legend ``3201``) must NOT be blindly
+    # summed — sums like 5294+9483=14777 vs Grafana ~20k. Numeric ids: ``max`` per timestamp across
+    # duplicates (upper envelope); non-numeric: pick one series by median magnitude.
     exact_candidates: List[List[Tuple[float, float]]] = []
     for s in payload.get("series") or []:
         lg = str(s.get("legendFormat") or "")
@@ -3988,14 +4015,20 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
             if pts:
                 exact_candidates.append(pts)
     if exact_candidates:
-        best = _pick_best_exact_keyword_series(exact_candidates)
+        if len(exact_candidates) == 1:
+            merged_pts = exact_candidates[0]
+        elif kw.isdigit():
+            merged_pts = _merge_exact_digit_keyword_series_max_per_ts(exact_candidates)
+        else:
+            merged_pts = _pick_best_exact_keyword_series(exact_candidates)
         by_one: Dict[float, float] = {}
-        for ts, val in best:
+        for ts, val in merged_pts:
             by_one[ts] = val
         return sorted(by_one.items(), key=lambda x: x[0])
 
     def _accumulate_fuzzy() -> Dict[float, float]:
         by_ts: Dict[float, float] = {}
+        digit_kw = bool(kw.isdigit())
         for s in payload.get("series") or []:
             lg = str(s.get("legendFormat") or "")
             prom = s.get("prometheus") or {}
@@ -4005,8 +4038,22 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
                 md = metric if isinstance(metric, dict) else {}
                 if kw and not _keyword_matches_series_labels(kw, lg, md):
                     continue
+                row_ts: Dict[float, float] = {}
                 for ts, val in _prometheus_result_value_pairs(r if isinstance(r, dict) else {}):
-                    by_ts[ts] = by_ts.get(ts, 0.0) + val
+                    try:
+                        v = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(v):
+                        continue
+                    row_ts[float(ts)] = v
+                for ts, v in row_ts.items():
+                    if digit_kw:
+                        prev = by_ts.get(ts)
+                        if prev is None or v > prev:
+                            by_ts[ts] = v
+                    else:
+                        by_ts[ts] = by_ts.get(ts, 0.0) + v
         return by_ts
 
     by_fuzzy = _accumulate_fuzzy()
