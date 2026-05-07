@@ -4442,9 +4442,8 @@ def _analysis_for_keyword_payload(
     payload: Dict[str, Any], keyword: str, fast_threshold_pct: float, continuous_threshold_pct: float
 ) -> Dict[str, Any]:
     pts = _merge_series_points_by_keyword(payload, keyword)
-    # Slightly stricter than HTTP panels: duplicate streams can leave single-row ghosts (~2.6k vs ~19k)
-    # that survive exact-second ``max``; drop points below ~14% of median before drop/spike math.
-    pts_filtered = _filter_low_outlier_points(pts, ratio_to_median=0.14)
+    # Drop ghost lows far below the typical level (e.g. ~4.5k vs median ~17k) before % rules.
+    pts_filtered = _filter_low_outlier_points(pts, ratio_to_median=0.28)
     if len(pts_filtered) != len(pts):
         logger.info(
             "keyword baseline filter applied keyword=%r points=%s->%s",
@@ -4617,6 +4616,26 @@ def _format_trigger_lines(
     return out
 
 
+def _format_alert_series_table_footer(
+    graph_label: str,
+    series_label: str,
+    analysis: Dict[str, Any],
+    *,
+    max_rows: int = 18,
+) -> str:
+    """English-only: compact table tail so alert lines can be checked against the same merged series."""
+    pts = analysis.get("merged_points") or []
+    title = f"Recent points — [{graph_label}] {series_label}:"
+    if not pts:
+        return f"{title}\n(no points)"
+    tail = pts[-max(1, min(max_rows, 48)) :]
+    rows = ["```text", "time           value", "-------------  ------------"]
+    for pair in tail:
+        rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+    rows.append("```")
+    return "\n".join([title, "\n".join(rows)])
+
+
 def _format_simple_series_alert_block(
     graph_label: str,
     series_label: str,
@@ -4670,7 +4689,11 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     which graph/series, spike or drop, from value/time -> to value/time.
     """
     _mute_purge_expired()
-    lines: List[str] = ["[ALERT] Threshold reached"]
+    lines: List[str] = [
+        "[ALERT] Monitoring thresholds exceeded",
+        "Fast = sharpest move within ~2 minutes; Continuous = longest steady climb or drop.",
+        "",
+    ]
     reason_blocks: List[str] = []
     a_http = _http_analysis_for_payload(payload)
     if not _monitoring_alert_channel_muted("http"):
@@ -4695,7 +4718,10 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 reasons.append(fb)
         if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(a_http.get("hit_alert"))):
             reasons = [_format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "HTTP", a_http)]
-        reason_blocks.extend(reasons)
+        elif reasons and not MONITORING_SIMPLE_ALERT_TEXT:
+            reasons.append(_format_alert_series_table_footer(GRAFANA_PANEL_TITLE, "HTTP", a_http))
+        if reasons:
+            reason_blocks.append("\n\n".join(reasons))
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
@@ -4780,12 +4806,14 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 reasons2.append(fb2)
         if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or bool(a2.get("hit_alert"))):
             reasons2 = [_format_simple_series_alert_block(g_lbl, s_lbl, a2)]
-        reason_blocks.extend(reasons2)
+        elif reasons2 and not MONITORING_SIMPLE_ALERT_TEXT:
+            reasons2.append(_format_alert_series_table_footer(g_lbl, s_lbl, a2))
+        if reasons2:
+            reason_blocks.append("\n\n".join(reasons2))
     if not reason_blocks:
-        lines.append("alert triggered but no analyzable timeseries points were found")
+        lines.append("Alert fired but no panel matched text details (no analyzable points).")
     else:
-        lines.append("")
-        lines.append("\n\n".join(reason_blocks))
+        lines.append("\n────────\n".join(reason_blocks))
     if TARGET_USER_OPEN_ID:
         lines.append("")
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
