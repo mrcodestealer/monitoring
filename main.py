@@ -4065,8 +4065,9 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
     kw = (keyword or "").strip()
 
     # Exact-id rows: duplicate Prometheus ``result`` rows (same legend ``3201``) must NOT be blindly
-    # summed — sums like 5294+9483=14777 vs Grafana ~20k. Numeric ids with multiple rows: ``max`` per
-    # **local minute** bucket across duplicates; non-numeric: pick one series by median magnitude.
+    # summed — sums like 5294+9483=14777 vs Grafana ~20k. Numeric ids: ``max`` per **local minute**
+    # (even for a single ``result`` row) so sub-minute scrapes cannot leave a ghost low in the same
+    # minute as Grafana's tooltip; non-numeric multi-row: pick one series by median magnitude.
     exact_candidates: List[List[Tuple[float, float]]] = []
     for s in payload.get("series") or []:
         lg = str(s.get("legendFormat") or "")
@@ -4081,10 +4082,10 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
             if pts:
                 exact_candidates.append(pts)
     if exact_candidates:
-        if len(exact_candidates) == 1:
-            merged_pts = exact_candidates[0]
-        elif kw.isdigit():
+        if kw.isdigit():
             merged_pts = _merge_digit_keyword_rows_max_bucketed(exact_candidates)
+        elif len(exact_candidates) == 1:
+            merged_pts = exact_candidates[0]
         else:
             merged_pts = _pick_best_exact_keyword_series(exact_candidates)
         by_one: Dict[float, float] = {}
@@ -4108,19 +4109,8 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
                     pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
                     if pts:
                         digit_rows.append(pts)
-            if len(digit_rows) > 1:
+            if digit_rows:
                 return dict(_merge_digit_keyword_rows_max_bucketed(digit_rows))
-            by_ts: Dict[float, float] = {}
-            if len(digit_rows) == 1:
-                for ts, val in digit_rows[0]:
-                    try:
-                        v = float(val)
-                    except (TypeError, ValueError):
-                        continue
-                    if not math.isfinite(v):
-                        continue
-                    by_ts[float(ts)] = v
-                return by_ts
             return {}
 
         by_ts_sum: Dict[float, float] = {}
