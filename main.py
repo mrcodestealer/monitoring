@@ -3859,6 +3859,43 @@ def _keyword_matches_series_labels(keyword: str, legend_format: str, metric: Dic
     return kw_cf in lg_cf or kw_cf in mb_cf
 
 
+def _series_row_exact_keyword_id(keyword: str, legend_format: str, metric: Dict[str, Any]) -> bool:
+    """
+    True when this row is unambiguously the single-series id (e.g. Grafana legend ``3201``),
+    not merely ``keyword`` appearing somewhere in a long label blob (which can still wrong-merge).
+
+    If any exact-id rows exist, :func:`_merge_series_points_by_keyword` uses **only** those rows so
+    alert numbers match the highlighted series (~21k) instead of accidental mixes (~14k).
+    """
+    kw_raw = (keyword or "").strip()
+    if not kw_raw:
+        return False
+    kw_cf = kw_raw.casefold()
+    lg = str(legend_format or "").strip().casefold()
+    if lg == kw_cf:
+        return True
+    if not isinstance(metric, dict):
+        return False
+    for mk in (
+        "series",
+        "name",
+        "provider",
+        "providerid",
+        "provider_id",
+        "game",
+        "gameid",
+        "game_id",
+        "label",
+        "__series_id__",
+    ):
+        v = metric.get(mk)
+        if v is None:
+            continue
+        if str(v).strip().casefold() == kw_cf:
+            return True
+    return False
+
+
 def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
     """Pick/merge points for '9280 + Push' from panel targets/results."""
     kw = (MONITORING_9280_SERIES_KEYWORD or "9280 + Push").strip()
@@ -3887,27 +3924,41 @@ def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]
 
 def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> List[Tuple[float, float]]:
     kw = (keyword or "").strip()
-    by_ts: Dict[float, float] = {}
-    for s in payload.get("series") or []:
-        lg = str(s.get("legendFormat") or "")
-        prom = s.get("prometheus") or {}
-        pdata = prom.get("data") or {}
-        for r in pdata.get("result") or []:
-            metric = r.get("metric") or {}
-            if kw and not _keyword_matches_series_labels(kw, lg, metric if isinstance(metric, dict) else {}):
-                continue
-            for pair in r.get("values") or []:
-                if len(pair) < 2:
-                    continue
-                try:
-                    ts = float(pair[0])
-                    val = float(pair[1])
-                except (TypeError, ValueError):
-                    continue
-                by_ts[ts] = by_ts.get(ts, 0.0) + val
-    if not by_ts:
+
+    def _accumulate(*, exact_id_only: bool) -> Dict[float, float]:
+        by_ts: Dict[float, float] = {}
+        for s in payload.get("series") or []:
+            lg = str(s.get("legendFormat") or "")
+            prom = s.get("prometheus") or {}
+            pdata = prom.get("data") or {}
+            for r in pdata.get("result") or []:
+                metric = r.get("metric") or {}
+                md = metric if isinstance(metric, dict) else {}
+                if exact_id_only:
+                    if kw and not _series_row_exact_keyword_id(kw, lg, md):
+                        continue
+                else:
+                    if kw and not _keyword_matches_series_labels(kw, lg, md):
+                        continue
+                for pair in r.get("values") or []:
+                    if len(pair) < 2:
+                        continue
+                    try:
+                        ts = float(pair[0])
+                        val = float(pair[1])
+                    except (TypeError, ValueError):
+                        continue
+                    by_ts[ts] = by_ts.get(ts, 0.0) + val
+        return by_ts
+
+    # Prefer Grafana-selected semantics: legend / primary id label equals keyword exactly.
+    by_exact = _accumulate(exact_id_only=True)
+    if by_exact:
+        return sorted(by_exact.items(), key=lambda x: x[0])
+    by_fuzzy = _accumulate(exact_id_only=False)
+    if not by_fuzzy:
         return []
-    return sorted(by_ts.items(), key=lambda x: x[0])
+    return sorted(by_fuzzy.items(), key=lambda x: x[0])
 
 
 def _merge_deposit_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
