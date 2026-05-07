@@ -97,6 +97,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_QUERY_ALIGNED_END_OFFSET_MINUTES": "1",
     # 合并后再丢掉尾部 N 个「分钟桶」（最后一两分钟常为未完成 scrape / 延迟，易出现畸形偏低）；0=不丢
     "MONITORING_DROP_LAST_MERGED_MINUTES": "1",
+    # /mo 与告警正文里的 time/value 表只展示「最新 N 行」（DROP/SPIKE 仍基于窗口内完整 merged 序列）
+    "MONITORING_TABLE_TAIL_ROWS": "5",
     # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
     "GRAFANA_SCREENSHOT_ENABLE": "1",
     "GRAFANA_SCREENSHOT_WIDTH": 1400,
@@ -600,6 +602,7 @@ MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECO
 MONITORING_DROP_LAST_MERGED_MINUTES = max(
     0, min(60, _cfg_int("MONITORING_DROP_LAST_MERGED_MINUTES", 1))
 )
+MONITORING_TABLE_TAIL_ROWS = max(1, min(99, _cfg_int("MONITORING_TABLE_TAIL_ROWS", 5)))
 MONITORING_SIMPLE_ALERT_TEXT = _lark_env_truthy("MONITORING_SIMPLE_ALERT_TEXT")
 MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS = _lark_env_truthy(
     "MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS"
@@ -4725,14 +4728,15 @@ def _format_alert_series_table_footer(
     series_label: str,
     analysis: Dict[str, Any],
     *,
-    max_rows: int = 18,
+    max_rows: Optional[int] = None,
 ) -> str:
     """English-only: compact table tail so alert lines can be checked against the same merged series."""
     pts = analysis.get("merged_points") or []
     title = f"Recent points — [{graph_label}] {series_label}:"
     if not pts:
         return f"{title}\n(no points)"
-    tail = pts[-max(1, min(max_rows, 48)) :]
+    cap = MONITORING_TABLE_TAIL_ROWS if max_rows is None else max(1, min(99, int(max_rows)))
+    tail = pts[-cap:]
     rows = ["```text", "time           value", "-------------  ------------"]
     for pair in tail:
         rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
@@ -4745,7 +4749,7 @@ def _format_simple_series_alert_block(
     series_label: str,
     analysis: Dict[str, Any],
     *,
-    max_rows: int = 8,
+    max_rows: Optional[int] = None,
 ) -> str:
     """
     Grafana-style snippet: latest timestamps and values from the same merged series the bot analyzed.
@@ -4758,7 +4762,8 @@ def _format_simple_series_alert_block(
     ]
     if not pts:
         return "\n".join(head + ["(no points in window)"])
-    tail = pts[-max(1, min(max_rows, 24)) :]
+    cap = MONITORING_TABLE_TAIL_ROWS if max_rows is None else max(1, min(99, int(max_rows)))
+    tail = pts[-cap:]
     rows = ["```text", "time           value", "-------------  ------------"]
     for pair in tail:
         rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
@@ -5011,7 +5016,7 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
     When the caller prepends ``_format_alert_trigger_reply`` (already contains ``<at>``), pass
     ``include_target_mention=False`` to avoid duplicate mentions.
     """
-    max_rows = 9
+    max_rows = MONITORING_TABLE_TAIL_ROWS
     uid = str(payload.get("dashboardUid") or GRAFANA_DASHBOARD_UID)
     base = str(GRAFANA_BASE_URL).rstrip("/")
     http_ex = _http_analysis_for_payload(payload)
