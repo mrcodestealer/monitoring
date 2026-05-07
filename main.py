@@ -3911,6 +3911,37 @@ def _prometheus_result_value_pairs(result: Dict[str, Any]) -> List[Tuple[float, 
     return out
 
 
+def _median_positive_abs(values: List[float]) -> float:
+    """Median of ``abs(v)`` for finite ``v > 0``; ``0.0`` if none."""
+    xs = sorted(abs(float(v)) for v in values if math.isfinite(float(v)) and float(v) > 0.0)
+    if not xs:
+        return 0.0
+    mid = len(xs) // 2
+    if len(xs) % 2 == 1:
+        return float(xs[mid])
+    return float(xs[mid - 1] + xs[mid]) / 2.0
+
+
+def _pick_best_exact_keyword_series(candidates: List[List[Tuple[float, float]]]) -> List[Tuple[float, float]]:
+    """
+    When Grafana shows one ``3201`` line but the snapshot carries several duplicate ``result`` rows,
+    picking **longest** series can select a stale/partial target (longer scrape history at wrong levels),
+    producing bogus fast drops (e.g. ~18k -> ~8k) and fake spikes from ~11k baselines.
+    Prefer the row whose magnitudes match the **main** curve: highest median ``|v|``, then length, then mass.
+    """
+    best_pl: Optional[List[Tuple[float, float]]] = None
+    best_key: Optional[Tuple[float, int, float]] = None
+    for pl in candidates:
+        vs = [v for _, v in pl]
+        med = _median_positive_abs(vs)
+        mass = sum(abs(float(v)) for v in vs if math.isfinite(float(v)))
+        key = (med, len(pl), mass)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_pl = pl
+    return best_pl or []
+
+
 def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
     """Pick/merge points for '9280 + Push' from panel targets/results."""
     kw = (MONITORING_9280_SERIES_KEYWORD or "9280 + Push").strip()
@@ -3957,10 +3988,7 @@ def _merge_series_points_by_keyword(payload: Dict[str, Any], keyword: str) -> Li
             if pts:
                 exact_candidates.append(pts)
     if exact_candidates:
-        best = max(
-            exact_candidates,
-            key=lambda pl: (len(pl), sum(abs(v) for _, v in pl)),
-        )
+        best = _pick_best_exact_keyword_series(exact_candidates)
         by_one: Dict[float, float] = {}
         for ts, val in best:
             by_one[ts] = val
