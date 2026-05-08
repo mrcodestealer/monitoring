@@ -736,7 +736,11 @@ MONITORING_CANONICAL_BOT_OPEN_ID_EXTRA_SET: Set[str] = {
     if p.strip()
 }
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
-MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
+# Default on: plain ``_lark_env_truthy`` treats unset as False — missing key meant no interactive card.
+MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy_or_default(
+    "MONITORING_MESSAGE_CARD_ENABLE",
+    default=True,
+)
 
 # 群聊里富媒体等类型仍可能带可解析文本；仅跳过明显无 /monitoring 的类型。
 _SKIP_IM_MESSAGE_TYPES = frozenset(
