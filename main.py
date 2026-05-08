@@ -1545,6 +1545,26 @@ def _lark_collect_explicit_bot_at_ids(
     return out
 
 
+def _lark_body_peer_only_strong_at_targets(
+    content_at_entity_ids: Optional[List[str]],
+    peer_open_ids: Set[str],
+) -> bool:
+    """
+    True when ``content`` JSON has at least one strong ``ou_``/``cli_`` and all are in ``peer_open_ids``.
+    Hard peer-only skip only when this holds — avoids skipping on mentions-only peer ids while text is ``@_user_N``.
+    """
+    if not peer_open_ids:
+        return False
+    body_ids: Set[str] = set()
+    for x in content_at_entity_ids or []:
+        t = str(x).strip()
+        if t and _lark_string_is_strong_feishu_at_target(t):
+            body_ids.add(t)
+    if not body_ids:
+        return False
+    return body_ids <= peer_open_ids
+
+
 def _text_should_run_monitoring(
     raw_text: str,
     clean: str,
@@ -1571,10 +1591,8 @@ def _text_should_run_monitoring(
     When ``mentions[]`` is weak but ``content`` still has ``<at …>`` with **this** bot's ``open_id``
     (needs ``LARK_BOT_OPEN_ID`` or ``bot/v3/info``), ``/mo`` triggers even if ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``.
 
-    ``MONITORING_CANONICAL_BOT_OPEN_ID`` / ``MONITORING_CANONICAL_BOT_OPEN_IDS`` / runtime ``bot/v3/info``: merged set.
-    If explicit ``ou_``/``cli_`` targets **intersect** it → trigger. If **disjoint**, **skip only** when every explicit
-    id is in ``MONITORING_PEER_BOT_OPEN_IDS`` (user @'d **only** the other bot); otherwise **fall through** — Feishu
-    may send an ``open_id`` variant not yet listed in canon.
+    ``MONITORING_CANONICAL_BOT_OPEN_ID`` / … merged set. Intersect → trigger. Disjoint → **hard skip** peer-only
+    only when **body** ``<at>`` confirms peer (not mentions-alone meta).
     """
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
@@ -1599,12 +1617,20 @@ def _text_should_run_monitoring(
                     and explicit_ids <= MONITORING_PEER_BOT_OPEN_ID_SET
                 )
                 if peer_only:
+                    body_peer_only = _lark_body_peer_only_strong_at_targets(
+                        content_at_entity_ids,
+                        MONITORING_PEER_BOT_OPEN_ID_SET,
+                    )
+                    if body_peer_only:
+                        logger.info(
+                            "monitoring /mo: skip — explicit @ targets %s peer-only and body <at> confirms peer",
+                            sorted(explicit_ids),
+                        )
+                        return False
                     logger.info(
-                        "monitoring /mo: skip — explicit @ targets %s are peer-only "
-                        "(subset of MONITORING_PEER_BOT_OPEN_IDS)",
+                        "monitoring /mo: explicit meta peer-only %s but body lacks peer-only <at> — fall through",
                         sorted(explicit_ids),
                     )
-                    return False
                 logger.info(
                     "monitoring /mo: explicit @ targets %s disjoint from canonical %s — fall through "
                     "(not peer-only; checking mentions/content)",
