@@ -18,7 +18,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 可用正文 ``@_user_N`` 兜底（含 **弱 mentions** 仅有 ``key``/``name``）。若 mentions 含 **他人** 的 ``ou_``/``cli_`` 强 id，其它 bot 不回复。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
+群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 用于 **mentions 为空** 时的 ``@_user_N`` 兜底。与 Game bot 同群时请保持 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，否则弱 mentions + ``/mo`` 可能对两台服务同时触发。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
 User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` (``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``; HTTP may need ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` for ``@_user_N`` text), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
 
@@ -167,6 +167,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_TRIGGER_REQUIRES_AT_BOT": "1",
     # 1=仅当 mentions **完全为空** 且正文含 @_user_N 时兜底 /mo（mentions 含其他 bot 时不误触发）；0=禁用
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
+    # 0=禁止「非空弱 mentions + @_user_N」跑 /mo — 与 Game bot 同群时勿改 1，否则会对方 @ Game 你也回
+    "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -711,6 +713,10 @@ MONITORING_TRIGGER_REQUIRES_AT_BOT = _lark_env_truthy("MONITORING_TRIGGER_REQUIR
 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER = _lark_env_truthy_or_default(
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER",
     default=True,
+)
+MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW = _lark_env_truthy_or_default(
+    "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW",
+    default=False,
 )
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
 MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
@@ -1427,8 +1433,10 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
     (prevents the wrong bot replying when multiple bots share a group).
 
     ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER``: required only when ``mentions`` is **empty** but the body
-    still has ``@_user_N``. Non-empty **weak** mentions (no conflicting ``ou_``/``cli_``) accept ``@_user_N``
-    without this flag so ops mis-setting ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=0`` does not break ``/mo``.
+    still has ``@_user_N``.
+
+    ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW``: when **1**, non-empty weak ``mentions`` + ``@_user_N`` can
+    trigger ``/mo``. **Keep ``0`` here if another monitoring bot shares the same Feishu group** (e.g. Game).
     """
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
@@ -1452,10 +1460,14 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
             else False
         )
         if mentions_list:
-            if body_ph and not conflict_other:
+            if (
+                MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW
+                and body_ph
+                and not conflict_other
+            ):
                 logger.info(
                     "monitoring /mo: allowed via Feishu @_user_N + weak/non-conflicting mentions "
-                    "(MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=%s)",
+                    "(MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=1 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=%s)",
                     MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
                 )
                 return True
@@ -6081,7 +6093,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         logger.info(
             "im.message no trigger raw=%r clean=%r mentions=%s mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s "
-            "mo_placeholder_cfg=%s body_has_@_user_N=%s mentions_other_ou_cli=%s bot_open_id_known=%s",
+            "mo_placeholder_cfg=%s mo_weak_nonempty_allow=%s body_has_@_user_N=%s mentions_other_ou_cli=%s bot_open_id_known=%s",
             (raw_text or "")[:160],
             (clean or "")[:160],
             len(mentions),
@@ -6090,6 +6102,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             MONITORING_CANCELMUTE_TRIGGER,
             MONITORING_TRIGGER_REQUIRES_AT_BOT,
             MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
+            MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW,
             body_ph,
             mo_ph_blocked_by_other,
             bool((_lark_effective_bot_open_id() or "").strip()),
