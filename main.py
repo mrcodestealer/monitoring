@@ -20,7 +20,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 用于 **mentions 为空** 时的 ``@_user_N`` 兜底。与 Game 同群时请保持 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，并把 **Game** 的 ``open_id`` 填入 ``MONITORING_PEER_BOT_OPEN_IDS``（正文 ``<at user_id=…>`` 仅指向 Game 时不再误触发）。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
 User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` (``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``; HTTP may need ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` for ``@_user_N`` text), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
-默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：交互卡片；``MONITORING_CARD_EMBED_SCREENSHOT=1``（默认）时在卡片内嵌 Grafana 截图 — **一条消息**。若 embed=``0``，会先卡片再 **单独一条图片**，看起来像两条。``MONITORING_MESSAGE_CARD_ENABLE=0`` 则为纯文字 + 独立 PNG。需在飞书开通「发送消息卡片」权限。
+默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：交互卡片；``MONITORING_CARD_EMBED_SCREENSHOT=1``（默认）嵌截图。**Platform /mo 正文常超过旧版 3000 字上限** — 已用 ``MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS``（默认 16000）+ ``MONITORING_MESSAGE_CARD_TRUNCATE=1`` 截断后进卡片，否则会误走纯文字。需在飞书开通「发送消息卡片」权限。
 
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
 
@@ -201,6 +201,10 @@ _CFG: Dict[str, Any] = {
     # 1=在监控卡片底部展示 callback 按钮（实现方式参考 Chatbox/jenkinsupdate 的 card JSON 2.0）
     "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
     "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Resend screenshot",
+    # Platform /mo 正文常远大于 3000；以前超限直接不发卡片。超限后的策略见下一项。
+    "MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS": "16000",
+    # 1=超长则截断 markdown 仍发交互卡片；0=超长改为整条纯文字（旧行为）
+    "MONITORING_MESSAGE_CARD_TRUNCATE": "1",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -3320,14 +3324,36 @@ def _lark_send_monitoring_user_message(
     rid = (receive_id or "").strip()
     if not rid:
         raise ValueError("empty receive_id for monitoring message")
-    # Card markdown body has strict cap; for long replies, send split text messages directly.
-    # Keep this threshold conservative to avoid card-side clipping.
-    if len(reply or "") > 3000:
-        _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3200)
-        return False, False
+    raw_reply = reply or ""
+    max_card = _cfg_int("MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS", 16000)
+    if max_card <= 0:
+        max_card = 3000
+
+    reply_for_card = raw_reply
+    if len(raw_reply) > max_card:
+        if MONITORING_MESSAGE_CARD_ENABLE and _lark_env_truthy_or_default(
+            "MONITORING_MESSAGE_CARD_TRUNCATE",
+            default=True,
+        ):
+            trunc_note = "\n\n… *(truncated for Feishu card size)*"
+            budget = max(800, max_card - len(trunc_note))
+            reply_for_card = raw_reply[:budget].rstrip() + trunc_note
+            logger.warning(
+                "monitoring interactive card: truncated body %s→%s chars "
+                "(MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS=%s)",
+                len(raw_reply),
+                len(reply_for_card),
+                max_card,
+            )
+        else:
+            _lark_send_text_auto(receive_id_type, rid, raw_reply, max_chars=3200)
+            return False, False
+
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
-            card = _monitoring_interactive_card_dict(reply, receive_id_type, rid, lark_img_key)
+            card = _monitoring_interactive_card_dict(
+                reply_for_card, receive_id_type, rid, lark_img_key
+            )
             _lark_send_interactive_card(receive_id_type, rid, card)
             return True, bool((lark_img_key or "").strip())
         except Exception as e:
@@ -3336,7 +3362,7 @@ def _lark_send_monitoring_user_message(
                 'check app permission "Send message cards".',
                 e,
             )
-    _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3200)
+    _lark_send_text_auto(receive_id_type, rid, raw_reply, max_chars=3200)
     return False, False
 
 
