@@ -18,7 +18,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；HTTP 常不带 ``mentions``，默认 ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` 在正文仍含 ``@_user_N`` 时也允许 ``/mo``。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
+群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 仅在 **mentions 完全为空** 时用正文 ``@_user_N`` 兜底，**mentions 指向其他 bot 时其它机器人不应回复**。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
 User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` (``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``; HTTP may need ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` for ``@_user_N`` text), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
 
@@ -165,7 +165,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
     # 1=发 MONITORING_TRIGGER（如 /mo）时必须 @ 本机器人（LARK_BOT_OPEN_ID）；0=群内任意出现 /mo 即触发（旧行为）
     "MONITORING_TRIGGER_REQUIRES_AT_BOT": "1",
-    # 1=HTTP 回调常不带 mentions，仅正文含 Feishu 占位 @_user_N 时也允许 /mo（需 REQUIRE_AT_BOT=1）；0=只信 mentions/open_id 匹配
+    # 1=仅当 mentions **完全为空** 且正文含 @_user_N 时兜底 /mo（mentions 含其他 bot 时不误触发）；0=禁用
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
@@ -295,33 +295,9 @@ def _cfg_float(key: str, default: float) -> float:
         return default
 
 
-def _cfg_listen_port(default: int = 5002) -> int:
-    """
-    Same order as ``Chatbox/main.py``: ``PORT`` or ``LARKBOT_PORT`` in env (skip blanks),
-    then ``_CFG["PORT"]`` / ``_CFG["LARKBOT_PORT"]``, then ``default`` (default **5002** here vs Chatbox **5000**).
-    """
-    for raw in (os.environ.get("PORT"), os.environ.get("LARKBOT_PORT")):
-        if raw is None:
-            continue
-        s = str(raw).strip()
-        if not s:
-            continue
-        try:
-            return int(s)
-        except ValueError:
-            continue
-    for key in ("PORT", "LARKBOT_PORT"):
-        v = _CFG.get(key)
-        if v is None:
-            continue
-        s = str(v).strip()
-        if not s:
-            continue
-        try:
-            return int(s)
-        except ValueError:
-            continue
-    return default
+def _cfg_listen_port() -> int:
+    """grafanaplatformbot always binds **5002**; ``PORT`` / ``LARKBOT_PORT`` / ``_CFG`` are ignored."""
+    return 5002
 
 
 # ``lark_oapi`` → ``ws/pb/google/__init__.py`` uses ``pkg_resources.declare_namespace`` (no upstream fix yet).
@@ -1320,21 +1296,26 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
     Run the same job as ``/monitoring`` when the command is present, or when the user @mentions
     the bot (see ``MONITORING_AT_MENTION_ENABLE`` / ``MONITORING_AT_MENTION_ANY_TEXT``).
 
-    When ``MONITORING_TRIGGER_REQUIRES_AT_BOT`` is true, an explicit trigger (e.g. ``/mo``) only
-    runs if ``mentions`` includes this app's ``LARK_BOT_OPEN_ID``, unless
-    ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` accepts ``@_user_N`` in raw text (HTTP omit meta).
+    When ``MONITORING_TRIGGER_REQUIRES_AT_BOT`` is true, ``/mo`` runs if ``mentions`` includes this bot.
+    If ``mentions`` is non-empty but targets someone else, **no** ``@_user_N`` placeholder fallback
+    (prevents the wrong bot replying when multiple bots share a group).
+
+    Placeholder applies only when ``mentions`` is **completely empty**.
     """
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
             return True
         if _lark_message_mentions_bot(mentions):
             return True
+        mentions_list = mentions if isinstance(mentions, list) else []
+        if mentions_list:
+            return False
         if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and _lark_raw_text_has_feishu_at_placeholder(
             raw_text
         ):
             logger.info(
                 "monitoring /mo: allowed via Feishu @_user_N placeholder "
-                "(mentions meta missing; MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1)"
+                "(mentions list empty; MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1)"
             )
             return True
         return False
