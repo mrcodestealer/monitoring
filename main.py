@@ -18,7 +18,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``：未 @ 本机器人时发 ``/mo`` 不会触发。
+群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``：未 @ 本机器人时发 ``/mo`` 不会触发；未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``（``APP_ID``/``APP_SECRET``）解析 bot ``open_id``。
 User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` monitoring (when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
 
@@ -434,6 +434,8 @@ _monitoring_chat_send_in_progress: set = set()
 _monitoring_card_action_event_ids: set = set()
 _monitoring_watch_last_alert_at: float = 0.0
 _monitoring_watch_started: bool = False
+_lark_bot_open_id_resolve_lock = threading.Lock()
+_lark_bot_open_id_api_cache: Optional[str] = None
 # --- Alert mute (「告警静音」：进程内；按监控通道粒度，供 watchdog / 告警转发过滤) ---
 _MONITORING_MUTE_UNTIL: Dict[str, float] = {}
 _mute_pending_selections: Dict[str, Set[str]] = {}
@@ -1211,25 +1213,40 @@ def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
 
 
 def _lark_message_mentions_bot(mentions: Any) -> bool:
-    """True when the message ``mentions`` list includes this app bot (``LARK_BOT_OPEN_ID``)."""
-    bot = (LARK_BOT_OPEN_ID or "").strip()
-    if not bot or not isinstance(mentions, list):
+    """True when ``mentions`` includes this app bot (``LARK_BOT_OPEN_ID`` or ``bot/v3/info``), or ``APP_ID`` on mention."""
+    if not isinstance(mentions, list) or not mentions:
+        return False
+    app = (str(APP_ID).strip() if APP_ID else "") or ""
+    bot = _lark_effective_bot_open_id()
+    if not bot and not app:
         return False
     for m in mentions:
         if not isinstance(m, dict):
             continue
+        if app:
+            for ak in ("app_id", "appId"):
+                av = m.get(ak)
+                if av and str(av).strip() == app:
+                    return True
         ido = m.get("id")
-        if isinstance(ido, str) and ido.strip() == bot:
+        if isinstance(ido, str) and bot and ido.strip() == bot:
             return True
         if isinstance(ido, dict):
-            for k in ("open_id", "openId", "user_id", "userId", "union_id", "unionId"):
-                v = ido.get(k)
+            if app:
+                for ak in ("app_id", "appId"):
+                    av = ido.get(ak)
+                    if av and str(av).strip() == app:
+                        return True
+            if bot:
+                for k in ("open_id", "openId", "user_id", "userId", "union_id", "unionId"):
+                    v = ido.get(k)
+                    if v and str(v).strip() == bot:
+                        return True
+        if bot:
+            for k in ("open_id", "openId", "user_id", "userId"):
+                v = m.get(k)
                 if v and str(v).strip() == bot:
                     return True
-        for k in ("open_id", "openId", "user_id", "userId"):
-            v = m.get(k)
-            if v and str(v).strip() == bot:
-                return True
     return False
 
 
@@ -2178,6 +2195,68 @@ def _lark_tenant_access_token_string() -> str:
     if not tok:
         raise RuntimeError(f"no tenant_access_token: {j}")
     return str(tok)
+
+
+def _lark_resolve_bot_open_id_via_api() -> str:
+    """
+    When ``LARK_BOT_OPEN_ID`` is unset, resolve this app's bot ``open_id`` via ``GET bot/v3/info``.
+
+    Cached after first attempt so IM hot path does not hammer the API.
+    """
+    global _lark_bot_open_id_api_cache
+    if _lark_bot_open_id_api_cache is not None:
+        return _lark_bot_open_id_api_cache
+    with _lark_bot_open_id_resolve_lock:
+        if _lark_bot_open_id_api_cache is not None:
+            return _lark_bot_open_id_api_cache
+        oid = ""
+        try:
+            if not APP_ID or not APP_SECRET:
+                logger.warning(
+                    "Cannot resolve bot open_id (empty LARK_BOT_OPEN_ID): set LARK_BOT_OPEN_ID or APP_ID/APP_SECRET"
+                )
+            else:
+                tok = _lark_tenant_access_token_string()
+                url = f"{_lark_api_domain()}/open-apis/bot/v3/info"
+                r = requests.get(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {tok}",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                    timeout=20,
+                )
+                r.raise_for_status()
+                j = r.json()
+                if int(j.get("code", -1)) != 0:
+                    logger.warning("bot/v3/info error: %s", j)
+                else:
+                    data = j.get("data")
+                    if isinstance(data, dict):
+                        oid = _lark_dict_pick_str(data, "open_id", "openId")
+                        if not oid:
+                            inner = data.get("bot")
+                            if isinstance(inner, dict):
+                                oid = _lark_dict_pick_str(inner, "open_id", "openId")
+                    oid = (oid or "").strip()
+        except Exception:
+            logger.exception(
+                "bot/v3/info failed — set LARK_BOT_OPEN_ID in config/env or fix APP credentials"
+            )
+        _lark_bot_open_id_api_cache = oid
+        if oid:
+            logger.info(
+                "Resolved bot open_id via bot/v3/info (override anytime with LARK_BOT_OPEN_ID)"
+            )
+        return oid
+
+
+def _lark_effective_bot_open_id() -> str:
+    """Configured ``LARK_BOT_OPEN_ID``, else cached result from :func:`_lark_resolve_bot_open_id_via_api`."""
+    c = (LARK_BOT_OPEN_ID or "").strip()
+    if c:
+        return c
+    return _lark_resolve_bot_open_id_via_api()
 
 
 def _lark_upload_png_image_key(png: bytes) -> str:
@@ -5673,7 +5752,8 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     else:
         sender = {}
     sender_open = _lark_dict_pick_str(sender, "open_id", "openId", "user_id", "userId")
-    if LARK_BOT_OPEN_ID and sender_open == LARK_BOT_OPEN_ID:
+    _bot_self = _lark_effective_bot_open_id()
+    if _bot_self and sender_open == _bot_self:
         return
 
     raw_text = _lark_extract_plain_text_from_message(msg)
@@ -5745,7 +5825,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
     if (
-        (LARK_BOT_OPEN_ID or "").strip()
+        _lark_effective_bot_open_id()
         and _lark_message_mentions_bot(mentions)
         and cn
         and not _im_command_matches(clean or "", MONITORING_TRIGGER)
@@ -6471,15 +6551,16 @@ def run_monitoring_bot() -> None:
     _start_grafana_playwright_keeper_if_enabled()
     _start_monitoring_watchdog_if_enabled()
     port = _cfg_listen_port(5002)
-    if MONITORING_AT_MENTION_ENABLE and not (LARK_BOT_OPEN_ID or "").strip():
-        logger.warning(
-            "MONITORING_AT_MENTION_ENABLE is on but LARK_BOT_OPEN_ID is empty — @-only triggers will not match; set LARK_BOT_OPEN_ID to this bot's open_id."
-        )
-    if MONITORING_TRIGGER_REQUIRES_AT_BOT and not (LARK_BOT_OPEN_ID or "").strip():
-        logger.warning(
-            "MONITORING_TRIGGER_REQUIRES_AT_BOT is on but LARK_BOT_OPEN_ID is empty — explicit triggers like %r will never match; set LARK_BOT_OPEN_ID or set MONITORING_TRIGGER_REQUIRES_AT_BOT=0.",
-            (MONITORING_TRIGGER or "/mo").strip(),
-        )
+    if MONITORING_AT_MENTION_ENABLE or MONITORING_TRIGGER_REQUIRES_AT_BOT:
+        _oid = _lark_effective_bot_open_id()
+        if MONITORING_AT_MENTION_ENABLE and not _oid:
+            logger.warning(
+                "MONITORING_AT_MENTION_ENABLE is on but bot open_id unknown — set LARK_BOT_OPEN_ID or ensure bot/v3/info works."
+            )
+        if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _oid:
+            logger.warning(
+                "MONITORING_TRIGGER_REQUIRES_AT_BOT is on but bot open_id unknown — @ /mo will not match; set LARK_BOT_OPEN_ID, fix APP_ID/APP_SECRET for bot/v3/info, or set MONITORING_TRIGGER_REQUIRES_AT_BOT=0."
+            )
     if int(GRAFANA_QUERY_LOOKBACK_SECONDS) != 900:
         logger.warning(
             "GRAFANA_QUERY_LOOKBACK_SECONDS=%s (default 900 = 15m) — /monitoring Prometheus window differs from default 15 minutes",
