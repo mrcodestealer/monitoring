@@ -18,7 +18,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 用于 **mentions 为空** 时的 ``@_user_N`` 兜底。与 Game bot 同群时请保持 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，否则弱 mentions + ``/mo`` 可能对两台服务同时触发。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
+群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 用于 **mentions 为空** 时的 ``@_user_N`` 兜底。与 Game 同群时请保持 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，并把 **Game** 的 ``open_id`` 填入 ``MONITORING_PEER_BOT_OPEN_IDS``（正文 ``<at user_id=…>`` 仅指向 Game 时不再误触发）。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
 User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` (``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``; HTTP may need ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` for ``@_user_N`` text), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
 
@@ -169,6 +169,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 0=禁止「非空弱 mentions + @_user_N」跑 /mo — 与 Game bot 同群时勿改 1，否则会对方 @ Game 你也回
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
+    # Game bot 的 open_id（逗号/空格）。正文 ``<at user_id=\"ou_…\">`` 只指向 Game 时 Platform 不weak触发（可与上一项同为 0 双保险）
+    "MONITORING_PEER_BOT_OPEN_IDS": "",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -718,6 +720,11 @@ MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW = _lark_env_truthy_or_default(
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW",
     default=False,
 )
+MONITORING_PEER_BOT_OPEN_ID_SET: Set[str] = {
+    p.strip()
+    for p in re.split(r"[\s,;]+", _cfg_str("MONITORING_PEER_BOT_OPEN_IDS", "").strip())
+    if p.strip()
+}
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
 MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
 
@@ -1423,7 +1430,69 @@ def _lark_mentions_carry_strong_identity_other_than_bot(bot: str, app: str, ment
     return False
 
 
-def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> bool:
+_LARK_AT_ENTITY_ID_IN_CONTENT_RE = re.compile(
+    r"<at\b[^>]*?\b(?:user_id|open_id|openId|userId)\s*=\s*[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+
+
+def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
+    """
+    Feishu sometimes omits usable ``mentions[]`` but keeps ``<at user_id=\"ou_…\">`` inside ``content`` JSON.
+    Used to skip weak-nonempty ``/mo`` when the body clearly @'s another bot in the same group.
+    """
+    blobs: List[str] = []
+    if isinstance(msg, dict):
+        raw_c = msg.get("content")
+        if raw_c is None:
+            raw_c = msg.get("Content")
+        if isinstance(raw_c, str):
+            blobs.append(raw_c)
+        elif isinstance(raw_c, dict):
+            blobs.append(json.dumps(raw_c, ensure_ascii=False))
+        for k in ("text", "Text", "body"):
+            v = msg.get(k)
+            if isinstance(v, str) and v.strip():
+                blobs.append(v)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for b in blobs:
+        for m in _LARK_AT_ENTITY_ID_IN_CONTENT_RE.finditer(b or ""):
+            s = m.group(1).strip()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
+
+
+def _mo_peer_at_blocks_weak_nonempty_mo(
+    content_at_entity_ids: Optional[List[str]],
+    *,
+    self_bot: str,
+    self_app: str,
+    peer_open_ids: Set[str],
+) -> bool:
+    if not peer_open_ids:
+        return False
+    ids = [str(x).strip() for x in (content_at_entity_ids or []) if str(x).strip()]
+    if not ids:
+        return False
+    sb = (self_bot or "").strip()
+    sa = (str(self_app).strip() if self_app else "") or ""
+    if sb and sb in ids:
+        return False
+    if sa and sa in ids:
+        return False
+    return any(i in peer_open_ids for i in ids)
+
+
+def _text_should_run_monitoring(
+    raw_text: str,
+    clean: str,
+    mentions: Any,
+    *,
+    content_at_entity_ids: Optional[List[str]] = None,
+) -> bool:
     """
     Run the same job as ``/monitoring`` when the command is present, or when the user @mentions
     the bot (see ``MONITORING_AT_MENTION_ENABLE`` / ``MONITORING_AT_MENTION_ANY_TEXT``).
@@ -1437,6 +1506,8 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
 
     ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW``: when **1**, non-empty weak ``mentions`` + ``@_user_N`` can
     trigger ``/mo``. **Keep ``0`` here if another monitoring bot shares the same Feishu group** (e.g. Game).
+
+    ``MONITORING_PEER_BOT_OPEN_IDS``: skip weak-nonempty ``/mo`` when ``content`` ``<at>`` targets a peer bot only.
     """
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
@@ -1465,12 +1536,23 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
                 and body_ph
                 and not conflict_other
             ):
-                logger.info(
-                    "monitoring /mo: allowed via Feishu @_user_N + weak/non-conflicting mentions "
-                    "(MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=1 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=%s)",
-                    MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
-                )
-                return True
+                if _mo_peer_at_blocks_weak_nonempty_mo(
+                    content_at_entity_ids,
+                    self_bot=_lark_effective_bot_open_id(),
+                    self_app=str(APP_ID).strip() if APP_ID else "",
+                    peer_open_ids=MONITORING_PEER_BOT_OPEN_ID_SET,
+                ):
+                    logger.info(
+                        "monitoring /mo: skip — content <at> targets MONITORING_PEER_BOT_OPEN_IDS "
+                        "(weak-nonempty path disabled for peer @)"
+                    )
+                else:
+                    logger.info(
+                        "monitoring /mo: allowed via Feishu @_user_N + weak/non-conflicting mentions "
+                        "(MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=1 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=%s)",
+                        MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
+                    )
+                    return True
             return False
         if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and body_ph:
             logger.info(
@@ -5980,6 +6062,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             raw_text = fb
     mentions = _lark_collect_im_message_mentions(msg, event)
     clean = _lark_clean_command_text(raw_text, mentions)
+    content_at_entity_ids = _lark_extract_at_entity_ids_from_im_message(msg)
 
     chat_id = chat_resolved
     open_id = sender_open
@@ -6079,7 +6162,9 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         ).start()
         return
 
-    if not _text_should_run_monitoring(raw_text, clean, mentions):
+    if not _text_should_run_monitoring(
+        raw_text, clean, mentions, content_at_entity_ids=content_at_entity_ids
+    ):
         ml = mentions if isinstance(mentions, list) else []
         body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
         mo_ph_blocked_by_other = (
