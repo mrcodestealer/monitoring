@@ -44,7 +44,7 @@ import re
 import threading
 import time
 import warnings
-from typing import Any, Dict, Generator, List, Optional, Set, Tuple
+from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
 
 import requests
 from flask import Flask, Response, g, jsonify, request
@@ -1253,6 +1253,28 @@ def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
     return _im_command_matches(clean or "", MONITORING_TRIGGER)
 
 
+def _lark_iter_mention_scalar_strings(obj: Any, depth: int = 0, *, max_depth: int = 8) -> Iterator[str]:
+    """Yield stripped strings from nested dict/list (Feishu mention shapes evolve; ids may sit deeper than ``id.open_id``)."""
+    if depth > max_depth:
+        return
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s:
+            yield s
+        return
+    if isinstance(obj, bool):
+        return
+    if isinstance(obj, int):
+        yield str(obj)
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _lark_iter_mention_scalar_strings(v, depth + 1, max_depth=max_depth)
+    elif isinstance(obj, list):
+        for it in obj:
+            yield from _lark_iter_mention_scalar_strings(it, depth + 1, max_depth=max_depth)
+
+
 def _lark_message_mentions_bot(mentions: Any) -> bool:
     """True when ``mentions`` includes this app bot (``LARK_BOT_OPEN_ID`` or ``bot/v3/info``), or ``APP_ID`` on mention."""
     if not isinstance(mentions, list) or not mentions:
@@ -1287,6 +1309,17 @@ def _lark_message_mentions_bot(mentions: Any) -> bool:
             for k in ("open_id", "openId", "user_id", "userId"):
                 v = m.get(k)
                 if v and str(v).strip() == bot:
+                    return True
+        # Nested / newer payload shapes (still one mention entity — avoid missing open_id under unknown keys).
+        if bot or app:
+            n = 0
+            for s in _lark_iter_mention_scalar_strings(m):
+                n += 1
+                if n > 200:
+                    break
+                if bot and s == bot:
+                    return True
+                if app and s == app:
                     return True
     return False
 
