@@ -615,7 +615,17 @@ MONITORING_TIME_BUCKET_TZ = _cfg_str("MONITORING_TIME_BUCKET_TZ", "").strip()
 
 
 def _parse_monitoring_zoneinfo() -> Optional[Any]:
-    from zoneinfo import ZoneInfo
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        try:
+            from backports.zoneinfo import ZoneInfo  # type: ignore
+        except ImportError:
+            logger.warning(
+                "zoneinfo unavailable (Python 3.9+ has it in stdlib; else: pip install "
+                "backports.zoneinfo). MONITORING_TIME_BUCKET_TZ ignored — local process time for buckets."
+            )
+            return None
 
     tzn = MONITORING_TIME_BUCKET_TZ.strip()
     if not tzn or tzn.lower() in ("local", "server", "-", "none"):
