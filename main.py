@@ -169,10 +169,12 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 0=禁止「非空弱 mentions + @_user_N」跑 /mo — 与 Game bot 同群时勿改 1，否则会对方 @ Game 你也回
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
-    # 本仓库 = Grafana **Platform** Bot：解析到明确 ou_/cli_ @ 目标时须包含此 id 才跑 /mo（双 webhook 同群）
+    # 本仓库 = Grafana **Platform** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_0bfd185231d6beb669425fdf8f13e9df",
-    # Game bot 的 open_id（逗号/空格）。正文 ``<at user_id=\"ou_…\">`` 只指向 Game 时 Platform 不 weak 触发（可与上一项同为 0 双保险）
-    "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed",
+    # 同一机器人在飞书里可能出现的其它 open_id（逗号/空格）；与上一项及运行时 bot/v3/info **并集** 匹配
+    "MONITORING_CANONICAL_BOT_OPEN_IDS": "ou_ee1af664e18d9c2d25e0ab6fded66388",
+    # Game bot 可能出现的 open_id（逗号/空格）。正文 ``<at>`` 只指向 Game 时 Platform 不 weak 触发
+    "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed ou_848fc4640b48b9845cbc5b0cfa2f1af1",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -728,6 +730,11 @@ MONITORING_PEER_BOT_OPEN_ID_SET: Set[str] = {
     if p.strip()
 }
 MONITORING_CANONICAL_BOT_OPEN_ID = _cfg_str("MONITORING_CANONICAL_BOT_OPEN_ID", "").strip()
+MONITORING_CANONICAL_BOT_OPEN_ID_EXTRA_SET: Set[str] = {
+    p.strip()
+    for p in re.split(r"[\s,;]+", _cfg_str("MONITORING_CANONICAL_BOT_OPEN_IDS", "").strip())
+    if p.strip()
+}
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
 MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
 
@@ -1502,6 +1509,18 @@ def _mo_peer_at_blocks_weak_nonempty_mo(
     return any(i in peer_open_ids for i in ids)
 
 
+def _monitoring_canonical_open_id_match_set() -> Set[str]:
+    """Configured canonical id(s) plus ``_lark_effective_bot_open_id()`` when known (covers Feishu vs console id mismatch)."""
+    s = set(MONITORING_CANONICAL_BOT_OPEN_ID_EXTRA_SET)
+    c = (MONITORING_CANONICAL_BOT_OPEN_ID or "").strip()
+    if c:
+        s.add(c)
+    eff = (_lark_effective_bot_open_id() or "").strip()
+    if eff:
+        s.add(eff)
+    return s
+
+
 def _lark_collect_explicit_bot_at_ids(
     mentions_list: List[Any],
     content_at_entity_ids: Optional[List[str]],
@@ -1548,8 +1567,8 @@ def _text_should_run_monitoring(
     When ``mentions[]`` is weak but ``content`` still has ``<at …>`` with **this** bot's ``open_id``
     (needs ``LARK_BOT_OPEN_ID`` or ``bot/v3/info``), ``/mo`` triggers even if ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``.
 
-    ``MONITORING_CANONICAL_BOT_OPEN_ID``: when non-empty and we parse at least one explicit ``ou_``/``cli_``
-    target, **only** trigger if that set includes this id (wrong-process webhook guard).
+    ``MONITORING_CANONICAL_BOT_OPEN_ID`` / ``MONITORING_CANONICAL_BOT_OPEN_IDS`` / runtime ``bot/v3/info``: merged set;
+    when non-empty and explicit ``ou_``/``cli_`` targets exist, trigger only if sets **intersect**.
     """
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
@@ -1560,19 +1579,19 @@ def _text_should_run_monitoring(
             mentions_list = [mentions]
         else:
             mentions_list = []
-        canon = (MONITORING_CANONICAL_BOT_OPEN_ID or "").strip()
+        canon_ids = _monitoring_canonical_open_id_match_set()
         explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
-        if canon:
-            if explicit_ids and canon not in explicit_ids:
+        if canon_ids:
+            if explicit_ids and explicit_ids.isdisjoint(canon_ids):
                 logger.info(
-                    "monitoring /mo: skip — explicit @ targets %s exclude MONITORING_CANONICAL_BOT_OPEN_ID=%s",
+                    "monitoring /mo: skip — explicit @ targets %s disjoint from canonical open_id set %s",
                     sorted(explicit_ids),
-                    canon,
+                    sorted(canon_ids),
                 )
                 return False
-            if explicit_ids and canon in explicit_ids:
+            if explicit_ids and not explicit_ids.isdisjoint(canon_ids):
                 logger.info(
-                    "monitoring /mo: trigger — MONITORING_CANONICAL_BOT_OPEN_ID in explicit @ targets"
+                    "monitoring /mo: trigger — explicit @ targets intersect canonical open_id set"
                 )
                 return True
         if _lark_message_mentions_bot(mentions):
