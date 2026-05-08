@@ -1186,6 +1186,51 @@ def _lark_extract_plain_text_from_message(msg: Dict[str, Any]) -> str:
     return obj.get("text") or ""
 
 
+def _lark_collect_im_message_mentions(msg: Dict[str, Any], event: Dict[str, Any]) -> List[Any]:
+    """
+    Merge @mention metadata from ``message``, ``event``, and parsed ``content`` JSON.
+
+    HTTP ``im.message`` payloads sometimes omit ``message.mentions`` while still encoding
+    ``{"text":"@_user_1 ...","mentions":[...]}`` inside ``content`` — without this, @-gates see an empty list.
+    """
+    out: List[Any] = []
+    seen: Set[str] = set()
+
+    def _add(lst: Any) -> None:
+        if not isinstance(lst, list):
+            return
+        for m in lst:
+            if not isinstance(m, dict):
+                continue
+            sig = json.dumps(m, sort_keys=True, ensure_ascii=False)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(m)
+
+    if isinstance(msg, dict):
+        _add(msg.get("mentions"))
+        _add(msg.get("Mentions"))
+    if isinstance(event, dict):
+        _add(event.get("mentions"))
+        _add(event.get("Mentions"))
+    raw_c = None
+    if isinstance(msg, dict):
+        raw_c = msg.get("content")
+        if raw_c is None:
+            raw_c = msg.get("Content")
+    if isinstance(raw_c, dict):
+        _add(raw_c.get("mentions"))
+    elif isinstance(raw_c, str):
+        try:
+            obj = json.loads(raw_c or "{}")
+            if isinstance(obj, dict):
+                _add(obj.get("mentions"))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return out
+
+
 def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
     """Remove @ placeholders so ``/monitoring`` survives after <at>...</at> blocks."""
     text = raw_text or ""
@@ -5771,8 +5816,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         fb = _lark_dict_pick_str(event, "text_without_at_bot", "textWithoutAtBot", "text")
         if fb:
             raw_text = fb
-    mentions_raw = msg.get("mentions") or []
-    mentions = mentions_raw if isinstance(mentions_raw, list) else []
+    mentions = _lark_collect_im_message_mentions(msg, event)
     clean = _lark_clean_command_text(raw_text, mentions)
 
     chat_id = chat_resolved
@@ -5875,9 +5919,10 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     if not _text_should_run_monitoring(raw_text, clean, mentions):
         logger.info(
-            "im.message no trigger raw=%r clean=%r (mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s; see MONITORING_AT_MENTION_*)",
+            "im.message no trigger raw=%r clean=%r mentions=%s mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s",
             (raw_text or "")[:160],
             (clean or "")[:160],
+            len(mentions),
             MONITORING_TRIGGER,
             MONITORING_MUTE_TRIGGER,
             MONITORING_CANCELMUTE_TRIGGER,
