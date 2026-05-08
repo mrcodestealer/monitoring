@@ -318,6 +318,14 @@ def _lark_env_truthy(key: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _lark_env_truthy_or_default(key: str, *, default: bool) -> bool:
+    """Like :func:`_lark_env_truthy` but ``default`` when the key is unset (``_cfg_raw`` is None)."""
+    v = _cfg_raw(key)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 app = Flask(__name__)
 
 
@@ -700,8 +708,9 @@ LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
 MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
 MONITORING_TRIGGER_REQUIRES_AT_BOT = _lark_env_truthy("MONITORING_TRIGGER_REQUIRES_AT_BOT")
-MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER = _lark_env_truthy(
-    "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER"
+MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER = _lark_env_truthy_or_default(
+    "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER",
+    default=True,
 )
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
 MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
@@ -1366,9 +1375,14 @@ def _lark_collect_mention_identity_strings_for_at_conflict(m: dict) -> List[str]
 
 
 def _lark_string_is_strong_feishu_at_target(s: str) -> bool:
-    """Open ids / chat ids / app ids Feishu uses to pin an @ target (union_id alone is intentionally ignored)."""
+    """
+    User/bot ``open_id`` (``ou_``) or app id (``cli_``) for the @ target.
+
+    Do **not** treat ``oc_`` (chat) / ``om_`` (message) / ``on_`` as @ targets — Feishu often copies
+    those into ``mentions`` JSON and would falsely block ``@_user_N`` ``/mo`` fallback.
+    """
     x = (s or "").strip()
-    return bool(x) and x.startswith(("ou_", "on_", "om_", "oc_", "cli_"))
+    return bool(x) and x.startswith(("ou_", "cli_"))
 
 
 def _lark_mentions_carry_strong_identity_other_than_bot(bot: str, app: str, mentions: Any) -> bool:
@@ -6037,8 +6051,22 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         return
 
     if not _text_should_run_monitoring(raw_text, clean, mentions):
+        ml = mentions if isinstance(mentions, list) else []
+        mo_ph_body_ok = MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and _lark_raw_text_has_feishu_at_placeholder(
+            raw_text
+        )
+        mo_ph_blocked_by_other = (
+            _lark_mentions_carry_strong_identity_other_than_bot(
+                _lark_effective_bot_open_id(),
+                str(APP_ID).strip() if APP_ID else "",
+                ml,
+            )
+            if ml
+            else False
+        )
         logger.info(
-            "im.message no trigger raw=%r clean=%r mentions=%s mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s",
+            "im.message no trigger raw=%r clean=%r mentions=%s mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s "
+            "mo_placeholder_enabled=%s mo_placeholder_body_ok=%s mentions_other_ou_cli=%s",
             (raw_text or "")[:160],
             (clean or "")[:160],
             len(mentions),
@@ -6046,6 +6074,9 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             MONITORING_MUTE_TRIGGER,
             MONITORING_CANCELMUTE_TRIGGER,
             MONITORING_TRIGGER_REQUIRES_AT_BOT,
+            MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
+            mo_ph_body_ok,
+            mo_ph_blocked_by_other,
         )
         return
 
