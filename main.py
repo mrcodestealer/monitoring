@@ -18,8 +18,8 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at 机器人发监控命令（默认 ``/mo``）**或仅 @ 机器人（无其它正文）** → Grafana 摘要（默认最近 **15** 分钟）。
-User-visible bot text is **English-only**. Short commands (configurable): ``/mo`` monitoring, ``/m`` mute card, ``/c`` cancel all mutes. **@bot + any other text** → bot replies with this command list.
+群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``：未 @ 本机器人时发 ``/mo`` 不会触发。
+User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` monitoring (when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
 
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
@@ -163,6 +163,8 @@ _CFG: Dict[str, Any] = {
     # 1=仅 @ 机器人且无其它正文也触发（与 MONITORING_TRIGGER 默认 /mo 同）；1+ANY=1 时 @ 且任意正文也跑监控（非命令且带字会先收到命令说明）
     "MONITORING_AT_MENTION_ENABLE": "0",
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
+    # 1=发 MONITORING_TRIGGER（如 /mo）时必须 @ 本机器人（LARK_BOT_OPEN_ID）；0=群内任意出现 /mo 即触发（旧行为）
+    "MONITORING_TRIGGER_REQUIRES_AT_BOT": "1",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -707,6 +709,7 @@ LARK_ENCRYPT_KEY = (
 LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
 MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
+MONITORING_TRIGGER_REQUIRES_AT_BOT = _lark_env_truthy("MONITORING_TRIGGER_REQUIRES_AT_BOT")
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
 MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
 
@@ -1234,8 +1237,13 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
     """
     Run the same job as ``/monitoring`` when the command is present, or when the user @mentions
     the bot (see ``MONITORING_AT_MENTION_ENABLE`` / ``MONITORING_AT_MENTION_ANY_TEXT``).
+
+    When ``MONITORING_TRIGGER_REQUIRES_AT_BOT`` is true, an explicit trigger (e.g. ``/mo``) only
+    runs if ``mentions`` includes this app's ``LARK_BOT_OPEN_ID``.
     """
     if _text_has_monitoring_trigger(raw_text, clean):
+        if MONITORING_TRIGGER_REQUIRES_AT_BOT:
+            return _lark_message_mentions_bot(mentions)
         return True
     if not MONITORING_AT_MENTION_ENABLE:
         return False
@@ -5777,12 +5785,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     if not _text_should_run_monitoring(raw_text, clean, mentions):
         logger.info(
-            "im.message no trigger raw=%r clean=%r (need %r, %r, %r or @bot per MONITORING_AT_MENTION_*)",
+            "im.message no trigger raw=%r clean=%r (mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s; see MONITORING_AT_MENTION_*)",
             (raw_text or "")[:160],
             (clean or "")[:160],
             MONITORING_TRIGGER,
             MONITORING_MUTE_TRIGGER,
             MONITORING_CANCELMUTE_TRIGGER,
+            MONITORING_TRIGGER_REQUIRES_AT_BOT,
         )
         return
 
@@ -6465,6 +6474,11 @@ def run_monitoring_bot() -> None:
     if MONITORING_AT_MENTION_ENABLE and not (LARK_BOT_OPEN_ID or "").strip():
         logger.warning(
             "MONITORING_AT_MENTION_ENABLE is on but LARK_BOT_OPEN_ID is empty — @-only triggers will not match; set LARK_BOT_OPEN_ID to this bot's open_id."
+        )
+    if MONITORING_TRIGGER_REQUIRES_AT_BOT and not (LARK_BOT_OPEN_ID or "").strip():
+        logger.warning(
+            "MONITORING_TRIGGER_REQUIRES_AT_BOT is on but LARK_BOT_OPEN_ID is empty — explicit triggers like %r will never match; set LARK_BOT_OPEN_ID or set MONITORING_TRIGGER_REQUIRES_AT_BOT=0.",
+            (MONITORING_TRIGGER or "/mo").strip(),
         )
     if int(GRAFANA_QUERY_LOOKBACK_SECONDS) != 900:
         logger.warning(
