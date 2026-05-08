@@ -1387,9 +1387,13 @@ def _lark_string_is_strong_feishu_at_target(s: str) -> bool:
 
 def _lark_mentions_carry_strong_identity_other_than_bot(bot: str, app: str, mentions: Any) -> bool:
     """
-    True if some mention carries a strong id (``ou_``/``cli_``/…) that is neither this bot nor this app.
+    True if some mention carries a strong id (``ou_``/``cli_``) that clearly targets **another** app/bot.
 
     Weak payloads (only ``@_user_N`` / display name) → False so ``@_user_N`` placeholder can still fire ``/mo``.
+
+    When **bot open_id is unknown** (empty ``LARK_BOT_OPEN_ID`` and ``bot/v3/info`` failed), any ``ou_`` in
+    the payload might still be this bot — we **do not** treat ``ou_`` as conflicting in that case; only a
+    ``cli_`` different from ``APP_ID`` blocks.
     """
     if not isinstance(mentions, list):
         return False
@@ -1405,6 +1409,10 @@ def _lark_mentions_carry_strong_identity_other_than_bot(bot: str, app: str, ment
                 continue
             if app_s and s == app_s:
                 continue
+            if not bot:
+                if s.startswith("cli_") and (not app_s or s != app_s):
+                    return True
+                continue
             return True
     return False
 
@@ -1418,32 +1426,41 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
     If ``mentions`` is non-empty but targets someone else, **no** ``@_user_N`` placeholder fallback
     (prevents the wrong bot replying when multiple bots share a group).
 
-    ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER``: body ``@_user_N`` may still enable ``/mo`` when mention
-    meta is **weak** (Feishu often sends ``mentions`` with only ``key``/``name``). Strong ``ou_``/``cli_``
-    ids for **another** entity block placeholder.
+    ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER``: required only when ``mentions`` is **empty** but the body
+    still has ``@_user_N``. Non-empty **weak** mentions (no conflicting ``ou_``/``cli_``) accept ``@_user_N``
+    without this flag so ops mis-setting ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=0`` does not break ``/mo``.
     """
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
             return True
         if _lark_message_mentions_bot(mentions):
             return True
-        mentions_list = mentions if isinstance(mentions, list) else []
-        ph_ok = MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and _lark_raw_text_has_feishu_at_placeholder(
-            raw_text
-        )
-        if mentions_list:
-            if ph_ok and not _lark_mentions_carry_strong_identity_other_than_bot(
+        if isinstance(mentions, list):
+            mentions_list = mentions
+        elif isinstance(mentions, dict) and mentions:
+            mentions_list = [mentions]
+        else:
+            mentions_list = []
+        body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
+        conflict_other = (
+            _lark_mentions_carry_strong_identity_other_than_bot(
                 _lark_effective_bot_open_id(),
                 str(APP_ID).strip() if APP_ID else "",
                 mentions_list,
-            ):
+            )
+            if mentions_list
+            else False
+        )
+        if mentions_list:
+            if body_ph and not conflict_other:
                 logger.info(
-                    "monitoring /mo: allowed via Feishu @_user_N placeholder "
-                    "(weak mention meta or no conflicting ou_/cli_ id; MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1)"
+                    "monitoring /mo: allowed via Feishu @_user_N + weak/non-conflicting mentions "
+                    "(MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=%s)",
+                    MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
                 )
                 return True
             return False
-        if ph_ok:
+        if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and body_ph:
             logger.info(
                 "monitoring /mo: allowed via Feishu @_user_N placeholder "
                 "(mentions list empty; MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1)"
@@ -6052,9 +6069,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     if not _text_should_run_monitoring(raw_text, clean, mentions):
         ml = mentions if isinstance(mentions, list) else []
-        mo_ph_body_ok = MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and _lark_raw_text_has_feishu_at_placeholder(
-            raw_text
-        )
+        body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
         mo_ph_blocked_by_other = (
             _lark_mentions_carry_strong_identity_other_than_bot(
                 _lark_effective_bot_open_id(),
@@ -6066,7 +6081,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         logger.info(
             "im.message no trigger raw=%r clean=%r mentions=%s mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s "
-            "mo_placeholder_enabled=%s mo_placeholder_body_ok=%s mentions_other_ou_cli=%s",
+            "mo_placeholder_cfg=%s body_has_@_user_N=%s mentions_other_ou_cli=%s bot_open_id_known=%s",
             (raw_text or "")[:160],
             (clean or "")[:160],
             len(mentions),
@@ -6075,8 +6090,9 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             MONITORING_CANCELMUTE_TRIGGER,
             MONITORING_TRIGGER_REQUIRES_AT_BOT,
             MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
-            mo_ph_body_ok,
+            body_ph,
             mo_ph_blocked_by_other,
+            bool((_lark_effective_bot_open_id() or "").strip()),
         )
         return
 
