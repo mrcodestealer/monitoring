@@ -2736,9 +2736,21 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
 
 
 def _monitoring_reply_to_card_md(reply: str) -> str:
-    s = (reply or "")[:3000]
-    s = s.replace("```", "'''")
-    return s
+    """
+    Feishu interactive-card ``markdown`` is picky: replacing ``` with ''' broke fences and left
+    ``time/value`` + dashed separator rows parsed as **table/setext** → huge header-like text.
+    Drop dash-only separator lines; keep real ``` fences (JSON-escaped by ``json.dumps``).
+    Length is capped earlier in :func:`_lark_send_monitoring_user_message`.
+    """
+    out: List[str] = []
+    for line in (reply or "").splitlines():
+        st = line.strip()
+        if st:
+            compact = st.replace("|", "").replace(" ", "")
+            if compact and all(c == "-" for c in compact):
+                continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def _monitoring_card_body_md_strip_title(reply: str) -> str:
@@ -5277,7 +5289,7 @@ def _format_alert_series_table_footer(
         return f"{title}\n(no points)"
     cap = MONITORING_TABLE_TAIL_ROWS if max_rows is None else max(1, min(99, int(max_rows)))
     tail = pts[-cap:]
-    rows = ["```text", "time           value", "-------------  ------------"]
+    rows = ["```text", "time           value"]
     for pair in tail:
         rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
     rows.append("```")
@@ -5304,7 +5316,7 @@ def _format_simple_series_alert_block(
         return "\n".join(head + ["(no points in window)"])
     cap = MONITORING_TABLE_TAIL_ROWS if max_rows is None else max(1, min(99, int(max_rows)))
     tail = pts[-cap:]
-    rows = ["```text", "time           value", "-------------  ------------"]
+    rows = ["```text", "time           value"]
     for pair in tail:
         rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
     rows.append("```")
@@ -5623,7 +5635,7 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
         lines.append(f"[{title}] series: {series}")
         if pts2:
             tail2 = pts2[-max_rows:]
-            rows2: List[str] = ["time           value", "-------------  ------------"]
+            rows2: List[str] = ["time           value"]
             for pair in tail2:
                 rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
             lines.append("```text")
@@ -5657,7 +5669,7 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             lines.append("")
             lines.append(f"[{ref}] {legend}")
             tail = vals[-max_rows:]
-            rows: List[str] = ["time           value", "-------------  ------------"]
+            rows: List[str] = ["time           value"]
             for pair in tail:
                 rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
             lines.append("```text")
