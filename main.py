@@ -171,8 +171,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
     # 本仓库 = Grafana **Platform** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_0bfd185231d6beb669425fdf8f13e9df",
-    # 同一机器人在飞书里可能出现的其它 open_id（逗号/空格）；与上一项及运行时 bot/v3/info **并集** 匹配
-    "MONITORING_CANONICAL_BOT_OPEN_IDS": "ou_ee1af664e18d9c2d25e0ab6fded66388",
+    # 同一机器人在飞书里可能出现的其它 open_id（逗号/空格）；租户/会话可能再变一条 —— _disjoint 非 peer-only 时会 fall through
+    "MONITORING_CANONICAL_BOT_OPEN_IDS": "ou_ee1af664e18d9c2d25e0ab6fded66388 ou_04878d0cdae2ca774e1d4a1716fa9ac3",
     # Game bot 可能出现的 open_id（逗号/空格）。正文 ``<at>`` 只指向 Game 时 Platform 不 weak 触发
     "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed ou_848fc4640b48b9845cbc5b0cfa2f1af1",
     "LARK_ENCRYPT_KEY": "",
@@ -1567,8 +1567,10 @@ def _text_should_run_monitoring(
     When ``mentions[]`` is weak but ``content`` still has ``<at …>`` with **this** bot's ``open_id``
     (needs ``LARK_BOT_OPEN_ID`` or ``bot/v3/info``), ``/mo`` triggers even if ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``.
 
-    ``MONITORING_CANONICAL_BOT_OPEN_ID`` / ``MONITORING_CANONICAL_BOT_OPEN_IDS`` / runtime ``bot/v3/info``: merged set;
-    when non-empty and explicit ``ou_``/``cli_`` targets exist, trigger only if sets **intersect**.
+    ``MONITORING_CANONICAL_BOT_OPEN_ID`` / ``MONITORING_CANONICAL_BOT_OPEN_IDS`` / runtime ``bot/v3/info``: merged set.
+    If explicit ``ou_``/``cli_`` targets **intersect** it → trigger. If **disjoint**, **skip only** when every explicit
+    id is in ``MONITORING_PEER_BOT_OPEN_IDS`` (user @'d **only** the other bot); otherwise **fall through** — Feishu
+    may send an ``open_id`` variant not yet listed in canon.
     """
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
@@ -1582,18 +1584,29 @@ def _text_should_run_monitoring(
         canon_ids = _monitoring_canonical_open_id_match_set()
         explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
         if canon_ids:
-            if explicit_ids and explicit_ids.isdisjoint(canon_ids):
-                logger.info(
-                    "monitoring /mo: skip — explicit @ targets %s disjoint from canonical open_id set %s",
-                    sorted(explicit_ids),
-                    sorted(canon_ids),
-                )
-                return False
             if explicit_ids and not explicit_ids.isdisjoint(canon_ids):
                 logger.info(
                     "monitoring /mo: trigger — explicit @ targets intersect canonical open_id set"
                 )
                 return True
+            if explicit_ids and explicit_ids.isdisjoint(canon_ids):
+                peer_only = (
+                    bool(MONITORING_PEER_BOT_OPEN_ID_SET)
+                    and explicit_ids <= MONITORING_PEER_BOT_OPEN_ID_SET
+                )
+                if peer_only:
+                    logger.info(
+                        "monitoring /mo: skip — explicit @ targets %s are peer-only "
+                        "(subset of MONITORING_PEER_BOT_OPEN_IDS)",
+                        sorted(explicit_ids),
+                    )
+                    return False
+                logger.info(
+                    "monitoring /mo: explicit @ targets %s disjoint from canonical %s — fall through "
+                    "(not peer-only; checking mentions/content)",
+                    sorted(explicit_ids),
+                    sorted(canon_ids),
+                )
         if _lark_message_mentions_bot(mentions):
             return True
         cat_ids = [str(x).strip() for x in (content_at_entity_ids or []) if str(x).strip()]
