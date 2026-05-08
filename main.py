@@ -20,7 +20,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 用于 **mentions 为空** 时的 ``@_user_N`` 兜底。与 Game 同群时请保持 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，并把 **Game** 的 ``open_id`` 填入 ``MONITORING_PEER_BOT_OPEN_IDS``（正文 ``<at user_id=…>`` 仅指向 Game 时不再误触发）。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
 User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` (``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``; HTTP may need ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` for ``@_user_N`` text), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
-默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
+默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：与 Game bot 一致，**一条** 交互卡片（``msg_type=interactive``），底部可有 ``MONITORING_MESSAGE_CARD_BUTTON_*``（如 **Resend screenshot**）。设 ``0`` 则为纯文字 + 独立 PNG，**无卡片按钮**。需在飞书应用开通「发送消息卡片」权限。
 
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
 
@@ -174,7 +174,7 @@ _CFG: Dict[str, Any] = {
     # 同一机器人在飞书里可能出现的其它 open_id（逗号/空格）；租户/会话可能再变一条 —— _disjoint 非 peer-only 时会 fall through
     "MONITORING_CANONICAL_BOT_OPEN_IDS": "ou_ee1af664e18d9c2d25e0ab6fded66388 ou_04878d0cdae2ca774e1d4a1716fa9ac3",
     # Game bot 可能出现的 open_id（逗号/空格）。正文 ``<at>`` 只指向 Game 时 Platform 不 weak 触发
-    "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed ou_848fc4640b48b9845cbc5b0cfa2f1af1",
+    "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed ou_848fc4640b48b9845cbc5b0cfa2f1af1 ou_a51dad55e46f665d740b85c5ae22f940",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -194,7 +194,7 @@ _CFG: Dict[str, Any] = {
     "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     # 1=当配置 ws 模式但尚未收到任何 WS DATA 帧时，允许 HTTP IM 回退处理（避免 200 但无回复）
     "LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA": "1",
-    # 1=监控摘要用 **一条** 飞书交互卡片
+    # 1=监控摘要一条交互卡片（与 Game 一致，才有 Resend screenshot 等卡片按钮）；0=纯文字 + 独立 PNG（无按钮）
     "MONITORING_MESSAGE_CARD_ENABLE": "1",
     # 1=把截图嵌进卡片；0=卡片仅文字，截图在下一条消息单独发送
     "MONITORING_CARD_EMBED_SCREENSHOT": "0",
