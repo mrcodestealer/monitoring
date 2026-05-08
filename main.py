@@ -1438,7 +1438,7 @@ _LARK_AT_ENTITY_ID_IN_CONTENT_RE = re.compile(
     re.IGNORECASE,
 )
 _LARK_AT_ID_ATTR_OU_CLI_RE = re.compile(
-    r"<at\b[^>]*?\bid\s*=\s*[\"']((?:?:ou_|cli_)[^\"']+)[\"']",
+    r"<at\b[^>]*?\bid\s*=\s*[\"']((?:ou_|cli_)[^\"']+)[\"']",
     re.IGNORECASE,
 )
 
