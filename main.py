@@ -19,7 +19,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
 群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；HTTP 常不带 ``mentions``，默认 ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` 在正文仍含 ``@_user_N`` 时也允许 ``/mo``。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
-User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` monitoring (when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
+User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` (``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``; HTTP may need ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` for ``@_user_N`` text), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
 
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
@@ -6420,7 +6420,7 @@ def webhook_event():
 
     if request.method == "GET":
         # No secrets — use to confirm env + URL reachability from browser/curl.
-        _listen_port = _cfg_listen_port(5002)
+        _listen_port = _cfg_listen_port()
         app_id = (APP_ID or "").strip()
         lark_sdk_version: Optional[str] = None
         try:
@@ -6482,7 +6482,7 @@ def webhook_event():
                     "飞书约 3s 超时：请用 python main.py 启动；webhook 先 200，Grafana 在后台线程执行。",
                     "发消息依赖 lark-oapi：pip install -U lark-oapi；GET 本 URL 可查看 lark_oapi_version。",
                     "lark_oapi_installed=false 只影响发消息，不影响「请求 URL 校验」；校验失败多半是 VERIFICATION_TOKEN 与后台不一致。",
-                    "若用 systemd：可在 unit 里 Environment=VERIFICATION_TOKEN=… / Environment=PORT=5002（与同机 Chatbox 的 5000 区分），或 EnvironmentFile=-/path/to/.env；修改后 daemon-reload && restart。",
+                    "若用 systemd：可在 unit 里 Environment=VERIFICATION_TOKEN=… / Environment=PORT=5002（grafanaplatformbot 默认 5002；同机 grafanagamebot 常用 5088；Chatbox 5000）；修改后 daemon-reload && restart。",
                     f"若飞书提示 3s 超时：云厂商安全组/防火墙须放行公网入站 TCP {_listen_port}；本机 curl -m 5 -X POST http://IP:{_listen_port}/webhook/event -H Content-Type:application/json -d '{{...}}' 测连通。",
                     "仍超时：核对控制台 URL 与监听一致（http/https）；排查时设 LARK_WEBHOOK_WSGI_LOG=1 再看 journal。",
                     "curl 勿只发 {\"challenge\":\"ping\"}→403 正常；应用 {\"type\":\"url_verification\",\"token\":\"…\",\"challenge\":\"ping\"} 测 POST 延迟。",
@@ -6626,7 +6626,7 @@ def run_monitoring_bot() -> None:
     )
     _start_grafana_playwright_keeper_if_enabled()
     _start_monitoring_watchdog_if_enabled()
-    port = _cfg_listen_port(5002)
+    port = _cfg_listen_port()
     if MONITORING_AT_MENTION_ENABLE or MONITORING_TRIGGER_REQUIRES_AT_BOT:
         _oid = _lark_effective_bot_open_id()
         if MONITORING_AT_MENTION_ENABLE and not _oid:
@@ -6634,9 +6634,16 @@ def run_monitoring_bot() -> None:
                 "MONITORING_AT_MENTION_ENABLE is on but bot open_id unknown — set LARK_BOT_OPEN_ID or ensure bot/v3/info works."
             )
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _oid:
-            logger.warning(
-                "MONITORING_TRIGGER_REQUIRES_AT_BOT is on but bot open_id unknown — @ /mo will not match; set LARK_BOT_OPEN_ID, fix APP_ID/APP_SECRET for bot/v3/info, or set MONITORING_TRIGGER_REQUIRES_AT_BOT=0."
-            )
+            if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER:
+                logger.info(
+                    "MONITORING_TRIGGER_REQUIRES_AT_BOT: bot open_id unresolved — /mo may still run when HTTP text "
+                    "contains Feishu @_user_N (MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1); set LARK_BOT_OPEN_ID for strict mention matching."
+                )
+            else:
+                logger.warning(
+                    "MONITORING_TRIGGER_REQUIRES_AT_BOT is on but bot open_id unknown — @ /mo will not match; set LARK_BOT_OPEN_ID, "
+                    "fix APP_ID/APP_SECRET for bot/v3/info, enable MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER for HTTP, or set MONITORING_TRIGGER_REQUIRES_AT_BOT=0."
+                )
     if int(GRAFANA_QUERY_LOOKBACK_SECONDS) != 900:
         logger.warning(
             "GRAFANA_QUERY_LOOKBACK_SECONDS=%s (default 900 = 15m) — /monitoring Prometheus window differs from default 15 minutes",
