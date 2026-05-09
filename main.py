@@ -169,12 +169,14 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 0=禁止「非空弱 mentions + @_user_N」跑 /mo — 与 Game bot 同群时勿改 1，否则会对方 @ Game 你也回
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
+    # 1=仅一条 mentions 且 open_id 为 **Game** peer、正文 @_user_N + /mo|/m|/c 时仍触发 Platform（对称 Game bot；飞书常绑错 ou_）；**0** 恢复严格 primary
+    "MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION": "1",
     # 本仓库 = Grafana **Platform** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_0bfd185231d6beb669425fdf8f13e9df",
     # 同一 Platform 应用在飞书里可能出现的其它 open_id（重装/多实例投递时 mentions 仍可能带旧 ou_）
     "MONITORING_CANONICAL_BOT_OPEN_IDS": "ou_ee1af664e18d9c2d25e0ab6fded66388 ou_04878d0cdae2ca774e1d4a1716fa9ac3",
-    # Grafana **Game** Bot open_id（逗号/空格列多条）。正文 ``<at>`` 只指向 Game 时 Platform 不 weak 触发
-    "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed",
+    # Game 机器人可能出现的全部 ou_（含历史 alternate）
+    "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed ou_848fc4640b48b9845cbc5b0cfa2f1af1 ou_a51dad55e46f665d740b85c5ae22f940",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "ou_0bfd185231d6beb669425fdf8f13e9df",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -716,7 +718,30 @@ LARK_ENCRYPT_KEY = (
     or _cfg_str("FEISHU_ENCRYPT_KEY")
     or ""
 ).strip()
-LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
+
+MONITORING_PEER_BOT_OPEN_ID_SET: Set[str] = {
+    p.strip()
+    for p in re.split(r"[\s,;]+", _cfg_str("MONITORING_PEER_BOT_OPEN_IDS", "").strip())
+    if p.strip()
+}
+
+_PLATFORM_EMBEDDED_CANONICAL_IDS: Tuple[str, ...] = (
+    "ou_0bfd185231d6beb669425fdf8f13e9df",
+    "ou_ee1af664e18d9c2d25e0ab6fded66388",
+    "ou_04878d0cdae2ca774e1d4a1716fa9ac3",
+)
+
+_lark_oid_cfg = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
+if not _lark_oid_cfg or _lark_oid_cfg in MONITORING_PEER_BOT_OPEN_ID_SET:
+    LARK_BOT_OPEN_ID = "ou_0bfd185231d6beb669425fdf8f13e9df"
+    if _lark_oid_cfg and _lark_oid_cfg in MONITORING_PEER_BOT_OPEN_ID_SET:
+        logger.warning(
+            "LARK_BOT_OPEN_ID=%r is a Game peer id on grafanaplatformbot — using embedded Platform bot open_id",
+            _lark_oid_cfg,
+        )
+else:
+    LARK_BOT_OPEN_ID = _lark_oid_cfg
+
 MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
 MONITORING_TRIGGER_REQUIRES_AT_BOT = _lark_env_truthy("MONITORING_TRIGGER_REQUIRES_AT_BOT")
@@ -729,17 +754,29 @@ MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW = _lark_env_truthy_or_default(
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW",
     default=False,
 )
-MONITORING_PEER_BOT_OPEN_ID_SET: Set[str] = {
-    p.strip()
-    for p in re.split(r"[\s,;]+", _cfg_str("MONITORING_PEER_BOT_OPEN_IDS", "").strip())
-    if p.strip()
-}
-MONITORING_CANONICAL_BOT_OPEN_ID = _cfg_str("MONITORING_CANONICAL_BOT_OPEN_ID", "").strip()
-MONITORING_CANONICAL_BOT_OPEN_ID_EXTRA_SET: Set[str] = {
+MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION = _lark_env_truthy_or_default(
+    "MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION",
+    default=True,
+)
+
+_cfg_canon_primary = _cfg_str("MONITORING_CANONICAL_BOT_OPEN_ID", "").strip()
+if not _cfg_canon_primary or _cfg_canon_primary in MONITORING_PEER_BOT_OPEN_ID_SET:
+    MONITORING_CANONICAL_BOT_OPEN_ID = "ou_0bfd185231d6beb669425fdf8f13e9df"
+    if _cfg_canon_primary and _cfg_canon_primary in MONITORING_PEER_BOT_OPEN_ID_SET:
+        logger.warning(
+            "MONITORING_CANONICAL_BOT_OPEN_ID=%r is a Game peer id — using embedded Platform canonical",
+            _cfg_canon_primary,
+        )
+else:
+    MONITORING_CANONICAL_BOT_OPEN_ID = _cfg_canon_primary
+
+_extra_canon_cfg = {
     p.strip()
     for p in re.split(r"[\s,;]+", _cfg_str("MONITORING_CANONICAL_BOT_OPEN_IDS", "").strip())
     if p.strip()
 }
+MONITORING_CANONICAL_BOT_OPEN_ID_EXTRA_SET = set(_PLATFORM_EMBEDDED_CANONICAL_IDS) | _extra_canon_cfg
+
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
 # Default on: plain ``_lark_env_truthy`` treats unset as False — missing key meant no interactive card.
 MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy_or_default(
@@ -1269,9 +1306,43 @@ def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
                     text = text.replace(str(k), "")
     text = re.sub(r"@_user_\d+", "", text)
     text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"[\u200b\uFEFF\u00A0]", "", text)
+    text = re.sub(r"[\u200b-\u200f\u2060\uFEFF\u00A0]", "", text)
+    for ch in ("\uff0f", "\u2215", "\u2044", "\u29f8"):
+        text = text.replace(ch, "/")
     text = text.replace("／", "/").replace("＼", "\\")
     text = re.sub(r"\s+", " ", text).strip()
+    # Rich-text-only payloads may leave ``@Bot Display Name`` before ``/mo`` when ``mentions=[]``.
+    triggers = sorted(
+        {
+            ((MONITORING_TRIGGER or "").strip() or "/mo"),
+            ((MONITORING_MUTE_TRIGGER or "").strip() or "/m"),
+            ((MONITORING_CANCELMUTE_TRIGGER or "").strip() or "/c"),
+        },
+        key=len,
+        reverse=True,
+    )
+    for tri in triggers:
+        if len(tri) < 2 or not tri.startswith("/"):
+            continue
+        m_cmd = re.search(re.escape(tri) + r"(?:\s|$)", text, flags=re.IGNORECASE)
+        if m_cmd:
+            return text[m_cmd.start() :].strip()
+    tl = text.casefold()
+    for tri in triggers:
+        if len(tri) < 2 or not tri.startswith("/"):
+            continue
+        tri_cf = tri.casefold()
+        start = 0
+        while True:
+            pos = tl.find(tri_cf, start)
+            if pos < 0:
+                break
+            prev_ok = pos == 0 or tl[pos - 1].isspace()
+            endpos = pos + len(tri_cf)
+            next_ok = endpos >= len(tl) or tl[endpos].isspace()
+            if prev_ok and next_ok:
+                return text[pos:].strip()
+            start = pos + 1
     return text
 
 
@@ -1322,11 +1393,15 @@ def _lark_message_mentions_bot(mentions: Any) -> bool:
         return False
     app = (str(APP_ID).strip() if APP_ID else "") or ""
     bot = _lark_effective_bot_open_id()
-    if not bot and not app:
+    canon_self = _monitoring_canonical_open_id_match_set()
+    if not bot and not app and not canon_self:
         return False
     for m in mentions:
         if not isinstance(m, dict):
             continue
+        row_oid = _lark_mention_row_main_open_id(m)
+        if row_oid and row_oid in canon_self:
+            return True
         if app:
             for ak in ("app_id", "appId"):
                 av = m.get(ak)
@@ -1352,7 +1427,7 @@ def _lark_message_mentions_bot(mentions: Any) -> bool:
                 if v and str(v).strip() == bot:
                     return True
         # Nested / newer payload shapes (still one mention entity — avoid missing open_id under unknown keys).
-        if bot or app:
+        if bot or app or canon_self:
             n = 0
             for s in _lark_iter_mention_scalar_strings(m):
                 n += 1
@@ -1361,6 +1436,36 @@ def _lark_message_mentions_bot(mentions: Any) -> bool:
                 if bot and s == bot:
                     return True
                 if app and s == app:
+                    return True
+                if (
+                    canon_self
+                    and _lark_string_is_strong_feishu_at_target(s)
+                    and s in canon_self
+                ):
+                    return True
+    return False
+
+
+def _lark_mentions_any_row_matches_app(mentions_list: List[Any], app: str) -> bool:
+    """
+    True when any ``mentions[]`` row carries this Lark app's ``app_id``.
+
+    Feishu occasionally binds ``@_user_N`` / ``open_id`` to a peer bot while the row still encodes this
+    app's ``app_id`` — strict ``primary open_id`` would skip incorrectly.
+    """
+    ap = (app or "").strip()
+    if not ap:
+        return False
+    for m in mentions_list:
+        if not isinstance(m, dict):
+            continue
+        for ak in ("app_id", "appId"):
+            if str(m.get(ak) or "").strip() == ap:
+                return True
+        ido = m.get("id")
+        if isinstance(ido, dict):
+            for ak in ("app_id", "appId"):
+                if str(ido.get(ak) or "").strip() == ap:
                     return True
     return False
 
@@ -1592,6 +1697,8 @@ def _lark_primary_strong_from_feishu_user_placeholders(
                 key_to_oid[ks] = oid
                 if ks.startswith("@"):
                     key_to_oid.setdefault(ks[1:], oid)
+                elif ks.startswith("_user_"):
+                    key_to_oid.setdefault("@" + ks, oid)
 
     for mm in re.finditer(r"@_user_(\d+)", raw_text):
         tok = mm.group(0)
@@ -1626,9 +1733,16 @@ def _lark_primary_strong_from_mentions_visible_order(
         if not isinstance(m, dict):
             continue
         keys_to_try: List[str] = []
-        k = m.get("key") or m.get("Key")
-        if k:
-            keys_to_try.append(str(k))
+        for fk in ("key", "Key", "mention_key", "mentionKey"):
+            k = m.get(fk)
+            if not k:
+                continue
+            ks = str(k).strip()
+            if not ks:
+                continue
+            keys_to_try.append(ks)
+            if ks.startswith("_user_"):
+                keys_to_try.append("@" + ks)
         nm = m.get("name") or m.get("Name")
         if nm:
             keys_to_try.append(f"@{nm}")
@@ -1658,8 +1772,8 @@ def _monitoring_resolved_primary_at_target(
     """
     Resolve primary @ target for shared multi-bot groups:
 
-    1. Feishu ``@_user_N`` placeholders (``mentions[].key`` if present, else row ``mentions[N-1]``).
-    2. If ``@_user_`` appears anywhere, leftmost ``key`` / ``@name`` match (before parsing body ``<at>``).
+    1. Leftmost visible ``key`` / ``mention_key`` / ``@name`` match in plain text (preferred over raw ``mentions[]`` order).
+    2. First ``@_user_N`` token mapped via ``mentions[].key`` when present, else ``mentions[N-1]`` (1-based index).
     3. When **several bot-like mentions** exist and visible body has **exactly one** ``<at>`` in the peer/canon bag,
        use that id (avoids trusting a misleading first tag when two bots appear in ``mentions[]``).
     4. Strong ids from visible ``<at user_id=…>`` in message body (metadata-safe blobs only).
@@ -1674,10 +1788,8 @@ def _monitoring_resolved_primary_at_target(
             rt = alt
         elif not (rt or "").strip():
             rt = alt
+    vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
     ph = _lark_primary_strong_from_feishu_user_placeholders(rt, mentions_list)
-    vis_early: Optional[str] = None
-    if "@_user_" in rt:
-        vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
 
     distinct_bot_like: Set[str] = set()
     body_chain: List[str] = []
@@ -1701,18 +1813,15 @@ def _monitoring_resolved_primary_at_target(
             vis_early,
         )
 
-    if ph:
-        return ph
     if vis_early:
         return vis_early
+    if ph:
+        return ph
     if len(distinct_bot_like) >= 2 and len(body_chain) == 1:
         return body_chain[0]
     b = _lark_primary_strong_at_from_im_message(msg)
     if b:
         return b
-    vis = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
-    if vis:
-        return vis
     return _lark_primary_strong_from_mentions_order(mentions_list)
 
 
@@ -1911,14 +2020,63 @@ def _monitoring_at_bot_requirement_satisfied(
         raw_text,
         bot_like_bag=canon_ids | MONITORING_PEER_BOT_OPEN_ID_SET,
     )
+    app = str(APP_ID or "").strip()
+    row_app_id_is_self = bool(app and _lark_mentions_any_row_matches_app(mentions_list, app))
+    cl = _lark_clean_command_text(raw_text, mentions_list)
+    if (
+        MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION
+        and MONITORING_PEER_BOT_OPEN_ID_SET
+        and len(mentions_list) == 1
+    ):
+        one = mentions_list[0]
+        sole = _lark_mention_row_main_open_id(one) if isinstance(one, dict) else ""
+        mo_hit = _im_command_matches(cl, MONITORING_TRIGGER)
+        mute_hit = _im_command_matches(cl, MONITORING_MUTE_TRIGGER)
+        cancel_hit = _im_command_matches(cl, MONITORING_CANCELMUTE_TRIGGER)
+        if (
+            sole
+            and sole in MONITORING_PEER_BOT_OPEN_ID_SET
+            and _lark_raw_text_has_feishu_at_placeholder(raw_text)
+            and (mo_hit or mute_hit or cancel_hit)
+            and not _lark_body_peer_only_strong_at_targets(
+                content_at_entity_ids,
+                MONITORING_PEER_BOT_OPEN_ID_SET,
+            )
+        ):
+            tri = (
+                (MONITORING_TRIGGER or "/mo")
+                if mo_hit
+                else ((MONITORING_MUTE_TRIGGER or "/m") if mute_hit else (MONITORING_CANCELMUTE_TRIGGER or "/c"))
+            )
+            logger.info(
+                "monitoring %s: trigger — single peer mention + @_user_N "
+                "(MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION; Feishu open_id/placeholder skew)",
+                tri,
+            )
+            return True
 
     if canon_ids and primary and primary not in canon_ids:
-        logger.info(
-            "monitoring: skip — primary @ target %r is not this bot (canonical=%s)",
-            primary,
-            sorted(canon_ids),
-        )
-        return False
+        if row_app_id_is_self:
+            logger.info(
+                "monitoring: primary @ open_id=%r not in canonical but mention row app_id matches "
+                "this app — continuing (Feishu open_id/placeholder skew)",
+                primary,
+            )
+        elif primary in MONITORING_PEER_BOT_OPEN_ID_SET:
+            logger.info(
+                "monitoring: skip — primary @ target %r is the configured peer bot (Game), "
+                "not Platform (canonical=%s).",
+                primary,
+                sorted(canon_ids),
+            )
+        else:
+            logger.info(
+                "monitoring: skip — primary @ target %r is not this bot (canonical=%s)",
+                primary,
+                sorted(canon_ids),
+            )
+        if not row_app_id_is_self:
+            return False
 
     if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_group_multi_bot_first_mention_gate(
         chat_type=chat_type,
@@ -2000,6 +2158,13 @@ def _monitoring_at_bot_requirement_satisfied(
             if primary in canon_ids:
                 logger.info(
                     "monitoring /mo: trigger — mentions include this bot and primary @ matches canonical"
+                )
+                return True
+            if row_app_id_is_self:
+                logger.info(
+                    "monitoring /mo: trigger — mentions include this bot (app_id) while primary "
+                    "open_id=%r is not canonical (Feishu skew)",
+                    primary,
                 )
                 return True
             logger.info(
@@ -3822,7 +3987,21 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     ``#dock-menu-button``（aria-label Dock menu）常在 ``[data-testid='data-testid navigation mega-menu']``
     对话框内；使用 ``visible`` 等待 + ``force=True`` 避免被遮罩/动画挡住导致 silent 失败。
     若仍无按钮则尝试打开 #mega-menu-toggle 后再点 Dock。
+
+    Set ``GRAFANA_SCREENSHOT_PAGE_RELOAD_INSTEAD_OF_DOCK=1`` to call ``page.reload()`` instead of Dock clicks.
     """
+    if _lark_env_truthy("GRAFANA_SCREENSHOT_PAGE_RELOAD_INSTEAD_OF_DOCK"):
+        t = min(25000, max(5000, int(timeout_ms)))
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=t)
+            page.wait_for_timeout(400)
+            logger.info(
+                "Grafana screenshot: page.reload() instead of Dock menu "
+                "(GRAFANA_SCREENSHOT_PAGE_RELOAD_INSTEAD_OF_DOCK=1)"
+            )
+        except Exception as e:
+            logger.warning("Grafana screenshot: page.reload failed: %s", e)
+        return
     if not _lark_env_truthy("GRAFANA_SCREENSHOT_DOCK_NAV"):
         return
     t = min(25000, max(5000, int(timeout_ms)))
