@@ -1542,14 +1542,62 @@ def _lark_distinct_strong_bot_like_ids_in_mentions(
     return out
 
 
+def _lark_primary_strong_from_mentions_visible_order(
+    raw_text: str, mentions_list: List[Any]
+) -> Optional[str]:
+    """
+    Feishu often shows ``@_user_N`` in visible text while ``mentions[]`` array order **does not** match the UI.
+    Pick the strong ``open_id`` whose mention ``key`` (or ``@name``) appears **leftmost** in ``raw_text``.
+    """
+    if not raw_text or not mentions_list:
+        return None
+    rt = raw_text
+    candidates: List[Tuple[int, str]] = []
+    for m in mentions_list:
+        if not isinstance(m, dict):
+            continue
+        keys_to_try: List[str] = []
+        k = m.get("key") or m.get("Key")
+        if k:
+            keys_to_try.append(str(k))
+        nm = m.get("name") or m.get("Name")
+        if nm:
+            keys_to_try.append(f"@{nm}")
+        pos: Optional[int] = None
+        for kt in keys_to_try:
+            p = rt.find(kt)
+            if p >= 0 and (pos is None or p < pos):
+                pos = p
+        if pos is None:
+            continue
+        oid = _lark_mention_row_main_open_id(m)
+        if oid and _lark_string_is_strong_feishu_at_target(oid):
+            candidates.append((pos, oid))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
 def _monitoring_resolved_primary_at_target(
     msg: Optional[Dict[str, Any]],
     mentions_list: List[Any],
+    raw_text: str = "",
 ) -> Optional[str]:
-    """Prefer first strong id from body ``<at>`` tags; else first strong id in ``mentions[]`` order."""
+    """
+    Prefer **visible** ``@_user_N`` order when several mentions exist (Feishu ``mentions[]`` order often ≠ UI).
+    Then body ``<at user_id=…>`` tags; then ``mentions[]`` row order.
+    """
+    if raw_text and "@_user_" in raw_text and len(mentions_list) >= 2:
+        vis0 = _lark_primary_strong_from_mentions_visible_order(raw_text, mentions_list)
+        if vis0:
+            return vis0
     b = _lark_primary_strong_at_from_im_message(msg)
     if b:
         return b
+    vis = _lark_primary_strong_from_mentions_visible_order(raw_text, mentions_list)
+    if vis:
+        return vis
     return _lark_primary_strong_from_mentions_order(mentions_list)
 
 
@@ -1742,7 +1790,7 @@ def _monitoring_at_bot_requirement_satisfied(
         mentions_list = []
     canon_ids = _monitoring_canonical_open_id_match_set()
     explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
-    primary = _monitoring_resolved_primary_at_target(msg, mentions_list)
+    primary = _monitoring_resolved_primary_at_target(msg, mentions_list, raw_text)
 
     if canon_ids and primary and primary not in canon_ids:
         logger.info(
