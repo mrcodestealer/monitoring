@@ -1548,6 +1548,40 @@ def _lark_distinct_strong_bot_like_ids_in_mentions(
     return out
 
 
+def _lark_primary_strong_from_feishu_user_placeholders(
+    raw_text: str, mentions_list: List[Any]
+) -> Optional[str]:
+    """
+    Walk ``@_user_N`` tokens **left-to-right** in the visible text and map each token to the mention row whose
+    ``key``/``Key`` equals that exact string, returning the first mapped strong ``open_id``.
+
+    Feishu binds ``@_user_1`` to a specific mention row; this matches that semantics and avoids treating an
+    unrelated ``<at user_id=…>`` segment (often wrong order) as primary when placeholder resolution is enough.
+    """
+    if not raw_text or not mentions_list:
+        return None
+    key_to_oid: Dict[str, str] = {}
+    for m in mentions_list:
+        if not isinstance(m, dict):
+            continue
+        k = m.get("key") or m.get("Key")
+        if not k:
+            continue
+        ks = str(k).strip()
+        if not ks:
+            continue
+        oid = _lark_mention_row_main_open_id(m)
+        if oid and _lark_string_is_strong_feishu_at_target(oid):
+            key_to_oid[ks] = oid
+    if not key_to_oid:
+        return None
+    for mm in re.finditer(r"@_user_\d+", raw_text):
+        oid = key_to_oid.get(mm.group(0))
+        if oid:
+            return oid
+    return None
+
+
 def _lark_primary_strong_from_mentions_visible_order(
     raw_text: str, mentions_list: List[Any]
 ) -> Optional[str]:
@@ -1591,17 +1625,25 @@ def _monitoring_resolved_primary_at_target(
     raw_text: str = "",
 ) -> Optional[str]:
     """
-    Prefer **visible** ``@_user_N`` order when several mentions exist (Feishu ``mentions[]`` order often ≠ UI).
-    Then body ``<at user_id=…>`` tags; then ``mentions[]`` row order.
+    Resolve primary @ target for shared multi-bot groups:
+
+    1. Feishu ``@_user_N`` placeholders in document order (bound via ``mentions[].key``).
+    2. If ``@_user_`` appears anywhere, leftmost ``key`` / ``@name`` match (before parsing body ``<at>``).
+    3. Strong ids from visible ``<at user_id=…>`` in message body (metadata-safe blobs only).
+    4. ``mentions[]`` row order.
     """
-    if raw_text and "@_user_" in raw_text and len(mentions_list) >= 2:
-        vis0 = _lark_primary_strong_from_mentions_visible_order(raw_text, mentions_list)
-        if vis0:
-            return vis0
+    rt = raw_text or ""
+    ph = _lark_primary_strong_from_feishu_user_placeholders(rt, mentions_list)
+    if ph:
+        return ph
+    if "@_user_" in rt:
+        vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
+        if vis_early:
+            return vis_early
     b = _lark_primary_strong_at_from_im_message(msg)
     if b:
         return b
-    vis = _lark_primary_strong_from_mentions_visible_order(raw_text, mentions_list)
+    vis = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
     if vis:
         return vis
     return _lark_primary_strong_from_mentions_order(mentions_list)
