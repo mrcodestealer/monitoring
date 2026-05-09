@@ -2093,9 +2093,11 @@ def _monitoring_at_bot_requirement_satisfied(
                     )
                     return False
                 logger.info(
-                    "monitoring /mo: explicit meta peer-only %s but body lacks peer-only <at> — fall through",
+                    "monitoring /mo: skip — explicit meta peer-only %s and body lacks "
+                    "peer <at> confirmation; treating as peer-addressed (MONITORING_PEER_BOT_OPEN_IDS).",
                     sorted(explicit_ids),
                 )
+                return False
             else:
                 logger.info(
                     "monitoring /mo: skip — explicit @ targets %s disjoint from canonical %s "
@@ -2229,8 +2231,10 @@ def _text_should_run_monitoring(
     When ``mentions[]`` is weak but ``content`` still has ``<at …>`` with **this** bot's ``open_id``
     (needs ``LARK_BOT_OPEN_ID`` or ``bot/v3/info``), ``/mo`` triggers even if ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``.
 
-    ``MONITORING_CANONICAL_BOT_OPEN_ID`` / … merged set. Intersect → trigger. Disjoint → **hard skip** peer-only
-    only when **body** ``<at>`` confirms peer (not mentions-alone meta).
+    ``MONITORING_CANONICAL_BOT_OPEN_ID`` / … merged set. Intersect → trigger. If ``explicit_ids`` are **peer-only**
+    but body ``<at>`` lacks peer strong-id confirmation (placeholder-only), **skip** — no fall-through to weak-nonempty.
+
+    Disjoint non-peer explicit sets → skip as before.
     """
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
