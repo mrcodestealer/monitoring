@@ -1609,12 +1609,14 @@ def _monitoring_at_bot_requirement_satisfied(
                     "monitoring /mo: explicit meta peer-only %s but body lacks peer-only <at> — fall through",
                     sorted(explicit_ids),
                 )
-            logger.info(
-                "monitoring /mo: explicit @ targets %s disjoint from canonical %s — fall through "
-                "(not peer-only; checking mentions/content)",
-                sorted(explicit_ids),
-                sorted(canon_ids),
-            )
+            else:
+                logger.info(
+                    "monitoring /mo: skip — explicit @ targets %s disjoint from canonical %s "
+                    "(not subset of MONITORING_PEER_BOT_OPEN_IDS; user @'d another bot/app)",
+                    sorted(explicit_ids),
+                    sorted(canon_ids),
+                )
+                return False
     if _lark_message_mentions_bot(mentions):
         return True
     cat_ids = [str(x).strip() for x in (content_at_entity_ids or []) if str(x).strip()]
@@ -1659,6 +1661,18 @@ def _monitoring_at_bot_requirement_satisfied(
                     MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
                 )
                 return True
+        return False
+    if (
+        (not mentions_list)
+        and explicit_ids
+        and canon_ids
+        and explicit_ids.isdisjoint(canon_ids)
+    ):
+        logger.info(
+            "monitoring /mo: skip — mentions empty but explicit @ ids %s disjoint from canonical; "
+            "refuse @_user_N placeholder-only (wrong bot in same group)",
+            sorted(explicit_ids),
+        )
         return False
     if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and body_ph:
         logger.info(
