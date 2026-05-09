@@ -720,6 +720,7 @@ LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
 MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
 MONITORING_TRIGGER_REQUIRES_AT_BOT = _lark_env_truthy("MONITORING_TRIGGER_REQUIRES_AT_BOT")
+MONITORING_LOG_PRIMARY_AT = _lark_env_truthy("MONITORING_LOG_PRIMARY_AT")
 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER = _lark_env_truthy_or_default(
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER",
     default=True,
@@ -1515,6 +1516,23 @@ def _lark_primary_strong_at_from_im_message(msg: Optional[Dict[str, Any]]) -> Op
     return None
 
 
+def _lark_visible_bot_like_at_chain(
+    msg: Optional[Dict[str, Any]], bot_like_bag: Set[str]
+) -> List[str]:
+    """Strong ``ou_``/``cli_`` from visible ``<at>`` tags (document order), filtered to ``bot_like_bag``."""
+    if not isinstance(msg, dict) or not bot_like_bag:
+        return []
+    out: List[str] = []
+    for blob in _lark_im_content_blobs_for_at_parse(msg):
+        for x in _lark_ordered_strong_ids_from_at_tags(blob):
+            t = str(x).strip()
+            if t and _lark_string_is_strong_feishu_at_target(t) and t in bot_like_bag:
+                out.append(t)
+        if out:
+            return out
+    return []
+
+
 def _lark_primary_strong_from_mentions_order(mentions_list: List[Any]) -> Optional[str]:
     """First strong ``ou_``/``cli_`` in ``mentions[]`` iteration order (fallback when body tags omit ids)."""
     for m in mentions_list:
@@ -1552,11 +1570,9 @@ def _lark_primary_strong_from_feishu_user_placeholders(
     raw_text: str, mentions_list: List[Any]
 ) -> Optional[str]:
     """
-    Walk ``@_user_N`` tokens **left-to-right** in the visible text and map each token to the mention row whose
-    ``key``/``Key`` equals that exact string, returning the first mapped strong ``open_id``.
+    Resolve the first ``@_user_N`` in visible text to a strong ``open_id``.
 
-    Feishu binds ``@_user_1`` to a specific mention row; this matches that semantics and avoids treating an
-    unrelated ``<at user_id=…>`` segment (often wrong order) as primary when placeholder resolution is enough.
+    Uses ``mentions[].key`` / ``mention_key`` when present; otherwise maps ``@_user_N`` to ``mentions[N-1]`` (1-based).
     """
     if not raw_text or not mentions_list:
         return None
@@ -1564,19 +1580,32 @@ def _lark_primary_strong_from_feishu_user_placeholders(
     for m in mentions_list:
         if not isinstance(m, dict):
             continue
-        k = m.get("key") or m.get("Key")
-        if not k:
-            continue
-        ks = str(k).strip()
-        if not ks:
-            continue
         oid = _lark_mention_row_main_open_id(m)
-        if oid and _lark_string_is_strong_feishu_at_target(oid):
-            key_to_oid[ks] = oid
-    if not key_to_oid:
-        return None
+        if not oid or not _lark_string_is_strong_feishu_at_target(oid):
+            continue
+        for fk in ("key", "Key", "mention_key", "mentionKey"):
+            k = m.get(fk)
+            if not k:
+                continue
+            ks = str(k).strip()
+            if ks:
+                key_to_oid[ks] = oid
+                if ks.startswith("@"):
+                    key_to_oid.setdefault(ks[1:], oid)
+
     for mm in re.finditer(r"@_user_\d+", raw_text):
-        oid = key_to_oid.get(mm.group(0))
+        tok = mm.group(0)
+        n = int(mm.group(1))
+        idx = n - 1
+        oid_idx: Optional[str] = None
+        if 0 <= idx < len(mentions_list):
+            mrow = mentions_list[idx]
+            if isinstance(mrow, dict):
+                o2 = _lark_mention_row_main_open_id(mrow)
+                if o2 and _lark_string_is_strong_feishu_at_target(o2):
+                    oid_idx = o2
+        oid_key = key_to_oid.get(tok) or key_to_oid.get(tok.lstrip("@"))
+        oid: Optional[str] = oid_key or oid_idx
         if oid:
             return oid
     return None
@@ -1623,23 +1652,61 @@ def _monitoring_resolved_primary_at_target(
     msg: Optional[Dict[str, Any]],
     mentions_list: List[Any],
     raw_text: str = "",
+    *,
+    bot_like_bag: Optional[Set[str]] = None,
 ) -> Optional[str]:
     """
     Resolve primary @ target for shared multi-bot groups:
 
-    1. Feishu ``@_user_N`` placeholders in document order (bound via ``mentions[].key``).
+    1. Feishu ``@_user_N`` placeholders (``mentions[].key`` if present, else row ``mentions[N-1]``).
     2. If ``@_user_`` appears anywhere, leftmost ``key`` / ``@name`` match (before parsing body ``<at>``).
-    3. Strong ids from visible ``<at user_id=…>`` in message body (metadata-safe blobs only).
-    4. ``mentions[]`` row order.
+    3. When **several bot-like mentions** exist and visible body has **exactly one** ``<at>`` in the peer/canon bag,
+       use that id (avoids trusting a misleading first tag when two bots appear in ``mentions[]``).
+    4. Strong ids from visible ``<at user_id=…>`` in message body (metadata-safe blobs only).
+    5. ``mentions[]`` row order.
+
+    Set ``MONITORING_LOG_PRIMARY_AT=1`` for one-line diagnostics on the server.
     """
     rt = raw_text or ""
+    if isinstance(msg, dict):
+        alt = _lark_extract_plain_text_from_message(msg) or ""
+        if "@_user_" in alt:
+            rt = alt
+        elif not (rt or "").strip():
+            rt = alt
     ph = _lark_primary_strong_from_feishu_user_placeholders(rt, mentions_list)
-    if ph:
-        return ph
+    vis_early: Optional[str] = None
     if "@_user_" in rt:
         vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
-        if vis_early:
-            return vis_early
+
+    distinct_bot_like: Set[str] = set()
+    body_chain: List[str] = []
+    if bot_like_bag:
+        distinct_bot_like = _lark_distinct_strong_bot_like_ids_in_mentions(
+            mentions_list,
+            canon_ids=bot_like_bag,
+            peer_ids=bot_like_bag,
+        )
+        if len(distinct_bot_like) >= 2:
+            body_chain = _lark_visible_bot_like_at_chain(msg, bot_like_bag)
+
+    if MONITORING_LOG_PRIMARY_AT:
+        logger.info(
+            "monitoring primary-at dbg rt=%r mentions_n=%s distinct_bot_like=%s body_at_chain=%s ph=%s vis_early=%s",
+            (rt[:200] + ("…" if len(rt) > 200 else "")),
+            len(mentions_list),
+            sorted(distinct_bot_like),
+            body_chain,
+            ph,
+            vis_early,
+        )
+
+    if ph:
+        return ph
+    if vis_early:
+        return vis_early
+    if len(distinct_bot_like) >= 2 and len(body_chain) == 1:
+        return body_chain[0]
     b = _lark_primary_strong_at_from_im_message(msg)
     if b:
         return b
@@ -1838,7 +1905,12 @@ def _monitoring_at_bot_requirement_satisfied(
         mentions_list = []
     canon_ids = _monitoring_canonical_open_id_match_set()
     explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
-    primary = _monitoring_resolved_primary_at_target(msg, mentions_list, raw_text)
+    primary = _monitoring_resolved_primary_at_target(
+        msg,
+        mentions_list,
+        raw_text,
+        bot_like_bag=canon_ids | MONITORING_PEER_BOT_OPEN_ID_SET,
+    )
 
     if canon_ids and primary and primary not in canon_ids:
         logger.info(
