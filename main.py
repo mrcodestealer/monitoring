@@ -1458,11 +1458,8 @@ _LARK_AT_ID_ATTR_OU_CLI_RE = re.compile(
 )
 
 
-def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
-    """
-    Parse ``<at …>`` from **body fields only** (``content`` / ``text`` / ``body``). Do not scan the whole
-    envelope JSON — ``mentions[]`` ids there falsely imply a peer ``<at>`` in visible text (dual-bot groups).
-    """
+def _lark_im_content_blobs_for_at_parse(msg: Dict[str, Any]) -> List[str]:
+    """Raw JSON/text blobs from ``message`` that may contain ``<at …>`` tags (same fields as entity-id parse)."""
     blobs: List[str] = []
     if isinstance(msg, dict):
         raw_c = msg.get("content")
@@ -1476,6 +1473,92 @@ def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str
             v = msg.get(k)
             if isinstance(v, str) and v.strip():
                 blobs.append(v)
+    return blobs
+
+
+_LARK_AT_OPEN_TAG_RE = re.compile(r"<at\b[^>]*>", re.IGNORECASE)
+
+
+def _lark_ordered_strong_ids_from_at_tags(blob: str) -> List[str]:
+    """Strong ``ou_``/``cli_`` ids in **document order** (first ``<at…>`` first)."""
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    for tm in _LARK_AT_OPEN_TAG_RE.finditer(blob or ""):
+        tag = tm.group(0) or ""
+        for m in _LARK_AT_ENTITY_ID_IN_CONTENT_RE.finditer(tag):
+            s = m.group(1).strip()
+            if s and _lark_string_is_strong_feishu_at_target(s) and s not in seen:
+                seen.add(s)
+                ordered.append(s)
+        for m in _LARK_AT_ID_ATTR_OU_CLI_RE.finditer(tag):
+            s = m.group(1).strip()
+            if s and s not in seen:
+                seen.add(s)
+                ordered.append(s)
+    return ordered
+
+
+def _lark_primary_strong_at_from_im_message(msg: Optional[Dict[str, Any]]) -> Optional[str]:
+    """First strong bot/user id from ``<at>`` tags in message body fields (visible order)."""
+    if not isinstance(msg, dict):
+        return None
+    for blob in _lark_im_content_blobs_for_at_parse(msg):
+        ids = _lark_ordered_strong_ids_from_at_tags(blob)
+        if ids:
+            return ids[0]
+    return None
+
+
+def _lark_primary_strong_from_mentions_order(mentions_list: List[Any]) -> Optional[str]:
+    """First strong ``ou_``/``cli_`` in ``mentions[]`` iteration order (fallback when body tags omit ids)."""
+    for m in mentions_list:
+        if not isinstance(m, dict):
+            continue
+        for s in _lark_collect_mention_identity_strings_for_at_conflict(m):
+            t = str(s).strip()
+            if t and _lark_string_is_strong_feishu_at_target(t):
+                return t
+    return None
+
+
+def _lark_distinct_strong_bot_like_ids_in_mentions(
+    mentions_list: List[Any],
+    *,
+    canon_ids: Set[str],
+    peer_ids: Set[str],
+) -> Set[str]:
+    """Strong ids in mentions that look like this app or a configured peer bot (multi-bot guard)."""
+    out: Set[str] = set()
+    bag = canon_ids | peer_ids
+    if not bag:
+        return out
+    for m in mentions_list:
+        if not isinstance(m, dict):
+            continue
+        for s in _lark_collect_mention_identity_strings_for_at_conflict(m):
+            t = str(s).strip()
+            if t and _lark_string_is_strong_feishu_at_target(t) and t in bag:
+                out.add(t)
+    return out
+
+
+def _monitoring_resolved_primary_at_target(
+    msg: Optional[Dict[str, Any]],
+    mentions_list: List[Any],
+) -> Optional[str]:
+    """Prefer first strong id from body ``<at>`` tags; else first strong id in ``mentions[]`` order."""
+    b = _lark_primary_strong_at_from_im_message(msg)
+    if b:
+        return b
+    return _lark_primary_strong_from_mentions_order(mentions_list)
+
+
+def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
+    """
+    Parse ``<at …>`` from **body fields only** (``content`` / ``text`` / ``body``). Do not scan the whole
+    envelope JSON — ``mentions[]`` ids there falsely imply a peer ``<at>`` in visible text (dual-bot groups).
+    """
+    blobs = _lark_im_content_blobs_for_at_parse(msg)
     out: List[str] = []
     seen: Set[str] = set()
     for b in blobs:
@@ -1570,10 +1653,14 @@ def _monitoring_at_bot_requirement_satisfied(
     mentions: Any,
     *,
     content_at_entity_ids: Optional[List[str]] = None,
+    msg: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Same @-target rules as ``/mo`` when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``.
     Used for ``/m`` / ``/c`` so mute commands in a shared group only hit the bot that was actually @'d.
+
+    When Lark delivers one payload to multiple apps, ``mentions[]`` may list **both** bots; we resolve the
+    **primary** @ target from body ``<at>`` order (then mentions order) so only the addressed bot replies.
     """
     if isinstance(mentions, list):
         mentions_list = mentions
@@ -1583,12 +1670,42 @@ def _monitoring_at_bot_requirement_satisfied(
         mentions_list = []
     canon_ids = _monitoring_canonical_open_id_match_set()
     explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
+    primary = _monitoring_resolved_primary_at_target(msg, mentions_list)
+
+    if canon_ids and primary and primary not in canon_ids:
+        logger.info(
+            "monitoring: skip — primary @ target %r is not this bot (canonical=%s)",
+            primary,
+            sorted(canon_ids),
+        )
+        return False
+
     if canon_ids:
         if explicit_ids and not explicit_ids.isdisjoint(canon_ids):
-            logger.info(
-                "monitoring /mo: trigger — explicit @ targets intersect canonical open_id set"
-            )
-            return True
+            if primary and primary in canon_ids:
+                logger.info(
+                    "monitoring /mo: trigger — primary @ %r matches canonical open_id set",
+                    primary,
+                )
+                return True
+            if not primary:
+                strong_x = {
+                    str(x).strip()
+                    for x in explicit_ids
+                    if _lark_string_is_strong_feishu_at_target(str(x).strip())
+                }
+                bot_like = strong_x & (canon_ids | MONITORING_PEER_BOT_OPEN_ID_SET)
+                if len(bot_like) >= 2:
+                    logger.info(
+                        "monitoring /mo: skip — multiple bot ids in explicit set %s without body primary @",
+                        sorted(bot_like),
+                    )
+                    return False
+                if strong_x & canon_ids:
+                    logger.info(
+                        "monitoring /mo: trigger — explicit @ intersects canonical (single bot-like id)"
+                    )
+                    return True
         if explicit_ids and explicit_ids.isdisjoint(canon_ids):
             peer_only = (
                 bool(MONITORING_PEER_BOT_OPEN_ID_SET)
@@ -1617,7 +1734,31 @@ def _monitoring_at_bot_requirement_satisfied(
                     sorted(canon_ids),
                 )
                 return False
+
+    distinct_bot_like = _lark_distinct_strong_bot_like_ids_in_mentions(
+        mentions_list,
+        canon_ids=canon_ids,
+        peer_ids=MONITORING_PEER_BOT_OPEN_ID_SET,
+    )
+    if len(distinct_bot_like) >= 2 and not primary:
+        logger.info(
+            "monitoring /mo: skip — mentions encode multiple bots %s with no resolvable primary @",
+            sorted(distinct_bot_like),
+        )
+        return False
+
     if _lark_message_mentions_bot(mentions):
+        if primary and canon_ids:
+            if primary in canon_ids:
+                logger.info(
+                    "monitoring /mo: trigger — mentions include this bot and primary @ matches canonical"
+                )
+                return True
+            logger.info(
+                "monitoring /mo: skip — mentions include this bot but primary @ %r is not canonical",
+                primary,
+            )
+            return False
         return True
     cat_ids = [str(x).strip() for x in (content_at_entity_ids or []) if str(x).strip()]
     sb = (_lark_effective_bot_open_id() or "").strip()
@@ -1689,6 +1830,7 @@ def _text_should_run_monitoring(
     mentions: Any,
     *,
     content_at_entity_ids: Optional[List[str]] = None,
+    msg: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Run the same job as ``/monitoring`` when the command is present, or when the user @mentions
@@ -1716,7 +1858,10 @@ def _text_should_run_monitoring(
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
             return True
         return _monitoring_at_bot_requirement_satisfied(
-            raw_text, mentions, content_at_entity_ids=content_at_entity_ids
+            raw_text,
+            mentions,
+            content_at_entity_ids=content_at_entity_ids,
+            msg=msg,
         )
     if not MONITORING_AT_MENTION_ENABLE:
         return False
@@ -6256,7 +6401,10 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     if sp_cmd:
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
-            raw_text, mentions, content_at_entity_ids=content_at_entity_ids
+            raw_text,
+            mentions,
+            content_at_entity_ids=content_at_entity_ids,
+            msg=msg,
         ):
             logger.info(
                 "%s skip — not addressed to this bot (MONITORING_TRIGGER_REQUIRES_AT_BOT=1)",
@@ -6313,6 +6461,14 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER)
     ):
+        if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
+            raw_text,
+            mentions,
+            content_at_entity_ids=content_at_entity_ids,
+            msg=msg,
+        ):
+            logger.info("cmd-help skip — @ not addressed to this bot")
+            return
         processed_h = _monitoring_processed_stick(
             mid, im_event_id, chat_id or "", sender_debounce, msg_time
         )
@@ -6345,7 +6501,11 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         return
 
     if not _text_should_run_monitoring(
-        raw_text, clean, mentions, content_at_entity_ids=content_at_entity_ids
+        raw_text,
+        clean,
+        mentions,
+        content_at_entity_ids=content_at_entity_ids,
+        msg=msg,
     ):
         ml = mentions if isinstance(mentions, list) else []
         body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
