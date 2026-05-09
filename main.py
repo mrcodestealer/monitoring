@@ -171,8 +171,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
     # 本仓库 = Grafana **Platform** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_0bfd185231d6beb669425fdf8f13e9df",
-    # 同一机器人在飞书里可能出现的其它 open_id（逗号/空格）；租户/会话可能再变一条 —— _disjoint 非 peer-only 时会 fall through
-    "MONITORING_CANONICAL_BOT_OPEN_IDS": "",
+    # 同一 Platform 应用在飞书里可能出现的其它 open_id（重装/多实例投递时 mentions 仍可能带旧 ou_）
+    "MONITORING_CANONICAL_BOT_OPEN_IDS": "ou_ee1af664e18d9c2d25e0ab6fded66388 ou_04878d0cdae2ca774e1d4a1716fa9ac3",
     # Grafana **Game** Bot open_id（逗号/空格列多条）。正文 ``<at>`` 只指向 Game 时 Platform 不 weak 触发
     "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed",
     "LARK_ENCRYPT_KEY": "",
