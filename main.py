@@ -18,8 +18,8 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。默认 ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``；``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 用于 **mentions 为空** 时的 ``@_user_N`` 兜底。与 Game 同群时请保持 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，并把 **Game** 的 ``open_id`` 填入 ``MONITORING_PEER_BOT_OPEN_IDS``（正文 ``<at user_id=…>`` 仅指向 Game 时不再误触发）。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
-User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` (``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``; HTTP may need ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` for ``@_user_N`` text), ``/m`` mute card, ``/c`` cancel all mutes. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
+群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。``MONITORING_TRIGGER_REQUIRES_AT_BOT=1`` 时 **``/m``、``/c`` 与 ``/mo`` 共用同一套 @ 判定**，群内裸发 ``/m`` 不会由本 bot 响应。``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 用于 **mentions 为空** 时的 ``@_user_N`` 兜底。与 Game 同群时请保持 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，并把 **Game** 的 ``open_id`` 填入 ``MONITORING_PEER_BOT_OPEN_IDS``（正文 ``<at user_id=…>`` 仅指向 Game 时不再误触发）。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
+User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` (``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``; HTTP may need ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` for ``@_user_N`` text), ``@this_bot /m`` mute card, ``@this_bot /c`` cancel mutes — same @-gate as ``/mo`` when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：交互卡片；``MONITORING_CARD_EMBED_SCREENSHOT=1``（默认）嵌截图。**Platform /mo 正文常超过旧版 3000 字上限** — 已用 ``MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS``（默认 16000）+ ``MONITORING_MESSAGE_CARD_TRUNCATE=1`` 截断后进卡片，否则会误走纯文字。需在飞书开通「发送消息卡片」权限。
 
 HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
@@ -196,7 +196,7 @@ _CFG: Dict[str, Any] = {
     "LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA": "1",
     # 1=监控摘要一条交互卡片（与 Game 一致，才有 Resend screenshot 等卡片按钮）；0=纯文字 + 独立 PNG（无按钮）
     "MONITORING_MESSAGE_CARD_ENABLE": "1",
-    # 1=截图嵌进同一张交互卡片（推荐，一条气泡）；0=卡片只有文字，截图再单独发一条（两条）
+    # /mo：**先**发卡/字再截图（避免截图阻塞整句回复）；截图一般为下一条。告警 watchdog 路径仍可先截再发。
     "MONITORING_CARD_EMBED_SCREENSHOT": "1",
     # 1=在监控卡片底部展示 callback 按钮（实现方式参考 Chatbox/jenkinsupdate 的 card JSON 2.0）
     "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
@@ -1460,8 +1460,8 @@ _LARK_AT_ID_ATTR_OU_CLI_RE = re.compile(
 
 def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
     """
-    Feishu sometimes omits usable ``mentions[]`` but keeps ``<at user_id=\"ou_…\">`` inside ``content`` JSON.
-    Used to skip weak-nonempty ``/mo`` when the body clearly @'s another bot in the same group.
+    Parse ``<at …>`` from **body fields only** (``content`` / ``text`` / ``body``). Do not scan the whole
+    envelope JSON — ``mentions[]`` ids there falsely imply a peer ``<at>`` in visible text (dual-bot groups).
     """
     blobs: List[str] = []
     if isinstance(msg, dict):
@@ -1476,10 +1476,6 @@ def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str
             v = msg.get(k)
             if isinstance(v, str) and v.strip():
                 blobs.append(v)
-        try:
-            blobs.append(json.dumps(msg, ensure_ascii=False))
-        except Exception:
-            pass
     out: List[str] = []
     seen: Set[str] = set()
     for b in blobs:
@@ -1569,6 +1565,110 @@ def _lark_body_peer_only_strong_at_targets(
     return body_ids <= peer_open_ids
 
 
+def _monitoring_at_bot_requirement_satisfied(
+    raw_text: str,
+    mentions: Any,
+    *,
+    content_at_entity_ids: Optional[List[str]] = None,
+) -> bool:
+    """
+    Same @-target rules as ``/mo`` when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``.
+    Used for ``/m`` / ``/c`` so mute commands in a shared group only hit the bot that was actually @'d.
+    """
+    if isinstance(mentions, list):
+        mentions_list = mentions
+    elif isinstance(mentions, dict) and mentions:
+        mentions_list = [mentions]
+    else:
+        mentions_list = []
+    canon_ids = _monitoring_canonical_open_id_match_set()
+    explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
+    if canon_ids:
+        if explicit_ids and not explicit_ids.isdisjoint(canon_ids):
+            logger.info(
+                "monitoring /mo: trigger — explicit @ targets intersect canonical open_id set"
+            )
+            return True
+        if explicit_ids and explicit_ids.isdisjoint(canon_ids):
+            peer_only = (
+                bool(MONITORING_PEER_BOT_OPEN_ID_SET)
+                and explicit_ids <= MONITORING_PEER_BOT_OPEN_ID_SET
+            )
+            if peer_only:
+                body_peer_only = _lark_body_peer_only_strong_at_targets(
+                    content_at_entity_ids,
+                    MONITORING_PEER_BOT_OPEN_ID_SET,
+                )
+                if body_peer_only:
+                    logger.info(
+                        "monitoring /mo: skip — explicit @ targets %s peer-only and body <at> confirms peer",
+                        sorted(explicit_ids),
+                    )
+                    return False
+                logger.info(
+                    "monitoring /mo: explicit meta peer-only %s but body lacks peer-only <at> — fall through",
+                    sorted(explicit_ids),
+                )
+            logger.info(
+                "monitoring /mo: explicit @ targets %s disjoint from canonical %s — fall through "
+                "(not peer-only; checking mentions/content)",
+                sorted(explicit_ids),
+                sorted(canon_ids),
+            )
+    if _lark_message_mentions_bot(mentions):
+        return True
+    cat_ids = [str(x).strip() for x in (content_at_entity_ids or []) if str(x).strip()]
+    sb = (_lark_effective_bot_open_id() or "").strip()
+    sa = (str(APP_ID).strip() if APP_ID else "") or ""
+    if sb and sb in cat_ids:
+        logger.info("monitoring /mo: trigger via content <at> matching this bot open_id")
+        return True
+    if sa and sa in cat_ids:
+        logger.info("monitoring /mo: trigger via content <at> matching APP_ID")
+        return True
+    body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
+    conflict_other = (
+        _lark_mentions_carry_strong_identity_other_than_bot(
+            _lark_effective_bot_open_id(),
+            str(APP_ID).strip() if APP_ID else "",
+            mentions_list,
+        )
+        if mentions_list
+        else False
+    )
+    if mentions_list:
+        if (
+            MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW
+            and body_ph
+            and not conflict_other
+        ):
+            if _mo_peer_at_blocks_weak_nonempty_mo(
+                content_at_entity_ids,
+                self_bot=_lark_effective_bot_open_id(),
+                self_app=str(APP_ID).strip() if APP_ID else "",
+                peer_open_ids=MONITORING_PEER_BOT_OPEN_ID_SET,
+            ):
+                logger.info(
+                    "monitoring /mo: skip — content <at> targets MONITORING_PEER_BOT_OPEN_IDS "
+                    "(weak-nonempty path disabled for peer @)"
+                )
+            else:
+                logger.info(
+                    "monitoring /mo: allowed via Feishu @_user_N + weak/non-conflicting mentions "
+                    "(MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=1 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=%s)",
+                    MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
+                )
+                return True
+        return False
+    if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and body_ph:
+        logger.info(
+            "monitoring /mo: allowed via Feishu @_user_N placeholder "
+            "(mentions list empty; MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1)"
+        )
+        return True
+    return False
+
+
 def _text_should_run_monitoring(
     raw_text: str,
     clean: str,
@@ -1601,98 +1701,9 @@ def _text_should_run_monitoring(
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
             return True
-        if isinstance(mentions, list):
-            mentions_list = mentions
-        elif isinstance(mentions, dict) and mentions:
-            mentions_list = [mentions]
-        else:
-            mentions_list = []
-        canon_ids = _monitoring_canonical_open_id_match_set()
-        explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
-        if canon_ids:
-            if explicit_ids and not explicit_ids.isdisjoint(canon_ids):
-                logger.info(
-                    "monitoring /mo: trigger — explicit @ targets intersect canonical open_id set"
-                )
-                return True
-            if explicit_ids and explicit_ids.isdisjoint(canon_ids):
-                peer_only = (
-                    bool(MONITORING_PEER_BOT_OPEN_ID_SET)
-                    and explicit_ids <= MONITORING_PEER_BOT_OPEN_ID_SET
-                )
-                if peer_only:
-                    body_peer_only = _lark_body_peer_only_strong_at_targets(
-                        content_at_entity_ids,
-                        MONITORING_PEER_BOT_OPEN_ID_SET,
-                    )
-                    if body_peer_only:
-                        logger.info(
-                            "monitoring /mo: skip — explicit @ targets %s peer-only and body <at> confirms peer",
-                            sorted(explicit_ids),
-                        )
-                        return False
-                    logger.info(
-                        "monitoring /mo: explicit meta peer-only %s but body lacks peer-only <at> — fall through",
-                        sorted(explicit_ids),
-                    )
-                logger.info(
-                    "monitoring /mo: explicit @ targets %s disjoint from canonical %s — fall through "
-                    "(not peer-only; checking mentions/content)",
-                    sorted(explicit_ids),
-                    sorted(canon_ids),
-                )
-        if _lark_message_mentions_bot(mentions):
-            return True
-        cat_ids = [str(x).strip() for x in (content_at_entity_ids or []) if str(x).strip()]
-        sb = (_lark_effective_bot_open_id() or "").strip()
-        sa = (str(APP_ID).strip() if APP_ID else "") or ""
-        if sb and sb in cat_ids:
-            logger.info("monitoring /mo: trigger via content <at> matching this bot open_id")
-            return True
-        if sa and sa in cat_ids:
-            logger.info("monitoring /mo: trigger via content <at> matching APP_ID")
-            return True
-        body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
-        conflict_other = (
-            _lark_mentions_carry_strong_identity_other_than_bot(
-                _lark_effective_bot_open_id(),
-                str(APP_ID).strip() if APP_ID else "",
-                mentions_list,
-            )
-            if mentions_list
-            else False
+        return _monitoring_at_bot_requirement_satisfied(
+            raw_text, mentions, content_at_entity_ids=content_at_entity_ids
         )
-        if mentions_list:
-            if (
-                MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW
-                and body_ph
-                and not conflict_other
-            ):
-                if _mo_peer_at_blocks_weak_nonempty_mo(
-                    content_at_entity_ids,
-                    self_bot=_lark_effective_bot_open_id(),
-                    self_app=str(APP_ID).strip() if APP_ID else "",
-                    peer_open_ids=MONITORING_PEER_BOT_OPEN_ID_SET,
-                ):
-                    logger.info(
-                        "monitoring /mo: skip — content <at> targets MONITORING_PEER_BOT_OPEN_IDS "
-                        "(weak-nonempty path disabled for peer @)"
-                    )
-                else:
-                    logger.info(
-                        "monitoring /mo: allowed via Feishu @_user_N + weak/non-conflicting mentions "
-                        "(MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=1 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=%s)",
-                        MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
-                    )
-                    return True
-            return False
-        if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and body_ph:
-            logger.info(
-                "monitoring /mo: allowed via Feishu @_user_N placeholder "
-                "(mentions list empty; MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1)"
-            )
-            return True
-        return False
     if not MONITORING_AT_MENTION_ENABLE:
         return False
     if not _lark_message_mentions_bot(mentions):
@@ -5969,29 +5980,12 @@ def _monitoring_background_worker(
         used_interactive_card = False
         embedded_png_in_card = False
         try:
+            # Send Lark message before Playwright — pre-screenshot-first blocked replies on slow Grafana.
             pre_key: Optional[str] = None
-            if (
-                (chat_id or open_id)
-                and MONITORING_MESSAGE_CARD_ENABLE
-                and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
-                and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
-                and grafana_session is not None
-                and payload is not None
-            ):
-                w0 = payload.get("window") or {}
-                su0 = int(w0.get("startUnix") or 0)
-                eu0 = int(w0.get("endUnix") or 0)
-                if su0 > 0 and eu0 > 0:
-                    try:
-                        pre_key = _lark_upload_png_image_key(
-                            _grafana_headless_screenshot_png(grafana_session, su0, eu0)
-                        )
-                    except Exception:
-                        logger.exception("monitoring pre-screenshot for interactive card failed")
 
             if chat_id:
                 used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
-                    "chat_id", chat_id, reply, pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None
+                    "chat_id", chat_id, reply, None
                 )
                 sent = True
                 user_visible_send_ok = True
@@ -6004,7 +5998,7 @@ def _monitoring_background_worker(
                 )
             elif open_id:
                 used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
-                    "open_id", open_id, reply, pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None
+                    "open_id", open_id, reply, None
                 )
                 sent = True
                 user_visible_send_ok = True
@@ -6247,6 +6241,14 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         sp_cmd = "cancelmute"
 
     if sp_cmd:
+        if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
+            raw_text, mentions, content_at_entity_ids=content_at_entity_ids
+        ):
+            logger.info(
+                "%s skip — not addressed to this bot (MONITORING_TRIGGER_REQUIRES_AT_BOT=1)",
+                sp_cmd,
+            )
+            return
         processed_stick_m = _monitoring_processed_stick(
             mid, im_event_id, chat_id or "", sender_debounce, msg_time
         )
