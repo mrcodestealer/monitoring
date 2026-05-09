@@ -1636,20 +1636,15 @@ def _lark_primary_strong_at_from_im_message(msg: Optional[Dict[str, Any]]) -> Op
         ids = _lark_ordered_strong_ids_from_at_tags(blob)
         if ids:
             return ids[0]
-    raw_c = msg.get("content") or msg.get("Content") or msg.get("body")
-    if isinstance(raw_c, str):
-        raw_cs = raw_c.strip()
-        if raw_cs:
-            try:
-                raw_c = json.loads(raw_cs)
-            except (json.JSONDecodeError, TypeError):
-                raw_c = None
-        else:
-            raw_c = None
-    if isinstance(raw_c, dict):
+    root = _lark_im_parsed_content_root(msg)
+    if isinstance(root, dict):
+        mentions_for_resolve = _lark_collect_im_message_mentions(msg, {})
+        ordered = _lark_ordered_post_at_strong_ids_from_root(root, mentions_for_resolve)
+        if ordered:
+            return ordered[0]
         post_first: List[str] = []
         post_seen: Set[str] = set()
-        _lark_collect_post_at_user_ids(raw_c, post_first, post_seen)
+        _lark_collect_post_at_user_ids(root, post_first, post_seen, mentions_list=mentions_for_resolve)
         if post_first:
             return post_first[0]
     return None
@@ -1664,6 +1659,15 @@ def _lark_visible_bot_like_at_chain(
     out: List[str] = []
     for blob in _lark_im_content_blobs_for_at_parse(msg):
         for x in _lark_ordered_strong_ids_from_at_tags(blob):
+            t = str(x).strip()
+            if t and _lark_string_is_strong_feishu_at_target(t) and t in bot_like_bag:
+                out.append(t)
+        if out:
+            return out
+    mentions_for_resolve = _lark_collect_im_message_mentions(msg, {})
+    root = _lark_im_parsed_content_root(msg)
+    if isinstance(root, dict):
+        for x in _lark_ordered_post_at_strong_ids_from_root(root, mentions_for_resolve):
             t = str(x).strip()
             if t and _lark_string_is_strong_feishu_at_target(t) and t in bot_like_bag:
                 out.append(t)
@@ -1930,27 +1934,141 @@ def _monitoring_group_multi_bot_first_mention_gate(
     return True
 
 
-def _lark_collect_post_at_user_ids(obj: Any, out: List[str], seen: Set[str], depth: int = 0) -> None:
-    """Collect ``ou_`` / ``cli_`` from ``{\"tag\": \"at\", \"user_id\": \"...\"}`` in Feishu **post** JSON."""
-    if depth > 12 or obj is None:
-        return
-    if isinstance(obj, dict):
-        if obj.get("tag") == "at":
-            uid = ""
-            for key in ("user_id", "userId", "open_id", "openId"):
-                v = obj.get(key)
-                if v:
-                    uid = str(v).strip()
-                    if uid:
-                        break
-            if uid and _lark_string_is_strong_feishu_at_target(uid) and uid not in seen:
+def _lark_im_parsed_content_root(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Parsed ``message.content`` / ``body`` JSON object when it is (or parses to) a dict."""
+    raw_c = msg.get("content") or msg.get("Content") or msg.get("body")
+    if isinstance(raw_c, dict):
+        return raw_c
+    if isinstance(raw_c, str):
+        raw_cs = raw_c.strip()
+        if not raw_cs:
+            return None
+        try:
+            o = json.loads(raw_cs)
+            return o if isinstance(o, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
+
+_LARK_POST_DOC_ORDER_KEYS_FIRST: Tuple[str, ...] = (
+    "content",
+    "elements",
+    "children",
+    "rows",
+    "body",
+)
+_LARK_POST_SKIP_RECURSE_KEYS = frozenset({"mentions", "Mentions"})
+
+
+def _lark_post_cell_raw_at_ref(cell: Dict[str, Any]) -> Optional[str]:
+    """Raw ``user_id`` / ``open_id`` from a post cell (may be ``union_id`` / internal id per Feishu docs)."""
+    tag_s = str(cell.get("tag") or cell.get("Tag") or "").strip().lower()
+    if tag_s not in ("at", "mention"):
+        return None
+    for key in ("user_id", "userId", "open_id", "openId"):
+        v = cell.get(key)
+        if v:
+            s = str(v).strip()
+            if s and s.lower() != "all":
+                return s
+    user = cell.get("user") or cell.get("User")
+    if isinstance(user, dict):
+        for key in ("open_id", "openId", "user_id", "userId", "union_id", "unionId", "id", "Id"):
+            v = user.get(key)
+            if v:
+                s = str(v).strip()
+                if s and s.lower() != "all":
+                    return s
+    return None
+
+
+def _lark_resolve_feishu_at_ref_to_strong_open_id(ref: str, mentions_list: List[Any]) -> Optional[str]:
+    """Map post ``user_id`` field (open_id / union_id / etc.) to ``ou_``/``cli_`` using ``mentions[]`` rows."""
+    r = (ref or "").strip()
+    if not r or r.lower() == "all":
+        return None
+    if _lark_string_is_strong_feishu_at_target(r):
+        return r
+    for m in mentions_list:
+        if not isinstance(m, dict):
+            continue
+        id_strings = _lark_collect_mention_identity_strings_for_at_conflict(m)
+        if r not in id_strings:
+            continue
+        oid = _lark_mention_row_main_open_id(m)
+        if oid and _lark_string_is_strong_feishu_at_target(oid):
+            return oid
+        for s in id_strings:
+            t = str(s).strip()
+            if t and _lark_string_is_strong_feishu_at_target(t):
+                return t
+    return None
+
+
+def _lark_post_cell_resolved_strong_at_user_id(cell: Dict[str, Any], mentions_list: List[Any]) -> Optional[str]:
+    raw = _lark_post_cell_raw_at_ref(cell)
+    if not raw:
+        return None
+    return _lark_resolve_feishu_at_ref_to_strong_open_id(raw, mentions_list)
+
+
+def _lark_ordered_post_at_strong_ids_from_root(
+    root: Dict[str, Any],
+    mentions_list: Optional[List[Any]] = None,
+) -> List[str]:
+    """Document-order ``@`` targets in post/rich-text JSON (DFS). Skips embedded ``mentions`` metadata subtrees."""
+    ml = mentions_list or []
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def visit(obj: Any, depth: int = 0) -> None:
+        if depth > 18 or obj is None:
+            return
+        if isinstance(obj, dict):
+            uid = _lark_post_cell_resolved_strong_at_user_id(obj, ml)
+            if uid and uid not in seen:
                 seen.add(uid)
                 out.append(uid)
-        for v in obj.values():
-            _lark_collect_post_at_user_ids(v, out, seen, depth + 1)
+            keys = list(obj.keys())
+            priority = [k for k in _LARK_POST_DOC_ORDER_KEYS_FIRST if k in obj]
+            rest = [k for k in keys if k not in priority]
+            for k in priority + rest:
+                if k in _LARK_POST_SKIP_RECURSE_KEYS:
+                    continue
+                visit(obj[k], depth + 1)
+        elif isinstance(obj, list):
+            for x in obj:
+                visit(x, depth + 1)
+
+    visit(root, 0)
+    return out
+
+
+def _lark_collect_post_at_user_ids(
+    obj: Any,
+    out: List[str],
+    seen: Set[str],
+    depth: int = 0,
+    *,
+    mentions_list: Optional[List[Any]] = None,
+) -> None:
+    """Collect resolved ``ou_`` / ``cli_`` from nested post / rich-text JSON (DFS)."""
+    ml = mentions_list or []
+    if depth > 14 or obj is None:
+        return
+    if isinstance(obj, dict):
+        uid = _lark_post_cell_resolved_strong_at_user_id(obj, ml)
+        if uid and uid not in seen:
+            seen.add(uid)
+            out.append(uid)
+        for k, v in obj.items():
+            if k in _LARK_POST_SKIP_RECURSE_KEYS:
+                continue
+            _lark_collect_post_at_user_ids(v, out, seen, depth + 1, mentions_list=ml)
     elif isinstance(obj, list):
         for x in obj:
-            _lark_collect_post_at_user_ids(x, out, seen, depth + 1)
+            _lark_collect_post_at_user_ids(x, out, seen, depth + 1, mentions_list=ml)
 
 
 def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
@@ -1976,18 +2094,14 @@ def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str
                 seen.add(s)
                 out.append(s)
 
-    raw_c = msg.get("content") or msg.get("Content") or msg.get("body")
-    if isinstance(raw_c, str):
-        raw_cs = raw_c.strip()
-        if raw_cs:
-            try:
-                raw_c = json.loads(raw_cs)
-            except (json.JSONDecodeError, TypeError):
-                raw_c = None
-        else:
-            raw_c = None
-    if isinstance(raw_c, dict):
-        _lark_collect_post_at_user_ids(raw_c, out, seen)
+    mentions_for_resolve = _lark_collect_im_message_mentions(msg, {})
+    root = _lark_im_parsed_content_root(msg)
+    if isinstance(root, dict):
+        for uid in _lark_ordered_post_at_strong_ids_from_root(root, mentions_for_resolve):
+            if uid not in seen:
+                seen.add(uid)
+                out.append(uid)
+        _lark_collect_post_at_user_ids(root, out, seen, mentions_list=mentions_for_resolve)
 
     return out
 
@@ -2094,6 +2208,13 @@ def _monitoring_at_bot_requirement_satisfied(
         raw_text,
         bot_like_bag=canon_ids | MONITORING_PEER_BOT_OPEN_ID_SET,
     )
+    root = _lark_im_parsed_content_root(msg) if isinstance(msg, dict) else None
+    post_at_ordered = (
+        _lark_ordered_post_at_strong_ids_from_root(root, mentions_list) if root else []
+    )
+    if post_at_ordered:
+        # Mobile post: trust document-order @ in body over mentions[] order (often lists both bots).
+        primary = post_at_ordered[0]
     app = str(APP_ID or "").strip()
     row_app_id_is_self = bool(app and _lark_mentions_any_row_matches_app(mentions_list, app))
     # Never auto-trigger on «sole mention open_id ∈ peer + @_user_N + /mo|/m|/c»: same payload when user
