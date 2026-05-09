@@ -1603,6 +1603,14 @@ def _lark_im_content_blobs_for_at_parse(msg: Dict[str, Any]) -> List[str]:
         if v == vis:
             continue
         blobs.append(v)
+    # Escaped JSON string sometimes keeps ``<at user_id=…>`` while extracted plain text is placeholder-only.
+    for k in ("content", "Content"):
+        v = msg.get(k)
+        if not isinstance(v, str) or not v.strip():
+            continue
+        if v in blobs:
+            continue
+        blobs.append(v)
     return blobs
 
 
@@ -1823,12 +1831,11 @@ def _monitoring_resolved_primary_at_target(
     """
     Resolve primary @ target for shared multi-bot groups:
 
-    1. Leftmost visible ``key`` / ``mention_key`` / ``@name`` match in plain text (preferred over raw ``mentions[]`` order).
-    2. First ``@_user_N`` token mapped via ``mentions[].key`` when present, else ``mentions[N-1]`` (1-based index).
-    3. When **several bot-like mentions** exist and visible body has **exactly one** ``<at>`` in the peer/canon bag,
-       use that id (avoids trusting a misleading first tag when two bots appear in ``mentions[]``).
-    4. Strong ids from visible ``<at user_id=…>`` in message body (metadata-safe blobs only).
-    5. ``mentions[]`` row order.
+    1. When **two or more** bot-like ids appear in ``mentions[]``, prefer **document-order** strong ``<at …>`` /
+       post cells in the message body (canon ∪ peer bag) — Feishu often misorders ``@_user_N`` vs real ``<at user_id=…>``.
+    2. Leftmost visible ``key`` / ``mention_key`` / ``@name`` in plain text.
+    3. First ``@_user_N`` mapped via ``mentions[].key`` / index.
+    4. Fallback: any strong ``<at>`` / post id, then ``mentions[]`` row order.
 
     Set ``MONITORING_LOG_PRIMARY_AT=1`` for one-line diagnostics on the server.
     """
@@ -1864,12 +1871,13 @@ def _monitoring_resolved_primary_at_target(
             vis_early,
         )
 
+    if bot_like_bag and len(distinct_bot_like) >= 2 and body_chain:
+        return body_chain[0]
+
     if vis_early:
         return vis_early
     if ph:
         return ph
-    if len(distinct_bot_like) >= 2 and len(body_chain) == 1:
-        return body_chain[0]
     b = _lark_primary_strong_at_from_im_message(msg, mentions_list)
     if b:
         return b
