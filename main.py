@@ -1440,6 +1440,30 @@ def _lark_message_mentions_bot(mentions: Any) -> bool:
     return False
 
 
+def _lark_im_bot_addressed_in_mentions_or_body(
+    mentions: Any,
+    content_at_entity_ids: Optional[List[str]],
+) -> bool:
+    """
+    True when ``mentions[]`` encodes this bot **or** parsed body/post lists this app's canonical ``open_id``
+    / ``APP_ID``. Mobile ``post`` messages often omit usable ``mentions[]`` while ``{\"tag\":\"at\"}`` cells
+    carry ``user_id``.
+    """
+    if _lark_message_mentions_bot(mentions):
+        return True
+    canon = _monitoring_canonical_open_id_match_set()
+    app = str(APP_ID or "").strip()
+    for x in content_at_entity_ids or []:
+        s = str(x).strip()
+        if not s:
+            continue
+        if s in canon:
+            return True
+        if app and s == app:
+            return True
+    return False
+
+
 def _lark_mentions_any_row_matches_app(mentions_list: List[Any], app: str) -> bool:
     """
     True when any ``mentions[]`` row carries this Lark app's ``app_id``.
@@ -2074,6 +2098,23 @@ def _monitoring_at_bot_requirement_satisfied(
     row_app_id_is_self = bool(app and _lark_mentions_any_row_matches_app(mentions_list, app))
     # Never auto-trigger on «sole mention open_id ∈ peer + @_user_N + /mo|/m|/c»: same payload when user
     # correctly @ only the peer bot → the other bot would also reply (dual mute/monitoring).
+
+    strong_body = {
+        str(x).strip()
+        for x in (content_at_entity_ids or [])
+        if _lark_string_is_strong_feishu_at_target(str(x).strip())
+    }
+    if (
+        MONITORING_PEER_BOT_OPEN_ID_SET
+        and strong_body
+        and strong_body <= MONITORING_PEER_BOT_OPEN_ID_SET
+        and not (strong_body & canon_ids)
+    ):
+        logger.info(
+            "monitoring: skip — body/post @ ids %s are peer-only (no canonical id in body for this app)",
+            sorted(strong_body),
+        )
+        return False
 
     if canon_ids and primary and primary not in canon_ids:
         if row_app_id_is_self:
@@ -6845,11 +6886,10 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     msg_time = _lark_im_message_time_token(msg)
 
     sp_cmd: Optional[str] = None
-    # Same gate as /mo: when MONITORING_TRIGGER_REQUIRES_AT_BOT=1, do not treat bare /m|/c in shared text
-    # as this bot's command unless mentions encode **this** bot (_lark_message_mentions_bot). Otherwise
-    # every app that receives the group envelope would enqueue mute/cancelmute before primary-at resolves.
+    # Same gate as /mo: require this bot in mentions **or** body/post @ ids (mobile post often lacks the former).
     _mute_cancel_allowed = (
-        not MONITORING_TRIGGER_REQUIRES_AT_BOT or _lark_message_mentions_bot(mentions)
+        not MONITORING_TRIGGER_REQUIRES_AT_BOT
+        or _lark_im_bot_addressed_in_mentions_or_body(mentions, content_at_entity_ids)
     )
     if _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER):
         if _mute_cancel_allowed:
