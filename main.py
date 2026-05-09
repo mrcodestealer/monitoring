@@ -1459,20 +1459,26 @@ _LARK_AT_ID_ATTR_OU_CLI_RE = re.compile(
 
 
 def _lark_im_content_blobs_for_at_parse(msg: Dict[str, Any]) -> List[str]:
-    """Raw JSON/text blobs from ``message`` that may contain ``<at …>`` tags (same fields as entity-id parse)."""
+    """
+    User-visible text blobs that may contain ``<at …>`` tags.
+
+    Do **not** scan ``json.dumps(content)`` or the raw JSON envelope: Feishu may embed duplicate
+    ``<at user_id=…>`` fragments under metadata keys that serialize **before** the real ``text`` field,
+    so a whole-blob regex falsely picks another bot as primary @.
+    """
     blobs: List[str] = []
-    if isinstance(msg, dict):
-        raw_c = msg.get("content")
-        if raw_c is None:
-            raw_c = msg.get("Content")
-        if isinstance(raw_c, str):
-            blobs.append(raw_c)
-        elif isinstance(raw_c, dict):
-            blobs.append(json.dumps(raw_c, ensure_ascii=False))
-        for k in ("text", "Text", "body"):
-            v = msg.get(k)
-            if isinstance(v, str) and v.strip():
-                blobs.append(v)
+    if not isinstance(msg, dict):
+        return blobs
+    vis = _lark_extract_plain_text_from_message(msg)
+    if (vis or "").strip():
+        blobs.append(vis)
+    for k in ("text", "Text", "body"):
+        v = msg.get(k)
+        if not isinstance(v, str) or not v.strip():
+            continue
+        if v == vis:
+            continue
+        blobs.append(v)
     return blobs
 
 
