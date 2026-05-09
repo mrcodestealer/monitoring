@@ -7040,10 +7040,20 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     msg_time = _lark_im_message_time_token(msg)
 
     sp_cmd: Optional[str] = None
-    # Same gate as /mo: require this bot in mentions **or** body/post @ ids (mobile post often lacks the former).
+    req_at_bot = MONITORING_TRIGGER_REQUIRES_AT_BOT
+    monitoring_addressed_ok = True
+    if req_at_bot:
+        monitoring_addressed_ok = _monitoring_at_bot_requirement_satisfied(
+            raw_text,
+            mentions,
+            content_at_entity_ids=content_at_entity_ids,
+            msg=msg,
+            chat_type=im_chat_type,
+        )
     _mute_cancel_allowed = (
-        not MONITORING_TRIGGER_REQUIRES_AT_BOT
+        not req_at_bot
         or _lark_im_bot_addressed_in_mentions_or_body(mentions, content_at_entity_ids)
+        or monitoring_addressed_ok
     )
     if _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER):
         if _mute_cancel_allowed:
@@ -7053,13 +7063,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             sp_cmd = "cancelmute"
 
     if sp_cmd:
-        if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
-            raw_text,
-            mentions,
-            content_at_entity_ids=content_at_entity_ids,
-            msg=msg,
-            chat_type=im_chat_type,
-        ):
+        if req_at_bot and not monitoring_addressed_ok:
             logger.info(
                 "%s skip — not addressed to this bot (MONITORING_TRIGGER_REQUIRES_AT_BOT=1)",
                 sp_cmd,
