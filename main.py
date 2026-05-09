@@ -6784,14 +6784,19 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     im_event_id = _lark_im_payload_event_id(data)
     msg_time = _lark_im_message_time_token(msg)
 
-    mute_tri = (MONITORING_MUTE_TRIGGER or "/m").strip().lower()
-    cancel_tri = (MONITORING_CANCELMUTE_TRIGGER or "/c").strip().lower()
-
     sp_cmd: Optional[str] = None
+    # Same gate as /mo: when MONITORING_TRIGGER_REQUIRES_AT_BOT=1, do not treat bare /m|/c in shared text
+    # as this bot's command unless mentions encode **this** bot (_lark_message_mentions_bot). Otherwise
+    # every app that receives the group envelope would enqueue mute/cancelmute before primary-at resolves.
+    _mute_cancel_allowed = (
+        not MONITORING_TRIGGER_REQUIRES_AT_BOT or _lark_message_mentions_bot(mentions)
+    )
     if _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER):
-        sp_cmd = "mute"
+        if _mute_cancel_allowed:
+            sp_cmd = "mute"
     elif _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER):
-        sp_cmd = "cancelmute"
+        if _mute_cancel_allowed:
+            sp_cmd = "cancelmute"
 
     if sp_cmd:
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
