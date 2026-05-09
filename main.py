@@ -1593,7 +1593,7 @@ def _lark_primary_strong_from_feishu_user_placeholders(
                 if ks.startswith("@"):
                     key_to_oid.setdefault(ks[1:], oid)
 
-    for mm in re.finditer(r"@_user_\d+", raw_text):
+    for mm in re.finditer(r"@_user_(\d+)", raw_text):
         tok = mm.group(0)
         n = int(mm.group(1))
         idx = n - 1
