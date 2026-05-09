@@ -6899,7 +6899,8 @@ def webhook_event():
                 "checklist_cn": [
                     "推荐：开发者后台「事件与回调」→ 使用长连接接收事件，运行 ``python main.py``（LARK_EVENT_MODE=ws，默认），无需公网 URL。",
                     "若用 HTTP：Request URL 须指向本服务 POST /webhook/event（公网可达），并设 LARK_EVENT_MODE=http。",
-                    "订阅「消息与群组」→「接收消息 v2.0」；群内需权限：@机器人消息 (im:message.group_at_msg) 或群全量消息权限。",
+                    "订阅「消息与群组」→「接收消息 v1/v2」；群权限优先「仅 @ 本机器人」：im:message.group_at_msg:readonly（控制台名可能写为 group_at_msg）；"
+                    "勿再开「读取群全部消息」类敏感 scope，否则飞书会把未 @ 你的消息也 POST 到本服务（只能靠代码二次过滤）。",
                     "VERIFICATION_TOKEN 与后台「Verification Token」一致（无多余空格）。",
                     "国内飞书应用将 LARK_HOST 设为 https://open.feishu.cn；国际用 https://open.larksuite.com。",
                     "机器人需能力「机器人」+ 权限「以应用身份发消息」等，且机器人在目标群内。",
