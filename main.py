@@ -18,7 +18,7 @@ Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``L
 
 飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
 
-群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。``MONITORING_TRIGGER_REQUIRES_AT_BOT=1`` 时 **``/m``、``/c`` 与 ``/mo`` 共用同一套 @ 判定**，群内裸发 ``/m`` 不会由本 bot 响应。``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 用于 **mentions 为空** 时的 ``@_user_N`` 兜底。与 Game 同群时请保持 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，并把 **Game** 的 ``open_id`` 填入 ``MONITORING_PEER_BOT_OPEN_IDS``（正文 ``<at user_id=…>`` 仅指向 Game 时不再误触发）。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
+群/at **本**机器人 + 监控命令（默认 ``/mo``）**或仅 @ 本机器人（无其它正文，见 ``MONITORING_AT_MENTION_*``）** → Grafana 摘要（默认最近 **15** 分钟）。``MONITORING_TRIGGER_REQUIRES_AT_BOT=1`` 时 **``/m``、``/c`` 与 ``/mo`` 共用同一套 @ 判定**，群内裸发 ``/m`` 不会由本 bot 响应。``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 用于 **mentions 为空** 时的 ``@_user_N`` 兜底。与 Game 同群时请保持 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，并把 **Game** 的 ``open_id`` 填入 ``MONITORING_PEER_BOT_OPEN_IDS``（正文 ``<at user_id=…>`` 仅指向 Game 时不再误触发）。**勿**使用「单条 peer ``open_id`` + ``@_user_N`` 即触发本 bot」类逻辑——与用户**只 @ Game** 的载荷不可区分，会导致 **Platform 与 Game 双回**；mention 行若含本应用 ``app_id`` 仍由 ``row_app_id_is_self`` 纠偏。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。
 User-visible bot text is **English-only**. Short commands (configurable): ``@this_bot /mo`` (``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``; HTTP may need ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1`` for ``@_user_N`` text), ``@this_bot /m`` mute card, ``@this_bot /c`` cancel mutes — same @-gate as ``/mo`` when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``. **@this_bot + non-command text** → command list (see ``MONITORING_AT_MENTION_*``).
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：交互卡片；``MONITORING_CARD_EMBED_SCREENSHOT=1``（默认）嵌截图。**Platform /mo 正文常超过旧版 3000 字上限** — 已用 ``MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS``（默认 16000）+ ``MONITORING_MESSAGE_CARD_TRUNCATE=1`` 截断后进卡片，否则会误走纯文字。需在飞书开通「发送消息卡片」权限。
 
@@ -169,8 +169,6 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 0=禁止「非空弱 mentions + @_user_N」跑 /mo — 与 Game bot 同群时勿改 1，否则会对方 @ Game 你也回
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
-    # 1=仅一条 mentions 且 open_id 为 **Game** peer、正文 @_user_N + /mo|/m|/c 时仍触发 Platform（对称 Game bot；飞书常绑错 ou_）；**0** 恢复严格 primary
-    "MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION": "1",
     # 本仓库 = Grafana **Platform** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_0bfd185231d6beb669425fdf8f13e9df",
     # 同一 Platform 应用在飞书里可能出现的其它 open_id（重装/多实例投递时 mentions 仍可能带旧 ou_）
@@ -753,10 +751,6 @@ MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER = _lark_env_truthy_or_default(
 MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW = _lark_env_truthy_or_default(
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW",
     default=False,
-)
-MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION = _lark_env_truthy_or_default(
-    "MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION",
-    default=True,
 )
 
 _cfg_canon_primary = _cfg_str("MONITORING_CANONICAL_BOT_OPEN_ID", "").strip()
@@ -2022,38 +2016,8 @@ def _monitoring_at_bot_requirement_satisfied(
     )
     app = str(APP_ID or "").strip()
     row_app_id_is_self = bool(app and _lark_mentions_any_row_matches_app(mentions_list, app))
-    cl = _lark_clean_command_text(raw_text, mentions_list)
-    if (
-        MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION
-        and MONITORING_PEER_BOT_OPEN_ID_SET
-        and len(mentions_list) == 1
-    ):
-        one = mentions_list[0]
-        sole = _lark_mention_row_main_open_id(one) if isinstance(one, dict) else ""
-        mo_hit = _im_command_matches(cl, MONITORING_TRIGGER)
-        mute_hit = _im_command_matches(cl, MONITORING_MUTE_TRIGGER)
-        cancel_hit = _im_command_matches(cl, MONITORING_CANCELMUTE_TRIGGER)
-        if (
-            sole
-            and sole in MONITORING_PEER_BOT_OPEN_ID_SET
-            and _lark_raw_text_has_feishu_at_placeholder(raw_text)
-            and (mo_hit or mute_hit or cancel_hit)
-            and not _lark_body_peer_only_strong_at_targets(
-                content_at_entity_ids,
-                MONITORING_PEER_BOT_OPEN_ID_SET,
-            )
-        ):
-            tri = (
-                (MONITORING_TRIGGER or "/mo")
-                if mo_hit
-                else ((MONITORING_MUTE_TRIGGER or "/m") if mute_hit else (MONITORING_CANCELMUTE_TRIGGER or "/c"))
-            )
-            logger.info(
-                "monitoring %s: trigger — single peer mention + @_user_N "
-                "(MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION; Feishu open_id/placeholder skew)",
-                tri,
-            )
-            return True
+    # Never auto-trigger on «sole mention open_id ∈ peer + @_user_N + /mo|/m|/c»: same payload when user
+    # correctly @ only the peer bot → the other bot would also reply (dual mute/monitoring).
 
     if canon_ids and primary and primary not in canon_ids:
         if row_app_id_is_self:
