@@ -1553,6 +1553,77 @@ def _monitoring_resolved_primary_at_target(
     return _lark_primary_strong_from_mentions_order(mentions_list)
 
 
+def _lark_mention_row_main_open_id(m: dict) -> str:
+    """Chatbox-style: ``mentions[].id.open_id`` for one @ row."""
+    ido = m.get("id")
+    if isinstance(ido, dict):
+        return str(ido.get("open_id") or ido.get("openId") or "").strip()
+    if isinstance(ido, str):
+        return ido.strip()
+    return ""
+
+
+def _lark_ordered_strong_open_ids_from_mentions_rows(mentions_list: List[Any]) -> List[str]:
+    """Strong ``ou_``/``cli_`` open ids in Feishu ``mentions[]`` order (one per row)."""
+    out: List[str] = []
+    for m in mentions_list:
+        if not isinstance(m, dict):
+            continue
+        oid = _lark_mention_row_main_open_id(m)
+        if oid and _lark_string_is_strong_feishu_at_target(oid):
+            out.append(oid)
+    return out
+
+
+def _monitoring_group_multi_bot_first_mention_gate(
+    *,
+    chat_type: str,
+    mentions_list: List[Any],
+    primary: Optional[str],
+    canon_ids: Set[str],
+) -> bool:
+    """
+    Chatbox ``main.py`` only checks ``mention.open_id == BOT_OPEN_ID``; with **two** Lark apps in one group,
+    Feishu often puts **both** bot ``open_id``\\ s in ``mentions[]``, so each app still sees itself as mentioned.
+
+    For **group/topic** chats, when ``mentions[]`` contains **2+** bot-like ids (union of canonical + peer sets),
+    require the **first** such id to belong to **this** app, unless ``primary`` (body ``<at>``) already picks a
+    bot-like target — then **primary** must be in ``canon_ids``.
+
+    **Requires** each bot's ``MONITORING_PEER_BOT_OPEN_IDS`` to list the other app's bot ``ou_``\\ s.
+    """
+    ct = (chat_type or "").strip().lower()
+    if ct not in ("group", "topic"):
+        return True
+    if not canon_ids:
+        return True
+    bot_bag = canon_ids | MONITORING_PEER_BOT_OPEN_ID_SET
+    if len(bot_bag) < 2:
+        return True
+    ordered = _lark_ordered_strong_open_ids_from_mentions_rows(mentions_list)
+    bots_in_order = [x for x in ordered if x in bot_bag]
+    if len(bots_in_order) < 2:
+        return True
+    if primary and primary in bot_bag:
+        ok = primary in canon_ids
+        if not ok:
+            logger.info(
+                "monitoring: skip (group multi-bot) — primary %r is another bot / not canonical",
+                primary,
+            )
+        return ok
+    first = bots_in_order[0]
+    if first not in canon_ids:
+        logger.info(
+            "monitoring: skip (group multi-bot, Chatbox-order) — first bot-like mention %r not this app; "
+            "order=%s (set MONITORING_PEER_BOT_OPEN_IDS on both bots)",
+            first,
+            bots_in_order,
+        )
+        return False
+    return True
+
+
 def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
     """
     Parse ``<at …>`` from **body fields only** (``content`` / ``text`` / ``body``). Do not scan the whole
@@ -1654,6 +1725,7 @@ def _monitoring_at_bot_requirement_satisfied(
     *,
     content_at_entity_ids: Optional[List[str]] = None,
     msg: Optional[Dict[str, Any]] = None,
+    chat_type: str = "",
 ) -> bool:
     """
     Same @-target rules as ``/mo`` when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``.
@@ -1678,6 +1750,14 @@ def _monitoring_at_bot_requirement_satisfied(
             primary,
             sorted(canon_ids),
         )
+        return False
+
+    if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_group_multi_bot_first_mention_gate(
+        chat_type=chat_type,
+        mentions_list=mentions_list,
+        primary=primary,
+        canon_ids=canon_ids,
+    ):
         return False
 
     if canon_ids:
@@ -1831,6 +1911,7 @@ def _text_should_run_monitoring(
     *,
     content_at_entity_ids: Optional[List[str]] = None,
     msg: Optional[Dict[str, Any]] = None,
+    chat_type: str = "",
 ) -> bool:
     """
     Run the same job as ``/monitoring`` when the command is present, or when the user @mentions
@@ -1862,6 +1943,7 @@ def _text_should_run_monitoring(
             mentions,
             content_at_entity_ids=content_at_entity_ids,
             msg=msg,
+            chat_type=chat_type,
         )
     if not MONITORING_AT_MENTION_ENABLE:
         return False
@@ -6382,6 +6464,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     mentions = _lark_collect_im_message_mentions(msg, event)
     clean = _lark_clean_command_text(raw_text, mentions)
     content_at_entity_ids = _lark_extract_at_entity_ids_from_im_message(msg)
+    im_chat_type = _lark_dict_pick_str(msg, "chat_type", "chatType") or ""
 
     chat_id = chat_resolved
     open_id = sender_open
@@ -6405,6 +6488,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             mentions,
             content_at_entity_ids=content_at_entity_ids,
             msg=msg,
+            chat_type=im_chat_type,
         ):
             logger.info(
                 "%s skip — not addressed to this bot (MONITORING_TRIGGER_REQUIRES_AT_BOT=1)",
@@ -6466,6 +6550,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             mentions,
             content_at_entity_ids=content_at_entity_ids,
             msg=msg,
+            chat_type=im_chat_type,
         ):
             logger.info("cmd-help skip — @ not addressed to this bot")
             return
@@ -6506,6 +6591,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         mentions,
         content_at_entity_ids=content_at_entity_ids,
         msg=msg,
+        chat_type=im_chat_type,
     ):
         ml = mentions if isinstance(mentions, list) else []
         body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
