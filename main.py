@@ -175,9 +175,9 @@ _CFG: Dict[str, Any] = {
     # 本仓库 = Grafana **Platform** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_0bfd185231d6beb669425fdf8f13e9df",
     # 同一 Platform 应用在飞书里可能出现的其它 open_id（重装/多实例投递时 mentions 仍可能带旧 ou_）
-    "MONITORING_CANONICAL_BOT_OPEN_IDS": "ou_ee1af664e18d9c2d25e0ab6fded66388 ou_04878d0cdae2ca774e1d4a1716fa9ac3",
+    "MONITORING_CANONICAL_BOT_OPEN_IDS": "ou_a51dad55e46f665d740b85c5ae22f940 ou_04878d0cdae2ca774e1d4a1716fa9ac3",
     # Game 机器人可能出现的全部 ou_（含历史 alternate）
-    "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed ou_848fc4640b48b9845cbc5b0cfa2f1af1 ou_a51dad55e46f665d740b85c5ae22f940",
+    "MONITORING_PEER_BOT_OPEN_IDS": "ou_1830c6697311e779471888a420233eed ou_848fc4640b48b9845cbc5b0cfa2f1af1 ou_ee1af664e18d9c2d25e0ab6fded66388",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "ou_0bfd185231d6beb669425fdf8f13e9df",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -728,7 +728,7 @@ MONITORING_PEER_BOT_OPEN_ID_SET: Set[str] = {
 
 _PLATFORM_EMBEDDED_CANONICAL_IDS: Tuple[str, ...] = (
     "ou_0bfd185231d6beb669425fdf8f13e9df",
-    "ou_ee1af664e18d9c2d25e0ab6fded66388",
+    "ou_a51dad55e46f665d740b85c5ae22f940",
     "ou_04878d0cdae2ca774e1d4a1716fa9ac3",
 )
 
