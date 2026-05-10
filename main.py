@@ -169,6 +169,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 0=禁止「非空弱 mentions + @_user_N」跑 /mo — 与 Game bot 同群时勿改 1，否则会对方 @ Game 你也回
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
+    # 1=sole mention open_id=peer、正文仅有 @_user_N、无 <at user_id>，且 mention.name 命中 SUBSTRINGS 时 primary 纠正为本 bot（默认关）
+    "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK": "0",
+    "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS": "",
     # 本仓库 = Grafana **Platform** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_0bfd185231d6beb669425fdf8f13e9df",
     # 同一 Platform 应用在飞书里可能出现的其它 open_id（重装/多实例投递时 mentions 仍可能带旧 ou_）
@@ -751,6 +754,18 @@ MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER = _lark_env_truthy_or_default(
 MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW = _lark_env_truthy_or_default(
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW",
     default=False,
+)
+MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK = _lark_env_truthy_or_default(
+    "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK",
+    default=False,
+)
+MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS: Tuple[str, ...] = tuple(
+    p.strip()
+    for p in re.split(
+        r"[|,]",
+        _cfg_str("MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS", "").strip(),
+    )
+    if p.strip()
 )
 
 _cfg_canon_primary = _cfg_str("MONITORING_CANONICAL_BOT_OPEN_ID", "").strip()
@@ -1636,6 +1651,16 @@ def _lark_ordered_strong_ids_from_at_tags(blob: str) -> List[str]:
     return ordered
 
 
+def _lark_im_message_has_visible_strong_at_html(msg: Optional[Dict[str, Any]]) -> bool:
+    """True when IM body blobs include ``<at …>`` carrying a strong ``ou_``/``cli_`` id."""
+    if not isinstance(msg, dict):
+        return False
+    for blob in _lark_im_content_blobs_for_at_parse(msg):
+        if _lark_ordered_strong_ids_from_at_tags(blob):
+            return True
+    return False
+
+
 def _lark_primary_strong_at_from_im_message(
     msg: Optional[Dict[str, Any]],
     mentions_list: Optional[List[Any]] = None,
@@ -1832,10 +1857,11 @@ def _monitoring_resolved_primary_at_target(
     Resolve primary @ target for shared multi-bot groups:
 
     1. When **two or more** bot-like ids appear in ``mentions[]``, prefer **document-order** strong ``<at …>`` /
-       post cells in the message body (canon ∪ peer bag) — Feishu often misorders ``@_user_N`` vs real ``<at user_id=…>``.
-    2. Leftmost visible ``key`` / ``mention_key`` / ``@name`` in plain text.
-    3. First ``@_user_N`` mapped via ``mentions[].key`` / index.
-    4. Fallback: any strong ``<at>`` / post id, then ``mentions[]`` row order.
+       post cells filtered to the canon ∪ peer bag.
+    2. Else **rich-text / post body**: first strong ``<at …>`` whose id is in the bot_like bag — **before**
+       ``@_user_N`` → ``mentions[]`` mapping (Feishu often binds ``@_user_1`` to the wrong row while HTML keeps the tapped bot).
+    3. Leftmost visible ``key`` / ``mention_key`` / ``@name``.
+    4. First ``@_user_N`` via ``mentions[].key`` / index; then ``mentions[]`` row order.
 
     Set ``MONITORING_LOG_PRIMARY_AT=1`` for one-line diagnostics on the server.
     """
@@ -1846,8 +1872,6 @@ def _monitoring_resolved_primary_at_target(
             rt = alt
         elif not (rt or "").strip():
             rt = alt
-    vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
-    ph = _lark_primary_strong_from_feishu_user_placeholders(rt, mentions_list)
 
     distinct_bot_like: Set[str] = set()
     body_chain: List[str] = []
@@ -1860,13 +1884,19 @@ def _monitoring_resolved_primary_at_target(
         if len(distinct_bot_like) >= 2:
             body_chain = _lark_visible_bot_like_at_chain(msg, bot_like_bag, mentions_list)
 
+    body_first_bot_like = _lark_primary_strong_at_from_im_message(msg, mentions_list)
+    vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
+    ph = _lark_primary_strong_from_feishu_user_placeholders(rt, mentions_list)
+
     if MONITORING_LOG_PRIMARY_AT:
         logger.info(
-            "monitoring primary-at dbg rt=%r mentions_n=%s distinct_bot_like=%s body_at_chain=%s ph=%s vis_early=%s",
+            "monitoring primary-at dbg rt=%r mentions_n=%s distinct_bot_like=%s body_at_chain=%s "
+            "body_first_bot_like=%s ph=%s vis_early=%s",
             (rt[:200] + ("…" if len(rt) > 200 else "")),
             len(mentions_list),
             sorted(distinct_bot_like),
             body_chain,
+            body_first_bot_like,
             ph,
             vis_early,
         )
@@ -1874,13 +1904,19 @@ def _monitoring_resolved_primary_at_target(
     if bot_like_bag and len(distinct_bot_like) >= 2 and body_chain:
         return body_chain[0]
 
+    if (
+        body_first_bot_like
+        and bot_like_bag
+        and body_first_bot_like in bot_like_bag
+    ):
+        return body_first_bot_like
+
     if vis_early:
         return vis_early
     if ph:
         return ph
-    b = _lark_primary_strong_at_from_im_message(msg, mentions_list)
-    if b:
-        return b
+    if body_first_bot_like:
+        return body_first_bot_like
     return _lark_primary_strong_from_mentions_order(mentions_list)
 
 
@@ -2248,6 +2284,38 @@ def _monitoring_at_bot_requirement_satisfied(
     if post_at_ordered:
         # Mobile post: trust document-order @ in body over mentions[] order (often lists both bots).
         primary = post_at_ordered[0]
+
+    if (
+        MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK
+        and MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS
+        and primary
+        and primary in MONITORING_PEER_BOT_OPEN_ID_SET
+        and _lark_raw_text_has_feishu_at_placeholder(raw_text)
+        and len(mentions_list) == 1
+        and isinstance(mentions_list[0], dict)
+        and isinstance(msg, dict)
+        and not _lark_im_message_has_visible_strong_at_html(msg)
+    ):
+        nm = str(mentions_list[0].get("name") or mentions_list[0].get("Name") or "").strip()
+        matched_sub = ""
+        for sub in MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS:
+            ss = sub.strip()
+            if ss and ss.casefold() in nm.casefold():
+                matched_sub = ss
+                break
+        if matched_sub:
+            eff = (_lark_effective_bot_open_id() or "").strip()
+            if eff and eff in canon_ids:
+                logger.info(
+                    "monitoring: primary retarget peer=%r → self=%r mention.name=%r matched=%r "
+                    "(MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK)",
+                    primary,
+                    eff,
+                    nm,
+                    matched_sub,
+                )
+                primary = eff
+
     app = str(APP_ID or "").strip()
     row_app_id_is_self = bool(app and _lark_mentions_any_row_matches_app(mentions_list, app))
     # Never auto-trigger on «sole mention open_id ∈ peer + @_user_N + /mo|/m|/c»: same payload when user
@@ -7041,8 +7109,11 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     sp_cmd: Optional[str] = None
     req_at_bot = MONITORING_TRIGGER_REQUIRES_AT_BOT
+    mute_or_cancel = _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER) or _im_command_matches(
+        clean or "", MONITORING_CANCELMUTE_TRIGGER
+    )
     monitoring_addressed_ok = True
-    if req_at_bot:
+    if req_at_bot and mute_or_cancel:
         monitoring_addressed_ok = _monitoring_at_bot_requirement_satisfied(
             raw_text,
             mentions,
@@ -7055,6 +7126,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         or _lark_im_bot_addressed_in_mentions_or_body(mentions, content_at_entity_ids)
         or monitoring_addressed_ok
     )
+    if mute_or_cancel and req_at_bot and not _mute_cancel_allowed:
+        logger.info(
+            "im.command @gate reject: %s raw=%r clean=%r (same primary rules as /mo — payload targets another bot)",
+            ("mute /m" if _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER) else "cancelmute /c"),
+            (raw_text or "")[:160],
+            (clean or "")[:160],
+        )
     if _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER):
         if _mute_cancel_allowed:
             sp_cmd = "mute"
@@ -7178,9 +7256,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             if ml
             else False
         )
+        mute_like = _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER) or _im_command_matches(
+            clean or "", MONITORING_CANCELMUTE_TRIGGER
+        )
         logger.info(
             "im.message no trigger raw=%r clean=%r mentions=%s mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s "
-            "mo_placeholder_cfg=%s mo_weak_nonempty_allow=%s body_has_@_user_N=%s mentions_other_ou_cli=%s bot_open_id_known=%s",
+            "mo_placeholder_cfg=%s mo_weak_nonempty_allow=%s body_has_@_user_N=%s mentions_other_ou_cli=%s bot_open_id_known=%s "
+            "mute_cancel_cmd=%s",
             (raw_text or "")[:160],
             (clean or "")[:160],
             len(mentions),
@@ -7193,6 +7275,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             body_ph,
             mo_ph_blocked_by_other,
             bool((_lark_effective_bot_open_id() or "").strip()),
+            mute_like,
         )
         return
 
