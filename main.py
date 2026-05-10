@@ -117,7 +117,6 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": 1600,
     # 1=点击折叠的 dashboard 行（如只显示 KPI 标题无图时）
     "GRAFANA_SCREENSHOT_EXPAND_ROWS": "1",
-    # 截图 URL 用 GRAFANA_DASHBOARD_FROM/TO（默认 now-15m / now）；0 则用 Prometheus 窗口的绝对毫秒时间戳
     "GRAFANA_SCREENSHOT_RELATIVE_RANGE": "1",
     # 截图 URL 追加 timezone=…（与 Grafana 时间栏一致）；设为 none / - 可省略该参数
     "GRAFANA_SCREENSHOT_TIMEZONE": "browser",
@@ -505,8 +504,8 @@ GRAFANA_PANEL_TITLE_GAMES_INHOUSE = _cfg_str(
 MONITORING_GAMES_INHOUSE_SERIES_KEYWORD = _cfg_str(
     "MONITORING_GAMES_INHOUSE_SERIES_KEYWORD", "6005"
 ).strip()
-# Browser URL time range for screenshots (default last 15 minutes, aligned with /monitoring tables).
-GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-15m")
+# Browser URL time range for screenshots (default last 30 minutes, aligned with /monitoring tables).
+GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-30m")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 # Prometheus query_range step (seconds); 60 → up to 15 buckets in 15m when lookback=900
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
