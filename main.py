@@ -267,8 +267,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_QUIET_END_HOUR": "0",
     "MONITORING_WATCH_QUIET_END_MINUTE": "10",
     # Tag person
-    "TARGET_USER_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
-    "JUNCHEN": "ou_5f660c0fb0769d184aca635d02209272",
+    "TARGET_USER_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
+    # 告警 / 超阈值 /mo 文末仅 @ 此人时追加的说明（空=只 @ 不追加句子）
+    "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
     # In which group
     "MONITORING_ALERT_CHAT_ID": "oc_9de3d63fc589df6feeb9b0bee9c45b72",
 }
@@ -570,6 +571,10 @@ MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/mo")
 MONITORING_MUTE_TRIGGER = _cfg_str("MONITORING_MUTE_TRIGGER", "/m").strip()
 MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").strip()
 TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
+MONITORING_ALERT_AT_USER_NOTE = _cfg_str(
+    "MONITORING_ALERT_AT_USER_NOTE",
+    "It might be event started or false alert kindly check",
+).strip()
 MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
 MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 15.0)
 MONITORING_HTTP_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_HTTP_CONTINUOUS_ALERT_PCT", 20.0)
@@ -4127,7 +4132,7 @@ def _monitoring_interactive_card_dict(
     lark_img_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Feishu card JSON v2 — markdown card, optional embedded PNG."""
-    title = "📊 GRAFANA GRAPH"
+    title = "📊 GRAFANA PLATFORM GRAPH"
     is_alert_card = (reply or "").lstrip().startswith("[ALERT]")
     elements: List[Dict[str, Any]] = [
         {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
@@ -6229,6 +6234,16 @@ def _format_trigger_fallback_line(
     return None
 
 
+def _append_monitoring_alert_target_user_mention(lines: List[str]) -> None:
+    """Alert / threshold hits: mention only ``TARGET_USER_OPEN_ID`` with optional disclaimer line."""
+    if not TARGET_USER_OPEN_ID:
+        return
+    lines.append("")
+    if MONITORING_ALERT_AT_USER_NOTE:
+        lines.append(MONITORING_ALERT_AT_USER_NOTE)
+    lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
+
+
 def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     """
     Alert-only concise content:
@@ -6360,9 +6375,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         lines.append("Alert fired but no panel matched text details (no analyzable points).")
     else:
         lines.append("\n────────\n".join(reason_blocks))
-    if TARGET_USER_OPEN_ID:
-        lines.append("")
-        lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
+    _append_monitoring_alert_target_user_mention(lines)
     return "\n".join(lines)
 
 
@@ -6561,12 +6574,8 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             lines.extend(rows)
             lines.append("```")
 
-    if (
-        include_target_mention
-        and _monitoring_payload_hit_alert(payload)
-        and TARGET_USER_OPEN_ID
-    ):
-        lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
+    if include_target_mention and _monitoring_payload_hit_alert(payload):
+        _append_monitoring_alert_target_user_mention(lines)
     lines.extend(_format_http_analysis_lines(http_ex))
 
     return "\n".join(lines)
