@@ -5177,6 +5177,41 @@ def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
             pass
 
 
+def _grafana_playwright_ensure_dashboard_charts_visible(
+    page: Any, timeout_ms: int, url: str
+) -> bool:
+    """
+    Last-chance scroll / reload before PNG when headless Grafana shows header-only blank main area.
+    """
+    if _grafana_dashboard_has_visual_content(page):
+        return True
+    logger.warning("Grafana screenshot: charts not visible before capture — extra scroll pass")
+    _grafana_scroll_paint_lazy_panels(page)
+    _grafana_wait_panels_fully_loaded(
+        page, min(9000, int(GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS))
+    )
+    page.wait_for_timeout(320)
+    if _grafana_dashboard_has_visual_content(page):
+        return True
+    logger.warning("Grafana screenshot: still blank — one reload retry before capture")
+    try:
+        page.goto(url, wait_until="load", timeout=timeout_ms)
+        page.wait_for_timeout(280)
+        _grafana_playwright_dock_nav_only(page, timeout_ms)
+        _grafana_click_dashboard_refresh(page, timeout_ms)
+        _grafana_playwright_dock_nav_only(page, timeout_ms)
+        _grafana_expand_collapsed_dashboard_rows(page)
+        _grafana_wait_dashboard_ready(page, min(18000, timeout_ms // 2))
+        _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
+        _grafana_stabilize_dashboard_render(page, timeout_ms, rounds=2)
+        _grafana_wait_panels_fully_loaded(page, int(GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS))
+        _grafana_scroll_paint_lazy_panels(page)
+        page.wait_for_timeout(240)
+    except Exception as e:
+        logger.warning("Grafana screenshot: blank-capture reload retry failed: %s", e)
+    return _grafana_dashboard_has_visual_content(page)
+
+
 def _grafana_playwright_render_dashboard_and_png(
     page: Any,
     url: str,
@@ -5250,7 +5285,15 @@ def _grafana_playwright_render_dashboard_and_png(
     _grafana_close_open_menus(page)
     _grafana_playwright_dock_nav_only(page, timeout_ms)
     _grafana_playwright_pre_screenshot_paint_flush(page)
+    if not _grafana_playwright_ensure_dashboard_charts_visible(page, timeout_ms, url):
+        logger.error(
+            "Grafana screenshot: capture proceeding but dashboard may be blank "
+            "(check grafana_session cookie / GRAFANA_DASHBOARD_PATH / "
+            "GRAFANA_SCREENSHOT_POPULATE_MAX_MS / GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS)"
+        )
     if highlight_panel_titles:
+        _grafana_scroll_paint_lazy_panels(page)
+        page.wait_for_timeout(200)
         _grafana_playwright_highlight_alert_panels(page, highlight_panel_titles)
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
     try:
@@ -6855,13 +6898,29 @@ def _monitoring_send_screenshot_on_card_click(chat_id: str, open_id: str) -> Non
         if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
             raise RuntimeError("GRAFANA_SCREENSHOT_ENABLE=0")
         sess = grafana_login_session()
-        payload = fetch_request_total_1m_series(session=sess)
+        payload = fetch_monitoring_payload(session=sess)
+        alert_hit = _monitoring_payload_hit_alert(payload)
+        highlight = _monitoring_alert_panel_titles(payload) if alert_hit else []
         w = payload.get("window") or {}
         su = int(w.get("startUnix") or 0)
         eu = int(w.get("endUnix") or 0)
         if su <= 0 or eu <= 0:
             raise RuntimeError(f"invalid screenshot window start={su} end={eu}")
-        png = _grafana_headless_screenshot_png(sess, su, eu)
+        if alert_hit:
+            rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-15m").strip() or "now-15m"
+            rt = _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip() or "now"
+            tz = _cfg_str("MONITORING_WATCH_SCREENSHOT_TIMEZONE", "browser").strip()
+            png = _grafana_headless_screenshot_png(
+                sess,
+                su,
+                eu,
+                relative_from=rf,
+                relative_to=rt,
+                timezone_param=tz or None,
+                highlight_panel_titles=highlight or None,
+            )
+        else:
+            png = _grafana_headless_screenshot_png(sess, su, eu)
         key = _lark_upload_png_image_key(png)
         if (chat_id or "").strip():
             _lark_send_image_message("chat_id", chat_id.strip(), key)
@@ -6870,10 +6929,12 @@ def _monitoring_send_screenshot_on_card_click(chat_id: str, open_id: str) -> Non
         else:
             raise RuntimeError("missing chat_id/open_id")
         logger.info(
-            "monitoring card-action screenshot sent chat=%r open=%r bytes=%s",
+            "monitoring card-action screenshot sent chat=%r open=%r bytes=%s alert_hit=%s highlight_panels=%s",
             bool(chat_id),
             bool(open_id),
             len(png),
+            alert_hit,
+            len(highlight),
         )
     except Exception as e:
         logger.exception("monitoring card-action screenshot failed")
