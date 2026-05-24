@@ -134,11 +134,11 @@ _CFG: Dict[str, Any] = {
     # 常驻浏览器每次截图前：不清空全部 cookie，只追加/覆盖新登录（减轻 SPA 主区闪空白）
     "GRAFANA_PERSISTENT_BROWSER_SOFT_COOKIE": "1",
     # 按快门前几毫秒：置顶滚动 + 等字体 + rAF，缓解 headless「已 ready 但 PNG 仍空壳」
-    "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "800",
+    "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "1200",
     # 1=快门前再跑一轮整页滚动刷 canvas（更慢但更稳）
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL": "0",
     # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
-    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 4500,
+    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 8000,
     # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
     "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 1,
     "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 100,
@@ -151,7 +151,7 @@ _CFG: Dict[str, Any] = {
     # 截图前“全面板加载”最少面板数（防小屏/过滤时占比误判）
     "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 8,
     # 全面板加载等待预算（毫秒）
-    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 12000,
+    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 18000,
     # 告警截图：Playwright 在触发告警的面板外框加红边（仅告警路径传入 panel titles 时生效）
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT": "1",
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT_COLOR": "#FF0000",
@@ -4306,15 +4306,31 @@ _GRAFANA_JS_REACTROOT_HAS_CHARTS = """() => {
   const rr = document.getElementById('reactRoot');
   if (!rr) return false;
   const n = (sel) => rr.querySelectorAll(sel).length;
+  const visibleCanvas = () => {
+    let c = 0;
+    for (const el of rr.querySelectorAll('canvas')) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 40 && r.height > 24) c += 1;
+    }
+    return c;
+  };
+  const visibleUplot = () => {
+    let c = 0;
+    for (const el of rr.querySelectorAll('[data-testid="uplot-main-div"]')) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 40 && r.height > 24) c += 1;
+    }
+    return c;
+  };
   const grid = n('.react-grid-item');
-  const uplot = n('[data-testid="uplot-main-div"]');
-  const canv = n('canvas');
-  const panels = n('[data-testid^="data-testid Panel"], [class*="PanelChrome"], [class*="panel-content"]');
+  const canv = visibleCanvas();
+  const uplot = visibleUplot();
+  if (canv + uplot >= 1) return true;
+  const panels = n('[data-testid^="data-testid Panel"], [class*="PanelChrome"]');
   const main = document.querySelector('main');
   const mh = main ? main.getBoundingClientRect().height : 0;
-  if (grid + uplot + canv >= 1) return true;
-  if (panels >= 1 && mh > 140) return true;
-  if (canv >= 1 && mh > 100) return true;
+  if (grid >= 2 && mh > 220) return true;
+  if (panels >= 2 && mh > 220) return true;
   return false;
 }"""
 
@@ -4809,7 +4825,7 @@ def _grafana_wait_panels_fully_loaded(page: Any, budget_ms: int) -> None:
     )
 
 
-def _grafana_scroll_paint_lazy_panels(page: Any) -> None:
+def _grafana_scroll_paint_lazy_panels(page: Any, *, return_to_top: bool = True) -> None:
     """Scroll by ~viewport steps so off-screen panels mount and uPlot/canvas paint."""
     pause = int(GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS)
     try:
@@ -4828,8 +4844,9 @@ def _grafana_scroll_paint_lazy_panels(page: Any) -> None:
             y += step
         page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(pause)
-        page.evaluate("() => window.scrollTo(0, 0)")
-        page.wait_for_timeout(max(90, int(pause * 0.45)))
+        if return_to_top:
+            page.evaluate("() => window.scrollTo(0, 0)")
+            page.wait_for_timeout(max(90, int(pause * 0.45)))
     except Exception as e:
         logger.info("Grafana screenshot: scroll paint step skipped: %s", e)
 
@@ -5133,19 +5150,21 @@ def _grafana_playwright_highlight_alert_panels(page: Any, panel_titles: Optional
 
 def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
     """
-    Headless Grafana 有时「面板 ready 统计够了」但 uPlot/canvas 尚未合成进位图；快门前强制置顶、
-    等字体与双 rAF，减少全页截图只有侧栏/顶栏、主区纯底色的情况。
+    Headless Grafana 有时「面板 ready 统计够了」但 uPlot/canvas 尚未合成进位图；快门前等字体与双 rAF。
+    全页截图时不再强制 scrollTop=0（会把刚滚出来的 canvas 又弄没）；改为整页 scroll-paint 后保留位置。
     """
-    try:
-        page.evaluate(
-            """() => {
-              window.scrollTo(0, 0);
-              const s = document.scrollingElement || document.documentElement;
-              if (s) s.scrollTop = 0;
-            }"""
-        )
-    except Exception:
-        pass
+    full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
+    if not full_page:
+        try:
+            page.evaluate(
+                """() => {
+                  window.scrollTo(0, 0);
+                  const s = document.scrollingElement || document.documentElement;
+                  if (s) s.scrollTop = 0;
+                }"""
+            )
+        except Exception:
+            pass
     try:
         page.evaluate(
             """async () => {
@@ -5166,12 +5185,9 @@ def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
         )
     except Exception:
         pass
-    if _lark_env_truthy("GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL"):
+    if full_page or _lark_env_truthy("GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL"):
         try:
-            _grafana_scroll_paint_lazy_panels(page)
-            page.evaluate(
-                "() => { window.scrollTo(0, 0); const s = document.scrollingElement || document.documentElement; if (s) s.scrollTop = 0; }"
-            )
+            _grafana_scroll_paint_lazy_panels(page, return_to_top=not full_page)
             page.wait_for_timeout(220)
         except Exception:
             pass
@@ -5195,8 +5211,11 @@ def _grafana_playwright_ensure_dashboard_charts_visible(
         return True
     logger.warning("Grafana screenshot: still blank — one reload retry before capture")
     try:
-        page.goto(url, wait_until="load", timeout=timeout_ms)
-        page.wait_for_timeout(280)
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        try:
+            page.wait_for_load_state("networkidle", timeout=min(20000, max(8000, timeout_ms // 3)))
+        except Exception:
+            page.wait_for_timeout(500)
         _grafana_playwright_dock_nav_only(page, timeout_ms)
         _grafana_click_dashboard_refresh(page, timeout_ms)
         _grafana_playwright_dock_nav_only(page, timeout_ms)
@@ -5224,7 +5243,11 @@ def _grafana_playwright_render_dashboard_and_png(
     as ephemeral screenshots (shared with :class:`GrafanaPlaywrightKeeper`).
     Caller must have injected Grafana cookies (and optional boot-warm root ``/``) beforehand.
     """
-    page.goto(url, wait_until="load", timeout=timeout_ms)
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    try:
+        page.wait_for_load_state("networkidle", timeout=min(25000, max(8000, timeout_ms // 3)))
+    except Exception:
+        page.wait_for_timeout(600)
     page.wait_for_timeout(200)
     _grafana_playwright_dock_nav_only(page, timeout_ms)
     _grafana_click_dashboard_refresh(page, timeout_ms)
@@ -5292,9 +5315,14 @@ def _grafana_playwright_render_dashboard_and_png(
             "GRAFANA_SCREENSHOT_POPULATE_MAX_MS / GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS)"
         )
     if highlight_panel_titles:
-        _grafana_scroll_paint_lazy_panels(page)
+        _grafana_scroll_paint_lazy_panels(page, return_to_top=False)
         page.wait_for_timeout(200)
         _grafana_playwright_highlight_alert_panels(page, highlight_panel_titles)
+    if not _grafana_dashboard_has_visual_content(page):
+        raise RuntimeError(
+            "Grafana screenshot refused: dashboard charts not visible after waits "
+            "(blank PNG avoided — check session cookie / panel load timeouts)"
+        )
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
     try:
         return page.screenshot(type="png", full_page=full_page, animations="disabled")
@@ -5393,28 +5421,44 @@ class GrafanaPlaywrightKeeper:
                 ),
                 locale="en-US",
             )
-            page = context.new_page()
-            try:
-                page.add_init_script(
-                    "try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});}catch(e){}"
-                )
-            except Exception:
-                pass
-
+            warm_page: Optional[Any] = None
             timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
             base = str(GRAFANA_BASE_URL).rstrip("/")
             sess0 = grafana_login_session()
             context.add_cookies(_playwright_cookie_list(sess0))
             if _lark_env_truthy("GRAFANA_SCREENSHOT_BOOT_WARM"):
-                page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(20000, timeout_ms))
-                page.wait_for_timeout(220)
+                warm_page = context.new_page()
+                try:
+                    warm_page.add_init_script(
+                        "try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});}catch(e){}"
+                    )
+                except Exception:
+                    pass
+                warm_page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(20000, timeout_ms))
+                warm_page.wait_for_timeout(220)
 
             warm_url = _grafana_build_screenshot_dashboard_url(0, 0)
             logger.info("GrafanaPlaywrightKeeper: warm-up load url=%s…", warm_url[:220])
-            _ = _grafana_playwright_render_dashboard_and_png(page, warm_url, timeout_ms)
+            warm_job_page = context.new_page()
+            try:
+                warm_job_page.add_init_script(
+                    "try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});}catch(e){}"
+                )
+            except Exception:
+                pass
+            _ = _grafana_playwright_render_dashboard_and_png(warm_job_page, warm_url, timeout_ms)
+            try:
+                warm_job_page.close()
+            except Exception:
+                pass
+            if warm_page is not None:
+                try:
+                    warm_page.close()
+                except Exception:
+                    pass
             logger.info(
                 "GrafanaPlaywrightKeeper: warm-up finished — persistent Chromium stays open; "
-                "screenshot jobs reuse this browser (see log line 'using persistent Playwright keeper')."
+                "each screenshot job uses a fresh tab (see log line 'using persistent Playwright keeper')."
             )
             self._ready.set()
 
@@ -5423,10 +5467,7 @@ class GrafanaPlaywrightKeeper:
                 try:
                     job = self._q.get(timeout=idle_sec)
                 except queue.Empty:
-                    try:
-                        _grafana_click_dashboard_refresh(page, timeout_ms)
-                    except Exception as ex:
-                        logger.debug("GrafanaPlaywrightKeeper idle refresh: %s", ex)
+                    # Do not click Refresh on a stale shared tab — wrong control → blank dashboard body.
                     continue
                 if job.get("op") == "stop":
                     break
@@ -5436,6 +5477,7 @@ class GrafanaPlaywrightKeeper:
                 box: Dict[str, Any] = job["box"]
                 jurl = str(job.get("url") or "")
                 jto = int(job.get("timeout_ms") or timeout_ms)
+                job_page: Optional[Any] = None
                 try:
                     sess = grafana_login_session()
                     ck = _playwright_cookie_list(sess)
@@ -5448,8 +5490,15 @@ class GrafanaPlaywrightKeeper:
                     else:
                         context.clear_cookies()
                         context.add_cookies(ck)
+                    job_page = context.new_page()
+                    try:
+                        job_page.add_init_script(
+                            "try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});}catch(e){}"
+                        )
+                    except Exception:
+                        pass
                     box["png"] = _grafana_playwright_render_dashboard_and_png(
-                        page,
+                        job_page,
                         jurl,
                         max(5000, jto),
                         highlight_panel_titles=job.get("highlight_panel_titles") or None,
@@ -5457,6 +5506,11 @@ class GrafanaPlaywrightKeeper:
                 except Exception as ex:
                     box["err"] = ex
                 finally:
+                    if job_page is not None:
+                        try:
+                            job_page.close()
+                        except Exception:
+                            pass
                     ev.set()
         except Exception as ex:
             self._fatal = ex
@@ -5561,6 +5615,21 @@ def _grafana_headless_screenshot_png(
                 "Grafana persistent keeper screenshot failed (%s); falling back to ephemeral browser",
                 e,
             )
+
+    return _grafana_ephemeral_playwright_screenshot_png(
+        cookies, url, timeout_ms, highlight_panel_titles=highlight_panel_titles
+    )
+
+
+def _grafana_ephemeral_playwright_screenshot_png(
+    cookies: List[Dict[str, Any]],
+    url: str,
+    timeout_ms: int,
+    *,
+    highlight_panel_titles: Optional[List[str]] = None,
+) -> bytes:
+    """One-shot Chromium launch (no keeper reuse). Used as fallback when keeper fails or returns blank."""
+    from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
