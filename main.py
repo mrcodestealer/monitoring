@@ -26,8 +26,8 @@ HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额�
 
 可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：与卡片同开时先截一张上传为 ``image_key`` 嵌入卡片；仅关卡片时仍为无头 Chromium 截图后单独发图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
 默认 ``GRAFANA_PERSISTENT_BROWSER=1``：进程启动时后台常驻一颗 Chromium，先预热 Grafana；``/monitoring`` 与告警截图复用该页，失败时自动回退为「每次新开浏览器」。
-默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1``：scroll 0 下整页截图（不 clip、不移动 grid，避免 panel 重叠 / Pulsar 被裁掉）；告警面板红框仍生效。
-告警截图默认 ``GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT=1``：仅对 **触发阈值** 的面板（如 HTTP / 充值 / 提款）在 PNG 外加红色边框，便于一眼定位；``/mo`` 无告警或 Resend screenshot 不加框。
+默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1``：``/mo`` 无告警时整页截图。``GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL=1``（默认）时 **告警** 走 ``/d-solo/…?panelId=`` 只截第一个触发面板（视口 PNG），避免整页里红框散落。
+告警截图默认 ``GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT=1``：solo 模式下红框包住该单面板；整页回退时仍按标题匹配多面板。
 多轮滚动 + Spinner 轮询见 ``GRAFANA_SCREENSHOT_STABILIZE_ROUNDS`` 等键；Prometheus 无数据/报错的格子无法被脚本「画出曲线」。
 """
 
@@ -156,6 +156,10 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT": "1",
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT_COLOR": "#FF0000",
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT_BORDER_PX": "4",
+    # 1=告警截图用 Grafana d-solo 单面板（视口 PNG，适合 Lark 卡片）；0=告警仍整页+红框
+    "GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL": "1",
+    "GRAFANA_SCREENSHOT_ALERT_SOLO_WIDTH": "1200",
+    "GRAFANA_SCREENSHOT_ALERT_SOLO_HEIGHT": "560",
     # 1=压扁显示 No data 且无图表的大面板（仅改 height，不碰 react-grid transform）；0=关
     "GRAFANA_SCREENSHOT_COMPACT_EMPTY_PANELS": "1",
     "GRAFANA_SCREENSHOT_COMPACT_EMPTY_MAX_HEIGHT_PX": "72",
@@ -583,6 +587,13 @@ GRAFANA_SCREENSHOT_COMPACT_EMPTY_MAX_HEIGHT_PX = max(
     48, min(240, _cfg_int("GRAFANA_SCREENSHOT_COMPACT_EMPTY_MAX_HEIGHT_PX", 72))
 )
 GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL = _lark_env_truthy("GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL")
+GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL = _lark_env_truthy("GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL")
+GRAFANA_SCREENSHOT_ALERT_SOLO_WIDTH = max(
+    400, min(2400, _cfg_int("GRAFANA_SCREENSHOT_ALERT_SOLO_WIDTH", 1200))
+)
+GRAFANA_SCREENSHOT_ALERT_SOLO_HEIGHT = max(
+    240, min(1600, _cfg_int("GRAFANA_SCREENSHOT_ALERT_SOLO_HEIGHT", 560))
+)
 GRAFANA_USER = (
     _cfg_str("GRAFANA_USER")
     or _cfg_str("GRAFANA_ID")
@@ -5130,6 +5141,108 @@ def _grafana_build_screenshot_dashboard_url(
     return f"{GRAFANA_BASE_URL}{GRAFANA_DASHBOARD_PATH}?{q}"
 
 
+def _grafana_dashboard_slug() -> str:
+    """Last path segment of ``GRAFANA_DASHBOARD_PATH`` (e.g. ``core-metrics-arms-aliyun``)."""
+    parts = [p for p in (GRAFANA_DASHBOARD_PATH or "").split("/") if p]
+    if len(parts) >= 3 and parts[0] == "d":
+        return parts[-1]
+    return parts[-1] if parts else "dashboard"
+
+
+def _grafana_panel_id_for_title(session: requests.Session, panel_title: str) -> Optional[int]:
+    dash = _fetch_dashboard_model(session, GRAFANA_DASHBOARD_UID)
+    panel = _find_panel(dash, panel_title)
+    if not panel:
+        return None
+    pid = panel.get("id")
+    if pid is None:
+        return None
+    try:
+        return int(pid)
+    except (TypeError, ValueError):
+        return None
+
+
+def _grafana_build_solo_panel_url(
+    panel_id: int,
+    *,
+    relative_from: Optional[str] = None,
+    relative_to: Optional[str] = None,
+    timezone_param: Optional[str] = None,
+) -> str:
+    """Grafana solo panel view — one chart fills the viewport (alert screenshots)."""
+    params: List[Tuple[str, str]] = [
+        ("orgId", "1"),
+        ("panelId", str(int(panel_id))),
+    ]
+    rf = (relative_from or "").strip() or (GRAFANA_DASHBOARD_FROM or "now-15m").strip()
+    rt = (relative_to or "").strip() or (GRAFANA_DASHBOARD_TO or "now").strip()
+    params.extend([("from", rf), ("to", rt)])
+    tz = (timezone_param or "").strip()
+    if not tz:
+        tz = (GRAFANA_SCREENSHOT_TIMEZONE or "").strip()
+    if tz.lower() not in ("none", "-", "off", "0", "false", "no"):
+        if tz:
+            params.append(("timezone", tz))
+    k = (GRAFANA_SCREENSHOT_KIOSK or "").strip().lower()
+    if k and k not in ("0", "false", "no", "off"):
+        if k in ("1", "true", "yes", "on"):
+            params.append(("kiosk", "1"))
+        else:
+            params.append(("kiosk", k))
+    slug = _grafana_dashboard_slug()
+    q = urlencode(params)
+    return f"{GRAFANA_BASE_URL}/d-solo/{GRAFANA_DASHBOARD_UID}/{slug}?{q}"
+
+
+def _grafana_resolve_alert_solo_capture(
+    session: requests.Session,
+    highlight_panel_titles: Optional[List[str]],
+    *,
+    relative_from: Optional[str] = None,
+    relative_to: Optional[str] = None,
+    timezone_param: Optional[str] = None,
+) -> Optional[Tuple[str, str, int]]:
+    """
+    If solo alert capture applies, return ``(solo_url, primary_panel_title, panel_id)``.
+    Uses the **first** alerting panel title when several fire at once.
+    """
+    if not GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL:
+        return None
+    titles = [str(t).strip() for t in (highlight_panel_titles or []) if str(t).strip()]
+    if not titles:
+        return None
+    primary = titles[0]
+    pid = _grafana_panel_id_for_title(session, primary)
+    if pid is None:
+        logger.warning(
+            'Grafana alert solo: panel id not found for title=%r — falling back to full dashboard',
+            primary,
+        )
+        return None
+    if len(titles) > 1:
+        logger.info(
+            "Grafana alert solo: %s alerting panels; capturing first only: %r (panelId=%s)",
+            len(titles),
+            primary,
+            pid,
+        )
+    url = _grafana_build_solo_panel_url(
+        pid,
+        relative_from=relative_from,
+        relative_to=relative_to,
+        timezone_param=timezone_param,
+    )
+    return url, primary, pid
+
+
+def _grafana_solo_viewport_size() -> Dict[str, int]:
+    return {
+        "width": int(GRAFANA_SCREENSHOT_ALERT_SOLO_WIDTH),
+        "height": int(GRAFANA_SCREENSHOT_ALERT_SOLO_HEIGHT),
+    }
+
+
 def _grafana_wait_dashboard_ready(page: Any, timeout_ms: int) -> None:
     """
     SPA 在 ``domcontentloaded`` 时往往还没有 panel；此处在 ``load`` 之后仍要等网格/画布出现。
@@ -5509,6 +5622,91 @@ def _grafana_playwright_render_dashboard_and_png(
     return _grafana_playwright_capture_dashboard_png(page)
 
 
+def _grafana_playwright_capture_viewport_png(page: Any) -> bytes:
+    """Viewport-only PNG for d-solo (no full_page scroll height)."""
+    _grafana_playwright_scroll_to_top(page)
+    _grafana_wait_loading_like_gone(page, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS))
+    page.wait_for_timeout(320)
+    try:
+        page.evaluate(
+            "() => new Promise((resolve) => {"
+            "  requestAnimationFrame(() => { requestAnimationFrame(() => resolve(undefined)); });"
+            "})"
+        )
+    except Exception:
+        pass
+    logger.info("Grafana screenshot: viewport capture (solo panel)")
+    try:
+        return page.screenshot(type="png", full_page=False, animations="disabled")
+    except TypeError:
+        return page.screenshot(type="png", full_page=False)
+
+
+def _grafana_playwright_render_solo_panel_and_png(
+    page: Any,
+    url: str,
+    timeout_ms: int,
+    *,
+    highlight_panel_title: Optional[str] = None,
+) -> bytes:
+    """
+    Navigate to ``/d-solo/…?panelId=`` and capture a single focused chart (alert path).
+    """
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    try:
+        page.wait_for_load_state("networkidle", timeout=min(20000, max(6000, timeout_ms // 4)))
+    except Exception:
+        page.wait_for_timeout(500)
+    page.wait_for_timeout(200)
+    _grafana_playwright_dock_nav_only(page, timeout_ms)
+    _grafana_click_dashboard_refresh(page, timeout_ms)
+    _grafana_playwright_dock_nav_only(page, timeout_ms)
+    _grafana_wait_dashboard_ready(page, min(14000, timeout_ms // 2))
+    _grafana_wait_dashboard_body_populated(
+        page, min(6000, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
+    )
+    _grafana_wait_loading_like_gone(
+        page,
+        max(int(GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS), int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)),
+    )
+    if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
+        page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
+    _grafana_close_open_menus(page)
+    if highlight_panel_title and GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT:
+        _grafana_playwright_highlight_alert_panels(page, [highlight_panel_title])
+        page.wait_for_timeout(120)
+    if not _grafana_dashboard_has_visual_content(page):
+        raise RuntimeError(
+            "Grafana solo screenshot refused: chart not visible "
+            f"(panel title={highlight_panel_title!r})"
+        )
+    return _grafana_playwright_capture_viewport_png(page)
+
+
+def _grafana_playwright_render_page_and_png(
+    page: Any,
+    url: str,
+    timeout_ms: int,
+    *,
+    highlight_panel_titles: Optional[List[str]] = None,
+    solo_primary_title: Optional[str] = None,
+) -> bytes:
+    if "/d-solo/" in (url or ""):
+        return _grafana_playwright_render_solo_panel_and_png(
+            page,
+            url,
+            timeout_ms,
+            highlight_panel_title=solo_primary_title
+            or ((highlight_panel_titles or [None])[0] if highlight_panel_titles else None),
+        )
+    return _grafana_playwright_render_dashboard_and_png(
+        page,
+        url,
+        timeout_ms,
+        highlight_panel_titles=highlight_panel_titles,
+    )
+
+
 class GrafanaPlaywrightKeeper:
     """
     One daemon thread owns Playwright + Chromium + a single dashboard ``page``.
@@ -5537,6 +5735,7 @@ class GrafanaPlaywrightKeeper:
         timeout_ms: int,
         *,
         highlight_panel_titles: Optional[List[str]] = None,
+        solo_primary_title: Optional[str] = None,
     ) -> bytes:
         warm_wait = max(120.0, float(timeout_ms) / 1000.0 + 45.0)
         if not self._ready.wait(timeout=warm_wait):
@@ -5552,6 +5751,7 @@ class GrafanaPlaywrightKeeper:
                 "url": url,
                 "timeout_ms": int(timeout_ms),
                 "highlight_panel_titles": list(highlight_panel_titles or []),
+                "solo_primary_title": (solo_primary_title or "").strip() or None,
                 "ev": ev,
                 "box": box,
             }
@@ -5676,11 +5876,17 @@ class GrafanaPlaywrightKeeper:
                         )
                     except Exception:
                         pass
-                    box["png"] = _grafana_playwright_render_dashboard_and_png(
+                    if "/d-solo/" in jurl:
+                        try:
+                            job_page.set_viewport_size(_grafana_solo_viewport_size())
+                        except Exception:
+                            pass
+                    box["png"] = _grafana_playwright_render_page_and_png(
                         job_page,
                         jurl,
                         max(5000, jto),
                         highlight_panel_titles=job.get("highlight_panel_titles") or None,
+                        solo_primary_title=job.get("solo_primary_title"),
                     )
                 except Exception as ex:
                     box["err"] = ex
@@ -5742,8 +5948,11 @@ def _grafana_headless_screenshot_png(
     Headless Chromium (Playwright) opens the same dashboard URL as the UI, with session cookies.
     Requires: ``pip install playwright`` and ``playwright install chromium`` on the server.
 
-    ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` (default): ``page.screenshot(full_page=True)`` — full scroll height
-    so KPI rows below the fold are included. ``0`` captures only the viewport (``WIDTH``×``HEIGHT``).
+    ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` (default): full dashboard for ``/mo`` / non-alert paths.
+
+    When ``highlight_panel_titles`` is set and ``GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL=1``, opens
+    ``/d-solo/{uid}/{slug}?panelId=…`` (first alerting panel) and captures viewport only
+    (``GRAFANA_SCREENSHOT_ALERT_SOLO_WIDTH``×``…_HEIGHT``).
 
     Defaults favor **low latency** (short sleeps, tight spinner/populate caps). If captures go blank,
     raise ``GRAFANA_SCREENSHOT_POPULATE_MAX_MS`` and ``GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS`` first.
@@ -5761,22 +5970,43 @@ def _grafana_headless_screenshot_png(
             "Playwright not installed — pip install playwright && playwright install chromium"
         ) from e
 
-    url = _grafana_build_screenshot_dashboard_url(
-        start_unix,
-        end_unix,
+    solo_primary: Optional[str] = None
+    solo_cap = _grafana_resolve_alert_solo_capture(
+        session,
+        highlight_panel_titles,
         relative_from=relative_from,
         relative_to=relative_to,
         timezone_param=timezone_param,
     )
+    if solo_cap:
+        url, solo_primary, panel_id = solo_cap
+        highlight_for_render = (
+            [solo_primary] if solo_primary and GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT else None
+        )
+        logger.info(
+            "Grafana screenshot: alert solo panelId=%s title=%r",
+            panel_id,
+            solo_primary,
+        )
+    else:
+        url = _grafana_build_screenshot_dashboard_url(
+            start_unix,
+            end_unix,
+            relative_from=relative_from,
+            relative_to=relative_to,
+            timezone_param=timezone_param,
+        )
+        highlight_for_render = highlight_panel_titles
     cookies = _playwright_cookie_list(session)
     timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
     rel_eff = GRAFANA_SCREENSHOT_RELATIVE_RANGE or bool(
         (relative_from or "").strip() or (relative_to or "").strip()
     )
     logger.info(
-        "Grafana screenshot: relative_range=%s highlight_panels=%s url=%s",
+        "Grafana screenshot: relative_range=%s highlight_panels=%s solo=%s url=%s",
         rel_eff,
-        len(highlight_panel_titles or []),
+        len(highlight_for_render or []),
+        bool(solo_cap),
         url[:300] + ("…" if len(url) > 300 else ""),
     )
 
@@ -5787,7 +6017,8 @@ def _grafana_headless_screenshot_png(
             return k.request_png(
                 url,
                 timeout_ms,
-                highlight_panel_titles=highlight_panel_titles,
+                highlight_panel_titles=highlight_for_render,
+                solo_primary_title=solo_primary,
             )
         except Exception as e:
             logger.warning(
@@ -5796,7 +6027,11 @@ def _grafana_headless_screenshot_png(
             )
 
     return _grafana_ephemeral_playwright_screenshot_png(
-        cookies, url, timeout_ms, highlight_panel_titles=highlight_panel_titles
+        cookies,
+        url,
+        timeout_ms,
+        highlight_panel_titles=highlight_for_render,
+        solo_primary_title=solo_primary,
     )
 
 
@@ -5806,10 +6041,16 @@ def _grafana_ephemeral_playwright_screenshot_png(
     timeout_ms: int,
     *,
     highlight_panel_titles: Optional[List[str]] = None,
+    solo_primary_title: Optional[str] = None,
 ) -> bytes:
     """One-shot Chromium launch (no keeper reuse). Used as fallback when keeper fails or returns blank."""
     from playwright.sync_api import sync_playwright
 
+    solo = "/d-solo/" in (url or "")
+    vp = _grafana_solo_viewport_size() if solo else {
+        "width": max(400, int(GRAFANA_SCREENSHOT_WIDTH)),
+        "height": max(300, int(GRAFANA_SCREENSHOT_HEIGHT)),
+    }
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -5821,10 +6062,7 @@ def _grafana_ephemeral_playwright_screenshot_png(
         )
         try:
             context = browser.new_context(
-                viewport={
-                    "width": max(400, int(GRAFANA_SCREENSHOT_WIDTH)),
-                    "height": max(300, int(GRAFANA_SCREENSHOT_HEIGHT)),
-                },
+                viewport=vp,
                 user_agent=(
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
@@ -5846,11 +6084,12 @@ def _grafana_ephemeral_playwright_screenshot_png(
                 page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(20000, timeout_ms))
                 page.wait_for_timeout(220)
 
-            return _grafana_playwright_render_dashboard_and_png(
+            return _grafana_playwright_render_page_and_png(
                 page,
                 url,
                 timeout_ms,
                 highlight_panel_titles=highlight_panel_titles,
+                solo_primary_title=solo_primary_title,
             )
         finally:
             browser.close()
