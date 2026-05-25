@@ -135,7 +135,7 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_PERSISTENT_BROWSER_SOFT_COOKIE": "1",
     # 按快门前几毫秒：置顶滚动 + 等字体 + rAF，缓解 headless「已 ready 但 PNG 仍空壳」
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "1200",
-    # 1=快门前再跑一轮整页滚动刷 canvas（更慢但更稳）
+    # 1=快门前再跑一轮整页滚动刷 canvas（更慢但更稳）；0=默认，避免快门前滚到底再回顶导致 KPI/IGG 右侧假断崖
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL": "0",
     # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
     "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 8000,
@@ -156,8 +156,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT": "1",
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT_COLOR": "#FF0000",
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT_BORDER_PX": "4",
-    # 0=勿压扁/平移 grid（会破坏布局重叠）；1=旧实验行为，默认关
-    "GRAFANA_SCREENSHOT_COMPACT_EMPTY_PANELS": "0",
+    # 1=压扁显示 No data 且无图表的大面板（仅改 height，不碰 react-grid transform）；0=关
+    "GRAFANA_SCREENSHOT_COMPACT_EMPTY_PANELS": "1",
     "GRAFANA_SCREENSHOT_COMPACT_EMPTY_MAX_HEIGHT_PX": "72",
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
@@ -582,6 +582,7 @@ GRAFANA_SCREENSHOT_COMPACT_EMPTY_PANELS = _lark_env_truthy("GRAFANA_SCREENSHOT_C
 GRAFANA_SCREENSHOT_COMPACT_EMPTY_MAX_HEIGHT_PX = max(
     48, min(240, _cfg_int("GRAFANA_SCREENSHOT_COMPACT_EMPTY_MAX_HEIGHT_PX", 72))
 )
+GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL = _lark_env_truthy("GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL")
 GRAFANA_USER = (
     _cfg_str("GRAFANA_USER")
     or _cfg_str("GRAFANA_ID")
@@ -4888,7 +4889,10 @@ def _grafana_playwright_scroll_to_top(page: Any) -> None:
 
 
 def _grafana_playwright_compact_empty_panels(page: Any) -> int:
-    """Deprecated — shifting react-grid transforms breaks panel layout. Kept for opt-in only."""
+    """
+    Shrink tall "No data" panels (e.g. Login With Password) via injected CSS only.
+    Does not rewrite react-grid transforms — safe for full-page screenshots.
+    """
     if not GRAFANA_SCREENSHOT_COMPACT_EMPTY_PANELS:
         return 0
     cap = int(GRAFANA_SCREENSHOT_COMPACT_EMPTY_MAX_HEIGHT_PX)
@@ -4897,55 +4901,33 @@ def _grafana_playwright_compact_empty_panels(page: Any) -> int:
             """([capPx]) => {
               const items = Array.from(document.querySelectorAll('.react-grid-item'));
               if (!items.length) return 0;
-              const parseTy = (el) => {
-                const tr = window.getComputedStyle(el).transform || el.style.transform || '';
-                if (!tr || tr === 'none') return el.getBoundingClientRect().top + window.scrollY;
-                const m = tr.match(/matrix\\([^,]+,\\s*[^,]+,\\s*[^,]+,\\s*[^,]+,\\s*([^,]+),\\s*([^)]+)\\)/);
-                if (m) return parseFloat(m[2]);
-                const m2 = tr.match(/translate\\([^,]+,\\s*([^)]+)\\)/);
-                if (m2) return parseFloat(m2[1]);
-                return el.getBoundingClientRect().top + window.scrollY;
-              };
-              const parseTx = (el) => {
-                const tr = window.getComputedStyle(el).transform || el.style.transform || '';
-                const m = tr.match(/matrix\\([^,]+,\\s*[^,]+,\\s*[^,]+,\\s*[^,]+,\\s*([^,]+),\\s*([^)]+)\\)/);
-                if (m) return parseFloat(m[1]);
-                const m2 = tr.match(/translate\\(([^,]+),/);
-                if (m2) return parseFloat(m2[1]);
-                return 0;
-              };
-              const infos = items.map((el) => {
+              const styleId = 'grafanabot-compact-empty-style';
+              let st = document.getElementById(styleId);
+              if (!st) {
+                st = document.createElement('style');
+                st.id = styleId;
+                document.head.appendChild(st);
+              }
+              const innerCap = Math.max(24, capPx - 28);
+              st.textContent =
+                '.grafanabot-compact-empty {' +
+                'height:' + capPx + 'px !important;' +
+                'max-height:' + capPx + 'px !important;' +
+                'min-height:' + capPx + 'px !important;' +
+                'overflow:hidden !important;}' +
+                '.grafanabot-compact-empty [data-testid="panel-content"],' +
+                '.grafanabot-compact-empty [data-testid="data-testid panel content"],' +
+                '.grafanabot-compact-empty [data-testid="data-testid Panel content"] {' +
+                'max-height:' + innerCap + 'px !important; overflow:hidden !important;}';
+              let compacted = 0;
+              for (const el of items) {
                 const h = el.getBoundingClientRect().height;
                 const hasChart = !!el.querySelector('canvas, [data-testid="uplot-main-div"]');
                 const txt = (el.textContent || '').replace(/\\s+/g, ' ').trim();
                 const noData = /no data/i.test(txt);
-                return { el, ty: parseTy(el), tx: parseTx(el), h, empty: noData && !hasChart && h > capPx + 40 };
-              }).sort((a, b) => a.ty - b.ty);
-              let shift = 0;
-              let compacted = 0;
-              for (const info of infos) {
-                if (info.empty) {
-                  const saved = Math.max(0, info.h - capPx);
-                  info.el.style.setProperty('height', capPx + 'px', 'important');
-                  info.el.style.setProperty('max-height', capPx + 'px', 'important');
-                  info.el.style.setProperty('overflow', 'hidden', 'important');
-                  info.el.classList.add('grafanabot-compact-empty');
-                  shift += saved;
+                if (noData && !hasChart && h > capPx + 40) {
+                  el.classList.add('grafanabot-compact-empty');
                   compacted += 1;
-                } else if (shift > 0) {
-                  const newTy = info.ty - shift;
-                  info.el.style.transform = 'translate(' + info.tx + 'px, ' + newTy + 'px)';
-                }
-              }
-              if (shift > 0) {
-                const scrollers = document.querySelectorAll(
-                  'main, [class*="dashboard-scroll"], [class*="page-content"], #reactRoot'
-                );
-                for (const sc of scrollers) {
-                  const r = sc.getBoundingClientRect();
-                  if (r.height > 200) {
-                    sc.style.setProperty('min-height', Math.max(400, r.height - shift) + 'px', 'important');
-                  }
                 }
               }
               return compacted;
@@ -5018,20 +5000,27 @@ def _grafana_playwright_capture_dashboard_png(page: Any) -> bytes:
     """
     Capture full dashboard at scroll 0 after lazy panels are painted.
     Avoid clip/element capture — they truncate long dashboards (Pulsar rows) or break grid layout.
+
+    Do **not** scroll to the bottom here unless ``GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL=1`` —
+    a last-second scroll away from KPI / IGG panels often repaints them with incomplete
+    Prometheus tails (right-edge cliff to zero) while spinners are already gone.
     """
-    try:
-        page.evaluate(
-            """() => {
-              const items = document.querySelectorAll('.react-grid-item');
-              if (items.length) {
-                items[items.length - 1].scrollIntoView({ block: 'end', inline: 'nearest' });
-              }
-            }"""
-        )
-        page.wait_for_timeout(max(300, int(GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS)))
-    except Exception:
-        pass
+    if GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL:
+        try:
+            page.evaluate(
+                """() => {
+                  const items = document.querySelectorAll('.react-grid-item');
+                  if (items.length) {
+                    items[items.length - 1].scrollIntoView({ block: 'end', inline: 'nearest' });
+                  }
+                }"""
+            )
+            page.wait_for_timeout(max(300, int(GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS)))
+        except Exception:
+            pass
+    _grafana_playwright_compact_empty_panels(page)
     _grafana_playwright_scroll_to_top(page)
+    _grafana_wait_loading_like_gone(page, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS))
     page.wait_for_timeout(320)
     try:
         page.evaluate(
@@ -5374,6 +5363,13 @@ def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
         pass
     try:
         _grafana_scroll_paint_lazy_panels(page, return_to_top=True)
+        _grafana_wait_loading_like_gone(
+            page,
+            max(
+                int(GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS),
+                int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS),
+            ),
+        )
         page.wait_for_timeout(220)
     except Exception:
         pass
@@ -5503,6 +5499,7 @@ def _grafana_playwright_render_dashboard_and_png(
     if highlight_panel_titles:
         _grafana_playwright_highlight_alert_panels(page, highlight_panel_titles)
         _grafana_playwright_scroll_to_top(page)
+        _grafana_wait_loading_like_gone(page, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS))
         page.wait_for_timeout(180)
     if not _grafana_dashboard_has_visual_content(page):
         raise RuntimeError(
