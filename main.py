@@ -2839,10 +2839,33 @@ def _datasource_uid(ds: Any) -> Optional[str]:
 
 
 def _find_panel(dashboard: Dict[str, Any], title: str) -> Optional[Dict[str, Any]]:
+    """Exact title match on dashboard JSON (see :func:`_find_panel_fuzzy` for screenshots)."""
+    want = _grafana_normalize_panel_title(title)
+    if not want:
+        return None
     for p in _walk_panels(dashboard.get("panels")):
-        if (p.get("title") or "").strip() == title.strip():
+        if _grafana_normalize_panel_title(p.get("title") or "") == want:
             return p
     return None
+
+
+def _find_panel_fuzzy(dashboard: Dict[str, Any], title: str) -> Optional[Dict[str, Any]]:
+    """
+    Match panel by normalized title; falls back to substring match (same idea as Playwright highlight).
+    """
+    want = _grafana_normalize_panel_title(title)
+    if not want:
+        return None
+    partial: Optional[Dict[str, Any]] = None
+    for p in _walk_panels(dashboard.get("panels")):
+        pt = _grafana_normalize_panel_title(p.get("title") or "")
+        if not pt:
+            continue
+        if pt == want:
+            return p
+        if partial is None and (want in pt or pt in want):
+            partial = p
+    return partial
 
 
 def _fetch_dashboard_model(session: requests.Session, uid: str) -> Dict[str, Any]:
@@ -5149,9 +5172,51 @@ def _grafana_dashboard_slug() -> str:
     return parts[-1] if parts else "dashboard"
 
 
-def _grafana_panel_id_for_title(session: requests.Session, panel_title: str) -> Optional[int]:
+_grafana_dashboard_panel_cache: Dict[
+    str, Tuple[float, Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]
+] = {}
+
+
+def _grafana_dashboard_panel_maps(
+    session: requests.Session,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Return ``(exact_title -> panel, normalized_title -> panel)`` with 90s TTL."""
+    uid = (GRAFANA_DASHBOARD_UID or "").strip()
+    now = time.time()
+    cached = _grafana_dashboard_panel_cache.get(uid)
+    if cached and (now - cached[0]) < 90.0:
+        return cached[1], cached[2]
+    dash = _fetch_dashboard_model(session, uid)
+    exact: Dict[str, Dict[str, Any]] = {}
+    norm: Dict[str, Dict[str, Any]] = {}
+    for p in _walk_panels(dash.get("panels")):
+        raw = (p.get("title") or "").strip()
+        if not raw:
+            continue
+        exact[raw] = p
+        nk = _grafana_normalize_panel_title(raw)
+        if nk and nk not in norm:
+            norm[nk] = p
+    _grafana_dashboard_panel_cache[uid] = (now, exact, norm)
+    return exact, norm
+
+
+def _grafana_panel_for_title(session: requests.Session, panel_title: str) -> Optional[Dict[str, Any]]:
+    title = (panel_title or "").strip()
+    if not title:
+        return None
+    exact, norm = _grafana_dashboard_panel_maps(session)
+    if title in exact:
+        return exact[title]
+    nk = _grafana_normalize_panel_title(title)
+    if nk in norm:
+        return norm[nk]
     dash = _fetch_dashboard_model(session, GRAFANA_DASHBOARD_UID)
-    panel = _find_panel(dash, panel_title)
+    return _find_panel_fuzzy(dash, title)
+
+
+def _grafana_panel_id_for_title(session: requests.Session, panel_title: str) -> Optional[int]:
+    panel = _grafana_panel_for_title(session, panel_title)
     if not panel:
         return None
     pid = panel.get("id")
@@ -5213,6 +5278,7 @@ def _grafana_resolve_alert_solo_captures(
     if not titles:
         return []
     out: List[Tuple[str, str, int]] = []
+    seen_panel_ids: Set[int] = set()
     for title in titles:
         pid = _grafana_panel_id_for_title(session, title)
         if pid is None:
@@ -5221,6 +5287,14 @@ def _grafana_resolve_alert_solo_captures(
                 title,
             )
             continue
+        if pid in seen_panel_ids:
+            logger.info(
+                "Grafana alert solo: duplicate panelId=%s for title=%r — one screenshot only",
+                pid,
+                title,
+            )
+            continue
+        seen_panel_ids.add(pid)
         url = _grafana_build_solo_panel_url(
             pid,
             relative_from=relative_from,
@@ -5322,34 +5396,125 @@ def _grafana_normalize_panel_title(title: str) -> str:
     return re.sub(r"\s+", " ", (title or "").strip())
 
 
+def _monitoring_panel_has_visible_alert_block(
+    graph_label: str,
+    series_label: str,
+    analysis: Dict[str, Any],
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+) -> bool:
+    """True when :func:`_format_alert_trigger_reply` would emit a block for this panel."""
+    if bool(analysis.get("hit_alert")):
+        return True
+    reasons = _format_trigger_lines(
+        graph_label,
+        series_label,
+        analysis,
+        fast_threshold_pct,
+        continuous_threshold_pct,
+        MONITORING_ALERT_WINDOW_SECONDS,
+    )
+    if reasons:
+        return True
+    return _format_trigger_fallback_line(
+        graph_label,
+        series_label,
+        analysis,
+        fast_threshold_pct,
+        continuous_threshold_pct,
+        MONITORING_ALERT_WINDOW_SECONDS,
+    ) is not None
+
+
 def _monitoring_alert_panel_titles(payload: Optional[Dict[str, Any]]) -> List[str]:
-    """Panel titles that exceeded alert thresholds in this payload (respects /mute)."""
+    """Grafana panel titles for graphs that appear in the alert reply (respects /mute)."""
     if not isinstance(payload, dict):
         return []
     _mute_purge_expired()
     titles: List[str] = []
-    if not _monitoring_alert_channel_muted("http") and bool(
-        _http_analysis_for_payload(payload).get("hit_alert")
-    ):
-        titles.append(GRAFANA_PANEL_TITLE)
-    _kind_title: List[Tuple[str, str, Any]] = [
-        ("9280_push", GRAFANA_PANEL_TITLE_9280, _analysis_for_9280_payload),
-        ("deposit", GRAFANA_PANEL_TITLE_DEPOSIT, _analysis_for_deposit_payload),
-        ("withdraw", GRAFANA_PANEL_TITLE_WITHDRAW, _analysis_for_withdraw_payload),
-        ("provider_jili", GRAFANA_PANEL_TITLE_PROVIDER_JILI, _analysis_for_provider_jili_payload),
+    if not _monitoring_alert_channel_muted("http"):
+        a_http = _http_analysis_for_payload(payload)
+        if _monitoring_panel_has_visible_alert_block(
+            GRAFANA_PANEL_TITLE,
+            "HTTP",
+            a_http,
+            MONITORING_HTTP_DROP_ALERT_PCT,
+            MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
+        ):
+            titles.append(GRAFANA_PANEL_TITLE)
+    _kind_title: List[Tuple[str, str, str, Any, float, float]] = [
+        (
+            "9280_push",
+            GRAFANA_PANEL_TITLE_9280,
+            MONITORING_9280_SERIES_KEYWORD,
+            _analysis_for_9280_payload,
+            MONITORING_9280_ALERT_PCT,
+            MONITORING_9280_CONTINUOUS_ALERT_PCT,
+        ),
+        (
+            "deposit",
+            GRAFANA_PANEL_TITLE_DEPOSIT,
+            MONITORING_DEPOSIT_SERIES_KEYWORD,
+            _analysis_for_deposit_payload,
+            MONITORING_DEPOSIT_ALERT_PCT,
+            MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT,
+        ),
+        (
+            "withdraw",
+            GRAFANA_PANEL_TITLE_WITHDRAW,
+            MONITORING_WITHDRAW_SERIES_KEYWORD,
+            _analysis_for_withdraw_payload,
+            MONITORING_WITHDRAW_ALERT_PCT,
+            MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT,
+        ),
+        (
+            "provider_jili",
+            GRAFANA_PANEL_TITLE_PROVIDER_JILI,
+            MONITORING_PROVIDER_JILI_SERIES_KEYWORD,
+            _analysis_for_provider_jili_payload,
+            MONITORING_PROVIDER_JILI_ALERT_PCT,
+            MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT,
+        ),
         (
             "provider_general",
             GRAFANA_PANEL_TITLE_PROVIDER_GENERAL,
+            MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD,
             _analysis_for_provider_general_payload,
+            MONITORING_PROVIDER_GENERAL_ALERT_PCT,
+            MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT,
         ),
         (
             "provider_inhouse",
             GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE,
+            MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD,
             _analysis_for_provider_inhouse_payload,
+            MONITORING_PROVIDER_INHOUSE_ALERT_PCT,
+            MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT,
         ),
-        ("games_jili", GRAFANA_PANEL_TITLE_GAMES_JILI, _analysis_for_games_jili_payload),
-        ("games_general", GRAFANA_PANEL_TITLE_GAMES_GENERAL, _analysis_for_games_general_payload),
-        ("games_inhouse", GRAFANA_PANEL_TITLE_GAMES_INHOUSE, _analysis_for_games_inhouse_payload),
+        (
+            "games_jili",
+            GRAFANA_PANEL_TITLE_GAMES_JILI,
+            MONITORING_GAMES_JILI_SERIES_KEYWORD,
+            _analysis_for_games_jili_payload,
+            MONITORING_GAMES_JILI_ALERT_PCT,
+            MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT,
+        ),
+        (
+            "games_general",
+            GRAFANA_PANEL_TITLE_GAMES_GENERAL,
+            MONITORING_GAMES_GENERAL_SERIES_KEYWORD,
+            _analysis_for_games_general_payload,
+            MONITORING_GAMES_GENERAL_ALERT_PCT,
+            MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT,
+        ),
+        (
+            "games_inhouse",
+            GRAFANA_PANEL_TITLE_GAMES_INHOUSE,
+            MONITORING_GAMES_INHOUSE_SERIES_KEYWORD,
+            _analysis_for_games_inhouse_payload,
+            MONITORING_GAMES_INHOUSE_ALERT_PCT,
+            MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT,
+        ),
     ]
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
@@ -5358,10 +5523,13 @@ def _monitoring_alert_panel_titles(payload: Optional[Dict[str, Any]]) -> List[st
         if _monitoring_alert_channel_muted(kind):
             continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        for k, title, analyzer in _kind_title:
-            if kind == k and bool(analyzer(p2).get("hit_alert")):
-                titles.append(title)
-                break
+        for k, g_lbl, s_lbl, analyzer, fast_thr, cont_thr in _kind_title:
+            if kind != k:
+                continue
+            a2 = analyzer(p2)
+            if _monitoring_panel_has_visible_alert_block(g_lbl, s_lbl, a2, fast_thr, cont_thr):
+                titles.append(g_lbl)
+            break
     seen: Set[str] = set()
     out: List[str] = []
     for t in titles:
@@ -5369,6 +5537,8 @@ def _monitoring_alert_panel_titles(payload: Optional[Dict[str, Any]]) -> List[st
         if n and n not in seen:
             seen.add(n)
             out.append(t)
+    if len(out) > 1:
+        logger.info("monitoring alert screenshot targets: %s panels %r", len(out), out)
     return out
 
 
@@ -6194,26 +6364,38 @@ def _lark_send_monitoring_alert_pngs(
     """
     Send one or more alert PNGs to Lark.
 
-    When the first image is already embedded in the interactive card, only ``pngs[1:]`` are sent.
-    Otherwise ``pre_key`` (upload of ``pngs[0]``) is sent first when set, then any remaining PNGs.
+    **Multiple panels:** every PNG is sent as its own image message (card embed is not used for
+    extras-only — users were missing graphs when only the first was embedded).
+
+    **Single panel:** when the first image is embedded in the card, no duplicate image is sent;
+    otherwise ``pre_key`` or ``pngs[0]`` is uploaded and sent once.
     """
     rid = (receive_id or "").strip()
     if not rid or not pngs:
         return 0
+    if len(pngs) > 1:
+        sent = 0
+        for i, png in enumerate(pngs):
+            key = _lark_upload_png_image_key(png)
+            _lark_send_image_message(receive_id_type, rid, key)
+            sent += 1
+            logger.info(
+                "monitoring alert image %s/%s sent receive_id_type=%s bytes=%s",
+                i + 1,
+                len(pngs),
+                receive_id_type,
+                len(png),
+            )
+        return sent
     sent = 0
     if embedded_in_card:
-        to_upload = list(pngs[1:])
-    elif (pre_key or "").strip():
+        return 0
+    if (pre_key or "").strip():
         _lark_send_image_message(receive_id_type, rid, pre_key.strip())
-        sent += 1
-        to_upload = list(pngs[1:])
-    else:
-        to_upload = list(pngs)
-    for png in to_upload:
-        key = _lark_upload_png_image_key(png)
-        _lark_send_image_message(receive_id_type, rid, key)
-        sent += 1
-    return sent
+        return 1
+    key = _lark_upload_png_image_key(pngs[0])
+    _lark_send_image_message(receive_id_type, rid, key)
+    return 1
 
 
 def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
@@ -7675,7 +7857,10 @@ def _monitoring_watchdog_loop() -> None:
                 if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                     try:
                         alert_pngs = _grafana_watchdog_alert_screenshot_png_list(sess_c, payload_c)
-                        if alert_pngs and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT"):
+                        if (
+                            len(alert_pngs) == 1
+                            and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
+                        ):
                             pre_key = _lark_upload_png_image_key(alert_pngs[0])
                     except Exception:
                         logger.exception("monitoring watchdog pre-screenshot failed")
@@ -7771,7 +7956,10 @@ def _monitoring_watchdog_loop() -> None:
                 if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                     try:
                         alert_pngs = _grafana_watchdog_alert_screenshot_png_list(sess, payload)
-                        if alert_pngs and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT"):
+                        if (
+                            len(alert_pngs) == 1
+                            and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
+                        ):
                             pre_key = _lark_upload_png_image_key(alert_pngs[0])
                     except Exception:
                         logger.exception("monitoring watchdog pre-screenshot failed")
