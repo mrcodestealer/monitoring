@@ -72,6 +72,13 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DEPOSIT_SERIES_KEYWORD": "createProposal",
     "GRAFANA_PANEL_TITLE_WITHDRAW": "提款 (Withdrawal)",
     "MONITORING_WITHDRAW_SERIES_KEYWORD": "InitiateWithdrawal",
+    "GRAFANA_PANEL_TITLE_ERROR_REQ": "错误请求数/1m",
+    # Pipe ``|`` = ALL substrings must match legend/labels. Alert only when **both** series spike.
+    "MONITORING_ERROR_REQ_SERIES_A": "RedeemPlayerLuckyCoins",
+    "MONITORING_ERROR_REQ_SERIES_A_LABEL": "RedeemPlayerLuckyCoins",
+    "MONITORING_ERROR_REQ_SERIES_B": "igo-sw-http-main-apisix-pp|POST /refund",
+    "MONITORING_ERROR_REQ_SERIES_B_LABEL": "POST /refund",
+    "MONITORING_ERROR_REQ_EXCLUDE": "ReceiveEventLoginReward",
     "GRAFANA_PANEL_TITLE_PROVIDER_JILI": "IGO Distributions of Providers JILI",
     "MONITORING_PROVIDER_JILI_SERIES_KEYWORD": "3201",
     "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL": "IGO Distributions of Providers GENERAL",
@@ -239,6 +246,9 @@ _CFG: Dict[str, Any] = {
     # Withdraw only: spike/drop vs **median baseline** of eval window (not bucket-to-bucket %).
     # 例 median=200、80% → spike 需 >360；median=30 时 40 仅 +33% vs baseline，20→40 不告警。
     "MONITORING_WITHDRAW_MIN_BASELINE_VALUE": "0",
+    "MONITORING_ERROR_REQ_ENABLE": "1",
+    "MONITORING_ERROR_REQ_ALERT_PCT": 50,
+    "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 80,
     "MONITORING_PROVIDER_JILI_ENABLE": "1",
     "MONITORING_PROVIDER_JILI_ALERT_PCT": 15,
     "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 15,
@@ -319,6 +329,12 @@ def _cfg_int(key: str, default: int) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def _cfg_substring_parts(key: str, default: str) -> List[str]:
+    """Config value split on ``|``; every non-empty part must appear in the series label blob."""
+    raw = _cfg_str(key, default)
+    return [p.strip() for p in raw.split("|") if p.strip()]
 
 
 def _cfg_float(key: str, default: float) -> float:
@@ -492,6 +508,22 @@ GRAFANA_PANEL_TITLE_DEPOSIT = _cfg_str("GRAFANA_PANEL_TITLE_DEPOSIT", "主站充
 MONITORING_DEPOSIT_SERIES_KEYWORD = _cfg_str("MONITORING_DEPOSIT_SERIES_KEYWORD", "createProposal").strip()
 GRAFANA_PANEL_TITLE_WITHDRAW = _cfg_str("GRAFANA_PANEL_TITLE_WITHDRAW", "提款 (Withdrawal)")
 MONITORING_WITHDRAW_SERIES_KEYWORD = _cfg_str("MONITORING_WITHDRAW_SERIES_KEYWORD", "InitiateWithdrawal").strip()
+GRAFANA_PANEL_TITLE_ERROR_REQ = _cfg_str("GRAFANA_PANEL_TITLE_ERROR_REQ", "错误请求数/1m")
+MONITORING_ERROR_REQ_SERIES_A_PARTS = _cfg_substring_parts(
+    "MONITORING_ERROR_REQ_SERIES_A", "RedeemPlayerLuckyCoins"
+)
+MONITORING_ERROR_REQ_SERIES_A_LABEL = _cfg_str(
+    "MONITORING_ERROR_REQ_SERIES_A_LABEL", "RedeemPlayerLuckyCoins"
+).strip()
+MONITORING_ERROR_REQ_SERIES_B_PARTS = _cfg_substring_parts(
+    "MONITORING_ERROR_REQ_SERIES_B", "igo-sw-http-main-apisix-pp|POST /refund"
+)
+MONITORING_ERROR_REQ_SERIES_B_LABEL = _cfg_str(
+    "MONITORING_ERROR_REQ_SERIES_B_LABEL", "POST /refund"
+).strip()
+MONITORING_ERROR_REQ_EXCLUDE_PARTS = _cfg_substring_parts(
+    "MONITORING_ERROR_REQ_EXCLUDE", "ReceiveEventLoginReward"
+)
 GRAFANA_PANEL_TITLE_PROVIDER_JILI = _cfg_str(
     "GRAFANA_PANEL_TITLE_PROVIDER_JILI", "IGO Distributions of Providers JILI"
 )
@@ -627,6 +659,10 @@ MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", 60.0
 MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", 80.0)
 MONITORING_WITHDRAW_MIN_BASELINE_VALUE = max(
     0.0, _cfg_float("MONITORING_WITHDRAW_MIN_BASELINE_VALUE", 0.0)
+)
+MONITORING_ERROR_REQ_ALERT_PCT = _cfg_float("MONITORING_ERROR_REQ_ALERT_PCT", 50.0)
+MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT", 80.0
 )
 MONITORING_PROVIDER_JILI_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_JILI_ALERT_PCT", 15.0)
 MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
@@ -1439,6 +1475,98 @@ def _im_command_matches(clean: str, cmd: str) -> bool:
 def _text_has_monitoring_trigger(raw_text: str, clean: str) -> bool:
     _ = raw_text
     return _im_command_matches(clean or "", MONITORING_TRIGGER)
+
+
+def _parse_monitoring_trigger_panel(clean: str) -> Tuple[bool, Optional[str]]:
+    """
+    Parse ``/mo`` or ``/mo {panel title}``.
+    Returns ``(is_mo_command, panel_name)`` where ``panel_name`` is ``None`` = all graphs.
+    """
+    if not _im_command_matches(clean or "", MONITORING_TRIGGER):
+        return False, None
+    c = re.sub(r"\s+", " ", (clean or "").strip())
+    tri = (MONITORING_TRIGGER or "/mo").strip()
+    if not tri:
+        return True, None
+    if c.casefold() == tri.casefold():
+        return True, None
+    prefix = tri.casefold()
+    if c.casefold().startswith(prefix + " "):
+        rest = c[len(tri) :].strip()
+        return True, rest if rest else None
+    if c.casefold().startswith(prefix + "\t"):
+        rest = c[len(tri) :].strip()
+        return True, rest if rest else None
+    return True, None
+
+
+def _monitoring_enabled_panel_catalog() -> List[Dict[str, str]]:
+    """Enabled Grafana panels for ``/mo`` (kind + exact dashboard panel title)."""
+    out: List[Dict[str, str]] = [{"kind": "http", "title": GRAFANA_PANEL_TITLE}]
+    if _lark_env_truthy("MONITORING_9280_ENABLE"):
+        out.append({"kind": "9280_push", "title": GRAFANA_PANEL_TITLE_9280})
+    if _lark_env_truthy("MONITORING_DEPOSIT_ENABLE"):
+        out.append({"kind": "deposit", "title": GRAFANA_PANEL_TITLE_DEPOSIT})
+    if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
+        out.append({"kind": "withdraw", "title": GRAFANA_PANEL_TITLE_WITHDRAW})
+    if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
+        out.append({"kind": "error_req_1m", "title": GRAFANA_PANEL_TITLE_ERROR_REQ})
+    if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
+        out.append({"kind": "provider_jili", "title": GRAFANA_PANEL_TITLE_PROVIDER_JILI})
+    if _lark_env_truthy("MONITORING_PROVIDER_GENERAL_ENABLE"):
+        out.append({"kind": "provider_general", "title": GRAFANA_PANEL_TITLE_PROVIDER_GENERAL})
+    if _lark_env_truthy("MONITORING_PROVIDER_INHOUSE_ENABLE"):
+        out.append({"kind": "provider_inhouse", "title": GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE})
+    if _lark_env_truthy("MONITORING_GAMES_JILI_ENABLE"):
+        out.append({"kind": "games_jili", "title": GRAFANA_PANEL_TITLE_GAMES_JILI})
+    if _lark_env_truthy("MONITORING_GAMES_GENERAL_ENABLE"):
+        out.append({"kind": "games_general", "title": GRAFANA_PANEL_TITLE_GAMES_GENERAL})
+    if _lark_env_truthy("MONITORING_GAMES_INHOUSE_ENABLE"):
+        out.append({"kind": "games_inhouse", "title": GRAFANA_PANEL_TITLE_GAMES_INHOUSE})
+    return out
+
+
+def _resolve_mo_panel_filter(panel_name: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Resolve user graph name to catalog entry; ``(entry, error_message)``."""
+    name_n = _grafana_normalize_panel_title(panel_name)
+    if not name_n:
+        return None, "Graph name is empty. Example: `/mo 错误请求数/1m`"
+    catalog = _monitoring_enabled_panel_catalog()
+    exact = [
+        e
+        for e in catalog
+        if _grafana_normalize_panel_title(e.get("title") or "").casefold() == name_n.casefold()
+    ]
+    if len(exact) == 1:
+        return exact[0], None
+    if not exact:
+        partial = [
+            e
+            for e in catalog
+            if name_n.casefold() in _grafana_normalize_panel_title(e.get("title") or "").casefold()
+        ]
+        if len(partial) == 1:
+            return partial[0], None
+        if len(partial) > 1:
+            titles = ", ".join(e["title"] for e in partial)
+            return None, f"Ambiguous graph {panel_name!r}. Matches: {titles}"
+    titles = ", ".join(e["title"] for e in catalog)
+    return None, f"Unknown graph {panel_name!r}. Enabled panels: {titles}"
+
+
+def _monitoring_mo_panel_list_text() -> str:
+    lines = ["Available graphs for `/mo {name}`:"]
+    for e in _monitoring_enabled_panel_catalog():
+        lines.append(f"- `{e['title']}`")
+    return "\n".join(lines)
+
+
+def _monitoring_panel_title_for_kind(kind: str) -> Optional[str]:
+    k = (kind or "").strip()
+    for e in _monitoring_enabled_panel_catalog():
+        if e.get("kind") == k:
+            return str(e.get("title") or "").strip() or None
+    return None
 
 
 def _lark_iter_mention_scalar_strings(obj: Any, depth: int = 0, *, max_depth: int = 8) -> Iterator[str]:
@@ -2648,7 +2776,10 @@ def _monitoring_dispatch_body_key(clean: str, raw_text: str, mentions: Any) -> s
     """
     tri = (MONITORING_TRIGGER or "/mo").strip().lower()
     cl = re.sub(r"\s+", " ", (clean or "").strip().lower())
-    if _im_command_matches(clean or "", MONITORING_TRIGGER):
+    is_mo, panel_arg = _parse_monitoring_trigger_panel(clean or "")
+    if is_mo:
+        if panel_arg:
+            return f"{tri}:{_grafana_normalize_panel_title(panel_arg).casefold()}"
         return tri
     if MONITORING_AT_MENTION_ENABLE and _lark_message_mentions_bot(mentions):
         if MONITORING_AT_MENTION_ANY_TEXT:
@@ -3321,6 +3452,7 @@ def fetch_monitoring_payload(
     for_watchdog: bool = False,
     start_unix: Optional[int] = None,
     end_unix: Optional[int] = None,
+    mo_panel_kind: Optional[str] = None,
 ) -> Dict[str, Any]:
     sess = session or grafana_login_session()
     w_start: Optional[int] = None
@@ -3345,6 +3477,26 @@ def fetch_monitoring_payload(
                 w_start,
                 w_end,
             )
+    only_kind = (mo_panel_kind or "").strip()
+    if only_kind == "http":
+        primary = fetch_request_total_1m_series(session=sess, start_unix=w_start, end_unix=w_end)
+        primary["moPanelOnlyKind"] = "http"
+        return primary
+    if only_kind:
+        title = _monitoring_panel_title_for_kind(only_kind)
+        if not title:
+            raise ValueError(f"Unknown /mo panel kind {only_kind!r}")
+        panel = _fetch_panel_series_by_title(
+            title, session=sess, start_unix=w_start, end_unix=w_end
+        )
+        return {
+            "panelTitle": title,
+            "dashboardUid": panel.get("dashboardUid") or GRAFANA_DASHBOARD_UID,
+            "series": [],
+            "window": panel.get("window"),
+            "moPanelOnlyKind": only_kind,
+            "extraPanels": [{"kind": only_kind, "payload": panel}],
+        }
     primary = fetch_request_total_1m_series(session=sess, start_unix=w_start, end_unix=w_end)
     extra: List[Dict[str, Any]] = []
     if _lark_env_truthy("MONITORING_9280_ENABLE"):
@@ -3380,6 +3532,17 @@ def fetch_monitoring_payload(
             extra.append({"kind": "withdraw", "payload": pw})
         except Exception:
             logger.exception("fetch withdraw panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
+        try:
+            pe = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_ERROR_REQ,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": "error_req_1m", "payload": pe})
+        except Exception:
+            logger.exception("fetch error-req panel failed (optional monitor)")
     if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
         try:
             ppj = _fetch_panel_series_by_title(
@@ -3792,6 +3955,8 @@ def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
         out.append(("deposit", f"Deposit · {GRAFANA_PANEL_TITLE_DEPOSIT}"))
     if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
         out.append(("withdraw", f"Withdraw · {GRAFANA_PANEL_TITLE_WITHDRAW}"))
+    if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
+        out.append(("error_req_1m", f"Error req · {GRAFANA_PANEL_TITLE_ERROR_REQ}"))
     if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
         out.append(("provider_jili", f"Provider JILI"))
     if _lark_env_truthy("MONITORING_PROVIDER_GENERAL_ENABLE"):
@@ -4085,7 +4250,8 @@ def _monitoring_at_mention_help_text() -> str:
     c = (MONITORING_CANCELMUTE_TRIGGER or "/c").strip()
     return (
         "Commands:\n"
-        f"- `{mo}` — Grafana monitoring summary\n"
+        f"- `{mo}` — Grafana monitoring summary (all graphs)\n"
+        f"- `{mo} {{panel title}}` — one graph only (e.g. `{mo} 错误请求数/1m`)\n"
         f"- `{m}` — mute alerts (interactive card)\n"
         f"- `{c}` — clear all mutes"
     )
@@ -5410,6 +5576,17 @@ def _monitoring_panel_has_visible_alert_block(
     continuous_threshold_pct: float,
 ) -> bool:
     """True when :func:`_format_alert_trigger_reply` would emit a block for this panel."""
+    if analysis.get("dual_spike_required"):
+        if bool(analysis.get("hit_alert")):
+            return True
+        return bool(
+            _format_error_req_trigger_lines(
+                analysis,
+                fast_threshold_pct,
+                continuous_threshold_pct,
+                MONITORING_ALERT_WINDOW_SECONDS,
+            )
+        )
     if bool(analysis.get("hit_alert")):
         return True
     reasons = _format_trigger_lines(
@@ -5437,6 +5614,10 @@ def _monitoring_alert_panel_titles(payload: Optional[Dict[str, Any]]) -> List[st
     if not isinstance(payload, dict):
         return []
     _mute_purge_expired()
+    mo_only = (payload.get("moPanelOnlyKind") or "").strip()
+    if mo_only:
+        title = _monitoring_panel_title_for_kind(mo_only)
+        return [title] if title else []
     titles: List[str] = []
     if not _monitoring_alert_channel_muted("http"):
         a_http = _http_analysis_for_payload(payload)
@@ -5472,6 +5653,14 @@ def _monitoring_alert_panel_titles(payload: Optional[Dict[str, Any]]) -> List[st
             _analysis_for_withdraw_payload,
             MONITORING_WITHDRAW_ALERT_PCT,
             MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT,
+        ),
+        (
+            "error_req_1m",
+            GRAFANA_PANEL_TITLE_ERROR_REQ,
+            f"{MONITORING_ERROR_REQ_SERIES_A_LABEL} + {MONITORING_ERROR_REQ_SERIES_B_LABEL}",
+            _analysis_for_error_req_payload,
+            MONITORING_ERROR_REQ_ALERT_PCT,
+            MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT,
         ),
         (
             "provider_jili",
@@ -6490,6 +6679,59 @@ def _keyword_matches_series_labels(keyword: str, legend_format: str, metric: Dic
     return kw_cf in lg_cf or kw_cf in mb_cf
 
 
+def _series_label_blob(legend_format: str, metric: Dict[str, Any]) -> str:
+    lg = str(legend_format or "").strip()
+    mb = " ".join(str(v) for v in metric.values() if v is not None)
+    return f"{lg} {mb}".strip()
+
+
+def _series_matches_substring_parts(blob: str, parts: List[str]) -> bool:
+    if not parts:
+        return True
+    b = (blob or "").casefold()
+    return all(p.strip().casefold() in b for p in parts if p.strip())
+
+
+def _series_matches_exclude_parts(blob: str, exclude_parts: List[str]) -> bool:
+    b = (blob or "").casefold()
+    return any(p.strip().casefold() in b for p in exclude_parts if p.strip())
+
+
+def _merge_series_points_by_substrings(
+    payload: Dict[str, Any],
+    include_parts: List[str],
+    exclude_parts: Optional[List[str]] = None,
+) -> List[Tuple[float, float]]:
+    """Match series rows whose legend/labels contain **all** ``include_parts``; skip excludes."""
+    ex = exclude_parts or []
+    candidates: List[List[Tuple[float, float]]] = []
+    for s in payload.get("series") or []:
+        lg = str(s.get("legendFormat") or "")
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            metric = r.get("metric") or {}
+            md = metric if isinstance(metric, dict) else {}
+            blob = _series_label_blob(lg, md)
+            if _series_matches_exclude_parts(blob, ex):
+                continue
+            if include_parts and not _series_matches_substring_parts(blob, include_parts):
+                continue
+            pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
+            if pts:
+                candidates.append(pts)
+    if not candidates:
+        return []
+    if len(candidates) == 1:
+        merged_pts = candidates[0]
+    else:
+        merged_pts = _pick_best_exact_keyword_series(candidates)
+    by_one: Dict[float, float] = {}
+    for ts, val in merged_pts:
+        by_one[ts] = val
+    return sorted(by_one.items(), key=lambda x: x[0])
+
+
 def _series_row_exact_keyword_id(keyword: str, legend_format: str, metric: Dict[str, Any]) -> bool:
     """
     True when this row is unambiguously the single-series id (e.g. Grafana legend ``3201``),
@@ -7174,6 +7416,120 @@ def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return a
 
 
+def _series_analysis_has_spike(
+    analysis: Dict[str, Any], fast_threshold_pct: float, continuous_threshold_pct: float
+) -> bool:
+    ws = analysis.get("window_max_spike")
+    if isinstance(ws, dict) and float(ws.get("pct") or 0.0) >= float(fast_threshold_pct):
+        return True
+    cs = analysis.get("consecutive_max_spike")
+    if isinstance(cs, dict) and float(cs.get("pct") or 0.0) >= float(continuous_threshold_pct):
+        return True
+    return False
+
+
+def _analysis_for_error_req_series(
+    payload: Dict[str, Any], include_parts: List[str]
+) -> Dict[str, Any]:
+    pts = _merge_series_points_by_substrings(
+        payload, include_parts, MONITORING_ERROR_REQ_EXCLUDE_PARTS
+    )
+    pts = _snap_series_to_monitoring_minutes(pts, how="sum")
+    pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
+    a = _http_drop_spike_analysis(
+        pts,
+        MONITORING_ERROR_REQ_ALERT_PCT,
+        MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT,
+        MONITORING_ALERT_WINDOW_SECONDS,
+    )
+    a["point_count"] = len(pts)
+    a["merged_points"] = [[t, v] for t, v in pts]
+    return a
+
+
+def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ``错误请求数/1m``: alert only when **both** watched series spike (ignore excluded legends).
+    """
+    a_a = _analysis_for_error_req_series(payload, MONITORING_ERROR_REQ_SERIES_A_PARTS)
+    a_b = _analysis_for_error_req_series(payload, MONITORING_ERROR_REQ_SERIES_B_PARTS)
+    spike_a = _series_analysis_has_spike(
+        a_a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
+    )
+    spike_b = _series_analysis_has_spike(
+        a_b, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
+    )
+    return {
+        "hit_alert": bool(spike_a and spike_b),
+        "dual_spike_required": True,
+        "series_a_spike": spike_a,
+        "series_b_spike": spike_b,
+        "fast_threshold_pct": MONITORING_ERROR_REQ_ALERT_PCT,
+        "continuous_threshold_pct": MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT,
+        "window_seconds": MONITORING_ALERT_WINDOW_SECONDS,
+        "series_a": {**a_a, "label": MONITORING_ERROR_REQ_SERIES_A_LABEL},
+        "series_b": {**a_b, "label": MONITORING_ERROR_REQ_SERIES_B_LABEL},
+        "point_count": int(a_a.get("point_count") or 0) + int(a_b.get("point_count") or 0),
+        "merged_points": (a_a.get("merged_points") or []) + (a_b.get("merged_points") or []),
+    }
+
+
+def _format_error_req_trigger_lines(
+    analysis: Dict[str, Any],
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    window_seconds: int,
+) -> List[str]:
+    if not bool(analysis.get("hit_alert")):
+        return []
+    blocks: List[str] = [
+        f"[{GRAFANA_PANEL_TITLE_ERROR_REQ}] DUAL SPIKE — both watched series exceeded spike threshold"
+    ]
+    for key, default_lbl in (
+        ("series_a", MONITORING_ERROR_REQ_SERIES_A_LABEL),
+        ("series_b", MONITORING_ERROR_REQ_SERIES_B_LABEL),
+    ):
+        sub = analysis.get(key) if isinstance(analysis.get(key), dict) else {}
+        lbl = str(sub.get("label") or default_lbl)
+        blocks.extend(
+            _format_trigger_lines(
+                GRAFANA_PANEL_TITLE_ERROR_REQ,
+                lbl,
+                sub,
+                fast_threshold_pct,
+                continuous_threshold_pct,
+                window_seconds,
+            )
+        )
+    return ["\n".join(blocks)] if len(blocks) > 1 else []
+
+
+def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
+    if MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS:
+        return []
+    fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_ERROR_REQ_ALERT_PCT)
+    cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT)
+    win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
+    lines: List[str] = [
+        "",
+        f"[Error req] dual-spike alert: BOTH series must spike >{fast_thr:g}% (fast {win_sec//60}m) "
+        f"or >{cont_thr:g}% (continuous); excludes {', '.join(MONITORING_ERROR_REQ_EXCLUDE_PARTS) or '—'}",
+        f"series A ({MONITORING_ERROR_REQ_SERIES_A_LABEL}) spike: "
+        f"{'yes' if analysis.get('series_a_spike') else 'no'}",
+        f"series B ({MONITORING_ERROR_REQ_SERIES_B_LABEL}) spike: "
+        f"{'yes' if analysis.get('series_b_spike') else 'no'}",
+    ]
+    for key, lbl in (("series_a", MONITORING_ERROR_REQ_SERIES_A_LABEL), ("series_b", MONITORING_ERROR_REQ_SERIES_B_LABEL)):
+        sub = analysis.get(key) if isinstance(analysis.get(key), dict) else {}
+        ws = sub.get("window_max_spike")
+        cs = sub.get("consecutive_max_spike")
+        lines.append(
+            f"  {lbl}: within {win_sec//60}m spike +{(ws or {}).get('pct', 'n/a')}% / "
+            f"continuous +{(cs or {}).get('pct', 'n/a')}%"
+        )
+    return lines
+
+
 def _analysis_for_keyword_payload(
     payload: Dict[str, Any], keyword: str, fast_threshold_pct: float, continuous_threshold_pct: float
 ) -> Dict[str, Any]:
@@ -7453,8 +7809,11 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         "",
     ]
     reason_blocks: List[str] = []
+    mo_only = (payload.get("moPanelOnlyKind") or "").strip()
+    show_http = not mo_only or mo_only == "http"
+    show_extra = not mo_only or mo_only != "http"
     a_http = _http_analysis_for_payload(payload)
-    if not _monitoring_alert_channel_muted("http"):
+    if show_http and not _monitoring_alert_channel_muted("http"):
         reasons = _format_trigger_lines(
             GRAFANA_PANEL_TITLE,
             "HTTP",
@@ -7480,94 +7839,119 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             reasons.append(_format_alert_series_table_footer(GRAFANA_PANEL_TITLE, "HTTP", a_http))
         if reasons:
             reason_blocks.append("\n\n".join(reasons))
-    for ex in payload.get("extraPanels") or []:
-        if not isinstance(ex, dict):
-            continue
-        kind = (ex.get("kind") or "")
-        if _monitoring_alert_channel_muted(kind):
-            continue
-        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        if kind == "9280_push":
-            g_lbl = GRAFANA_PANEL_TITLE_9280
-            s_lbl = MONITORING_9280_SERIES_KEYWORD
-            a2 = _analysis_for_9280_payload(p2)
-            fast2 = MONITORING_9280_ALERT_PCT
-            cont2 = MONITORING_9280_CONTINUOUS_ALERT_PCT
-        elif kind == "deposit":
-            g_lbl = GRAFANA_PANEL_TITLE_DEPOSIT
-            s_lbl = MONITORING_DEPOSIT_SERIES_KEYWORD
-            a2 = _analysis_for_deposit_payload(p2)
-            fast2 = MONITORING_DEPOSIT_ALERT_PCT
-            cont2 = MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT
-        elif kind == "withdraw":
-            g_lbl = GRAFANA_PANEL_TITLE_WITHDRAW
-            s_lbl = MONITORING_WITHDRAW_SERIES_KEYWORD
-            a2 = _analysis_for_withdraw_payload(p2)
-            fast2 = MONITORING_WITHDRAW_ALERT_PCT
-            cont2 = MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT
-        elif kind == "provider_jili":
-            g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_JILI
-            s_lbl = MONITORING_PROVIDER_JILI_SERIES_KEYWORD
-            a2 = _analysis_for_provider_jili_payload(p2)
-            fast2 = MONITORING_PROVIDER_JILI_ALERT_PCT
-            cont2 = MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT
-        elif kind == "provider_general":
-            g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_GENERAL
-            s_lbl = MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD
-            a2 = _analysis_for_provider_general_payload(p2)
-            fast2 = MONITORING_PROVIDER_GENERAL_ALERT_PCT
-            cont2 = MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT
-        elif kind == "provider_inhouse":
-            g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE
-            s_lbl = MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD
-            a2 = _analysis_for_provider_inhouse_payload(p2)
-            fast2 = MONITORING_PROVIDER_INHOUSE_ALERT_PCT
-            cont2 = MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT
-        elif kind == "games_jili":
-            g_lbl = GRAFANA_PANEL_TITLE_GAMES_JILI
-            s_lbl = MONITORING_GAMES_JILI_SERIES_KEYWORD
-            a2 = _analysis_for_games_jili_payload(p2)
-            fast2 = MONITORING_GAMES_JILI_ALERT_PCT
-            cont2 = MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT
-        elif kind == "games_general":
-            g_lbl = GRAFANA_PANEL_TITLE_GAMES_GENERAL
-            s_lbl = MONITORING_GAMES_GENERAL_SERIES_KEYWORD
-            a2 = _analysis_for_games_general_payload(p2)
-            fast2 = MONITORING_GAMES_GENERAL_ALERT_PCT
-            cont2 = MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT
-        elif kind == "games_inhouse":
-            g_lbl = GRAFANA_PANEL_TITLE_GAMES_INHOUSE
-            s_lbl = MONITORING_GAMES_INHOUSE_SERIES_KEYWORD
-            a2 = _analysis_for_games_inhouse_payload(p2)
-            fast2 = MONITORING_GAMES_INHOUSE_ALERT_PCT
-            cont2 = MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT
-        else:
-            continue
-        reasons2 = _format_trigger_lines(
-            g_lbl,
-            s_lbl,
-            a2,
-            fast2,
-            cont2,
-            MONITORING_ALERT_WINDOW_SECONDS,
-        )
-        if not reasons2:
-            fb2 = _format_trigger_fallback_line(
-                g_lbl,
-                s_lbl,
-                a2,
-                fast2,
-                cont2,
-                MONITORING_ALERT_WINDOW_SECONDS,
-            )
-            if fb2:
-                reasons2.append(fb2)
-        if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or bool(a2.get("hit_alert"))):
-            reasons2 = [_format_simple_series_alert_block(g_lbl, s_lbl, a2)]
-        elif reasons2 and not MONITORING_SIMPLE_ALERT_TEXT:
-            reasons2.append(_format_alert_series_table_footer(g_lbl, s_lbl, a2))
-        if reasons2:
-            reason_blocks.append("\n\n".join(reasons2))
+    if show_extra:
+        for ex in payload.get("extraPanels") or []:
+            if not isinstance(ex, dict):
+                continue
+            kind = (ex.get("kind") or "")
+            if mo_only and kind != mo_only:
+                continue
+            if _monitoring_alert_channel_muted(kind):
+                continue
+            p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+            if kind == "9280_push":
+                g_lbl = GRAFANA_PANEL_TITLE_9280
+                s_lbl = MONITORING_9280_SERIES_KEYWORD
+                a2 = _analysis_for_9280_payload(p2)
+                fast2 = MONITORING_9280_ALERT_PCT
+                cont2 = MONITORING_9280_CONTINUOUS_ALERT_PCT
+            elif kind == "deposit":
+                g_lbl = GRAFANA_PANEL_TITLE_DEPOSIT
+                s_lbl = MONITORING_DEPOSIT_SERIES_KEYWORD
+                a2 = _analysis_for_deposit_payload(p2)
+                fast2 = MONITORING_DEPOSIT_ALERT_PCT
+                cont2 = MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT
+            elif kind == "withdraw":
+                g_lbl = GRAFANA_PANEL_TITLE_WITHDRAW
+                s_lbl = MONITORING_WITHDRAW_SERIES_KEYWORD
+                a2 = _analysis_for_withdraw_payload(p2)
+                fast2 = MONITORING_WITHDRAW_ALERT_PCT
+                cont2 = MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT
+            elif kind == "error_req_1m":
+                g_lbl = GRAFANA_PANEL_TITLE_ERROR_REQ
+                s_lbl = f"{MONITORING_ERROR_REQ_SERIES_A_LABEL} + {MONITORING_ERROR_REQ_SERIES_B_LABEL}"
+                a2 = _analysis_for_error_req_payload(p2)
+                fast2 = MONITORING_ERROR_REQ_ALERT_PCT
+                cont2 = MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
+            elif kind == "provider_jili":
+                g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_JILI
+                s_lbl = MONITORING_PROVIDER_JILI_SERIES_KEYWORD
+                a2 = _analysis_for_provider_jili_payload(p2)
+                fast2 = MONITORING_PROVIDER_JILI_ALERT_PCT
+                cont2 = MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT
+            elif kind == "provider_general":
+                g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_GENERAL
+                s_lbl = MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD
+                a2 = _analysis_for_provider_general_payload(p2)
+                fast2 = MONITORING_PROVIDER_GENERAL_ALERT_PCT
+                cont2 = MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT
+            elif kind == "provider_inhouse":
+                g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE
+                s_lbl = MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD
+                a2 = _analysis_for_provider_inhouse_payload(p2)
+                fast2 = MONITORING_PROVIDER_INHOUSE_ALERT_PCT
+                cont2 = MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT
+            elif kind == "games_jili":
+                g_lbl = GRAFANA_PANEL_TITLE_GAMES_JILI
+                s_lbl = MONITORING_GAMES_JILI_SERIES_KEYWORD
+                a2 = _analysis_for_games_jili_payload(p2)
+                fast2 = MONITORING_GAMES_JILI_ALERT_PCT
+                cont2 = MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT
+            elif kind == "games_general":
+                g_lbl = GRAFANA_PANEL_TITLE_GAMES_GENERAL
+                s_lbl = MONITORING_GAMES_GENERAL_SERIES_KEYWORD
+                a2 = _analysis_for_games_general_payload(p2)
+                fast2 = MONITORING_GAMES_GENERAL_ALERT_PCT
+                cont2 = MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT
+            elif kind == "games_inhouse":
+                g_lbl = GRAFANA_PANEL_TITLE_GAMES_INHOUSE
+                s_lbl = MONITORING_GAMES_INHOUSE_SERIES_KEYWORD
+                a2 = _analysis_for_games_inhouse_payload(p2)
+                fast2 = MONITORING_GAMES_INHOUSE_ALERT_PCT
+                cont2 = MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT
+            else:
+                continue
+            if kind == "error_req_1m":
+                reasons2 = _format_error_req_trigger_lines(
+                    a2, fast2, cont2, MONITORING_ALERT_WINDOW_SECONDS
+                )
+                if not reasons2 and bool(a2.get("hit_alert")):
+                    fb2 = _format_trigger_fallback_line(
+                        g_lbl,
+                        s_lbl,
+                        a2,
+                        fast2,
+                        cont2,
+                        MONITORING_ALERT_WINDOW_SECONDS,
+                    )
+                    if fb2:
+                        reasons2.append(fb2)
+            else:
+                reasons2 = _format_trigger_lines(
+                    g_lbl,
+                    s_lbl,
+                    a2,
+                    fast2,
+                    cont2,
+                    MONITORING_ALERT_WINDOW_SECONDS,
+                )
+                if not reasons2:
+                    fb2 = _format_trigger_fallback_line(
+                        g_lbl,
+                        s_lbl,
+                        a2,
+                        fast2,
+                        cont2,
+                        MONITORING_ALERT_WINDOW_SECONDS,
+                    )
+                    if fb2:
+                        reasons2.append(fb2)
+                if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or bool(a2.get("hit_alert"))):
+                    reasons2 = [_format_simple_series_alert_block(g_lbl, s_lbl, a2)]
+                elif reasons2 and not MONITORING_SIMPLE_ALERT_TEXT:
+                    reasons2.append(_format_alert_series_table_footer(g_lbl, s_lbl, a2))
+            if reasons2:
+                reason_blocks.append("\n\n".join(reasons2))
     if not reason_blocks:
         lines.append("Alert fired but no panel matched text details (no analyzable points).")
     else:
@@ -7578,7 +7962,12 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
 
 def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
     _mute_purge_expired()
-    if not _monitoring_alert_channel_muted("http") and bool(
+    mo_only = (payload.get("moPanelOnlyKind") or "").strip()
+    if mo_only == "http":
+        return not _monitoring_alert_channel_muted("http") and bool(
+            _http_analysis_for_payload(payload).get("hit_alert")
+        )
+    if not mo_only and not _monitoring_alert_channel_muted("http") and bool(
         _http_analysis_for_payload(payload).get("hit_alert")
     ):
         return True
@@ -7586,6 +7975,8 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
         if not isinstance(ex, dict):
             continue
         k = (ex.get("kind") or "")
+        if mo_only and k != mo_only:
+            continue
         if _monitoring_alert_channel_muted(k):
             continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
@@ -7594,6 +7985,8 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
         if k == "deposit" and bool(_analysis_for_deposit_payload(p2).get("hit_alert")):
             return True
         if k == "withdraw" and bool(_analysis_for_withdraw_payload(p2).get("hit_alert")):
+            return True
+        if k == "error_req_1m" and bool(_analysis_for_error_req_payload(p2).get("hit_alert")):
             return True
         if k == "provider_jili" and bool(_analysis_for_provider_jili_payload(p2).get("hit_alert")):
             return True
@@ -7666,7 +8059,10 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
     max_rows = MONITORING_TABLE_TAIL_ROWS
     uid = str(payload.get("dashboardUid") or GRAFANA_DASHBOARD_UID)
     base = str(GRAFANA_BASE_URL).rstrip("/")
-    http_ex = _http_analysis_for_payload(payload)
+    mo_only = (payload.get("moPanelOnlyKind") or "").strip()
+    show_http = not mo_only or mo_only == "http"
+    show_extra = not mo_only or mo_only != "http"
+    http_ex = _http_analysis_for_payload(payload) if show_http else {}
 
     lines: List[str] = [
         f"[{payload.get('panelTitle')}] graph",
@@ -7677,6 +8073,8 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
         if not isinstance(ex, dict):
             continue
         k = (ex.get("kind") or "")
+        if show_extra and mo_only and k != mo_only:
+            continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
         if k == "9280_push":
             a2 = _analysis_for_9280_payload(p2)
@@ -7693,6 +8091,11 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             title = GRAFANA_PANEL_TITLE_WITHDRAW
             series = MONITORING_WITHDRAW_SERIES_KEYWORD
             extra_footer = _format_extra_analysis_lines("Withdraw", a2)
+        elif k == "error_req_1m":
+            a2 = _analysis_for_error_req_payload(p2)
+            title = GRAFANA_PANEL_TITLE_ERROR_REQ
+            series = f"{MONITORING_ERROR_REQ_SERIES_A_LABEL} + {MONITORING_ERROR_REQ_SERIES_B_LABEL}"
+            extra_footer = _format_error_req_extra_analysis_lines(a2)
         elif k == "provider_jili":
             a2 = _analysis_for_provider_jili_payload(p2)
             title = GRAFANA_PANEL_TITLE_PROVIDER_JILI
@@ -7725,55 +8128,77 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             extra_footer = _format_extra_analysis_lines("Games INHOUSE", a2)
         else:
             continue
-        pts2 = a2.get("merged_points") or []
         lines.append("")
         lines.append(f"[{title}] series: {series}")
-        if pts2:
-            tail2 = pts2[-max_rows:]
-            rows2: List[str] = ["time           value"]
-            for pair in tail2:
-                rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
-            lines.append("```text")
-            lines.extend(rows2)
-            lines.append("```")
+        if k == "error_req_1m":
+            for sub_key, default_lbl in (
+                ("series_a", MONITORING_ERROR_REQ_SERIES_A_LABEL),
+                ("series_b", MONITORING_ERROR_REQ_SERIES_B_LABEL),
+            ):
+                sub = a2.get(sub_key) if isinstance(a2.get(sub_key), dict) else {}
+                lbl = str(sub.get("label") or default_lbl)
+                pts_sub = sub.get("merged_points") or []
+                lines.append(f"  · {lbl}")
+                if pts_sub:
+                    tail_sub = pts_sub[-max_rows:]
+                    rows_sub: List[str] = ["time           value"]
+                    for pair in tail_sub:
+                        rows_sub.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+                    lines.append("```text")
+                    lines.extend(rows_sub)
+                    lines.append("```")
+                else:
+                    lines.append(f"  (no points matched for {lbl})")
         else:
-            lines.append(f"(no {series} points matched)")
+            pts2 = a2.get("merged_points") or []
+            if pts2:
+                tail2 = pts2[-max_rows:]
+                rows2: List[str] = ["time           value"]
+                for pair in tail2:
+                    rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+                lines.append("```text")
+                lines.extend(rows2)
+                lines.append("```")
+            else:
+                lines.append(f"(no {series} points matched)")
         lines.extend(extra_footer)
 
-    for s in payload.get("series") or []:
-        prom = s.get("prometheus") or {}
-        pdata = prom.get("data") or {}
-        results = pdata.get("result") or []
-        ref = s.get("refId") or "?"
-        if not results:
-            lines.append(f"- [{ref}] no data")
-            continue
-        http_results = [
-            r for r in results[:24] if _metric_series_is_http_leg(r.get("metric") or {})
-        ]
-        if not http_results:
-            lines.append(f"- [{ref}] no http-labeled series (skipped {len(results)} rows)")
-            continue
-        for r in http_results[:6]:
-            m = r.get("metric") or {}
-            legend = _compact_http_legend(m, str(ref))
-            vals = r.get("values") or []
-            if not vals:
-                lines.append(f"[{ref}] {legend}: (empty)")
+    if show_http:
+        for s in payload.get("series") or []:
+            prom = s.get("prometheus") or {}
+            pdata = prom.get("data") or {}
+            results = pdata.get("result") or []
+            ref = s.get("refId") or "?"
+            if not results:
+                lines.append(f"- [{ref}] no data")
                 continue
-            lines.append("")
-            lines.append(f"[{ref}] {legend}")
-            tail = vals[-max_rows:]
-            rows: List[str] = ["time           value"]
-            for pair in tail:
-                rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
-            lines.append("```text")
-            lines.extend(rows)
-            lines.append("```")
+            http_results = [
+                r for r in results[:24] if _metric_series_is_http_leg(r.get("metric") or {})
+            ]
+            if not http_results:
+                lines.append(f"- [{ref}] no http-labeled series (skipped {len(results)} rows)")
+                continue
+            for r in http_results[:6]:
+                m = r.get("metric") or {}
+                legend = _compact_http_legend(m, str(ref))
+                vals = r.get("values") or []
+                if not vals:
+                    lines.append(f"[{ref}] {legend}: (empty)")
+                    continue
+                lines.append("")
+                lines.append(f"[{ref}] {legend}")
+                tail = vals[-max_rows:]
+                rows: List[str] = ["time           value"]
+                for pair in tail:
+                    rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+                lines.append("```text")
+                lines.extend(rows)
+                lines.append("```")
 
     if include_target_mention and _monitoring_payload_hit_alert(payload):
         _append_monitoring_alert_target_user_mention(lines)
-    lines.extend(_format_http_analysis_lines(http_ex))
+    if show_http:
+        lines.extend(_format_http_analysis_lines(http_ex))
 
     return "\n".join(lines)
 
@@ -8179,9 +8604,12 @@ def _run_monitoring_background_job(
     mid: str,
     dispatch_key: str,
     source_chat_aliases: Optional[List[str]] = None,
+    mo_panel_filter: Optional[str] = None,
 ) -> None:
     try:
-        _monitoring_background_worker(chat_id, open_id, mid, dispatch_key, source_chat_aliases)
+        _monitoring_background_worker(
+            chat_id, open_id, mid, dispatch_key, source_chat_aliases, mo_panel_filter
+        )
     finally:
         if dispatch_key:
             with _monitoring_reply_dispatch_lock:
@@ -8194,6 +8622,7 @@ def _monitoring_background_worker(
     mid: str,
     dispatch_key: str = "",
     source_chat_aliases: Optional[List[str]] = None,
+    mo_panel_filter: Optional[str] = None,
 ) -> None:
     """
     Grafana + Lark send can exceed Feishu's ~3s webhook limit — run off the request thread.
@@ -8214,13 +8643,31 @@ def _monitoring_background_worker(
         return
 
     user_visible_send_ok = False
+    mo_panel_kind: Optional[str] = None
     try:
         grafana_session: Optional[requests.Session] = None
         payload: Optional[Dict[str, Any]] = None
         alert_hit = False
         try:
+            if mo_panel_filter:
+                entry, err = _resolve_mo_panel_filter(mo_panel_filter)
+                if err:
+                    reply = err + "\n\n" + _monitoring_mo_panel_list_text()
+                    grafana_session = None
+                    payload = None
+                    alert_hit = False
+                    if chat_id:
+                        _lark_send_monitoring_user_message("chat_id", chat_id, reply, None)
+                        user_visible_send_ok = True
+                    elif open_id:
+                        _lark_send_monitoring_user_message("open_id", open_id, reply, None)
+                        user_visible_send_ok = True
+                    return
+                mo_panel_kind = (entry or {}).get("kind")
             grafana_session = grafana_login_session()
-            payload = fetch_monitoring_payload(session=grafana_session)
+            payload = fetch_monitoring_payload(
+                session=grafana_session, mo_panel_kind=mo_panel_kind
+            )
             alert_hit = _monitoring_payload_hit_alert(payload)
             reply = _format_monitoring_reply(payload, include_target_mention=not alert_hit)
             if alert_hit and payload is not None:
@@ -8661,6 +9108,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         return
 
+    _, mo_panel_arg = _parse_monitoring_trigger_panel(clean or "")
     body_key = _monitoring_dispatch_body_key(clean, raw_text, mentions)
     processed_stick = _monitoring_processed_stick(
         mid, im_event_id, chat_id or "", sender_debounce, msg_time
@@ -8745,7 +9193,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     threading.Thread(
         target=_run_monitoring_background_job,
-        args=(chat_id, open_id, mid, debounce_key, chat_aliases),
+        args=(chat_id, open_id, mid, debounce_key, chat_aliases, mo_panel_arg),
         daemon=True,
         name="monitoring-reply",
     ).start()
