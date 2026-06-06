@@ -236,6 +236,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WITHDRAW_ENABLE": "1",
     "MONITORING_WITHDRAW_ALERT_PCT": 80,
     "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 120,
+    # Withdraw only: spike/drop vs **median baseline** of eval window (not bucket-to-bucket %).
+    # 例 median=200、80% → spike 需 >360；median=30 时 40 仅 +33% vs baseline，20→40 不告警。
+    "MONITORING_WITHDRAW_MIN_BASELINE_VALUE": "0",
     "MONITORING_PROVIDER_JILI_ENABLE": "1",
     "MONITORING_PROVIDER_JILI_ALERT_PCT": 15,
     "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 15,
@@ -622,6 +625,9 @@ MONITORING_DEPOSIT_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_ALERT_PCT", 60.0)
 MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT", 80.0)
 MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", 60.0)
 MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", 80.0)
+MONITORING_WITHDRAW_MIN_BASELINE_VALUE = max(
+    0.0, _cfg_float("MONITORING_WITHDRAW_MIN_BASELINE_VALUE", 0.0)
+)
 MONITORING_PROVIDER_JILI_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_JILI_ALERT_PCT", 15.0)
 MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
     "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT", 15.0
@@ -6536,6 +6542,17 @@ def _prometheus_result_value_pairs(result: Dict[str, Any]) -> List[Tuple[float, 
     return out
 
 
+def _median_finite(values: List[float]) -> float:
+    """Median of finite values (includes 0); ``0.0`` if none."""
+    xs = sorted(float(v) for v in values if math.isfinite(float(v)))
+    if not xs:
+        return 0.0
+    mid = len(xs) // 2
+    if len(xs) % 2 == 1:
+        return float(xs[mid])
+    return float(xs[mid - 1] + xs[mid]) / 2.0
+
+
 def _median_positive_abs(values: List[float]) -> float:
     """Median of ``abs(v)`` for finite ``v > 0``; ``0.0`` if none."""
     xs = sorted(abs(float(v)) for v in values if math.isfinite(float(v)) and float(v) > 0.0)
@@ -6964,6 +6981,138 @@ def _http_drop_spike_analysis(
     return out
 
 
+def _withdraw_baseline_drop_spike_analysis(
+    points: List[Tuple[float, float]],
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    window_seconds: int = 120,
+    *,
+    min_baseline_value: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Withdraw-only: compare peaks/troughs to the **median baseline** of the eval window.
+    Ignores low-volume bucket-to-bucket % noise (e.g. 20→40 is +100% between buckets but only
+    +33% vs median≈30, below an 80% threshold).
+    """
+    out: Dict[str, Any] = {
+        "pointCount": len(points),
+        "hit_alert": False,
+        "alert_rule": "baseline_median",
+        "fast_threshold_pct": fast_threshold_pct,
+        "continuous_threshold_pct": continuous_threshold_pct,
+        "window_seconds": int(window_seconds),
+        "baseline_median": None,
+        "consecutive_max_drop": None,
+        "consecutive_max_spike": None,
+        "window_max_drop": None,
+        "window_max_spike": None,
+    }
+    if len(points) < 2:
+        return out
+
+    vals = [p[1] for p in points]
+    ts = [p[0] for p in points]
+    L = len(points)
+    baseline = _median_finite(vals)
+    out["baseline_median"] = round(baseline, 2) if baseline > 0 else None
+    if baseline <= 0:
+        return out
+    if float(min_baseline_value) > 0 and baseline < float(min_baseline_value):
+        return out
+
+    if L >= 2:
+        diffs = [max(1.0, ts[i + 1] - ts[i]) for i in range(L - 1)]
+        diffs.sort()
+        step_sec = diffs[len(diffs) // 2]
+    else:
+        step_sec = 60.0
+    span = max(1, int(round(float(window_seconds) / float(step_sec))))
+    out["window_span_buckets"] = span + 1
+
+    fast_spike_level = baseline * (1.0 + float(fast_threshold_pct) / 100.0)
+    fast_drop_level = baseline * (1.0 - float(fast_threshold_pct) / 100.0)
+    cont_spike_level = baseline * (1.0 + float(continuous_threshold_pct) / 100.0)
+    cont_drop_level = baseline * max(0.0, 1.0 - float(continuous_threshold_pct) / 100.0)
+
+    def _pct_above_baseline(val: float) -> float:
+        return round((float(val) - baseline) / baseline * 100.0, 2)
+
+    def _pct_below_baseline(val: float) -> float:
+        return round((baseline - float(val)) / baseline * 100.0, 2)
+
+    drop_run = _best_consecutive_drop_run(vals, ts)
+    if drop_run is not None:
+        end_val = float(drop_run.get("to_val") or 0.0)
+        pct_b = _pct_below_baseline(end_val)
+        out["consecutive_max_drop"] = {
+            "pct": pct_b,
+            "from_ts": drop_run["from_ts"],
+            "to_ts": drop_run["to_ts"],
+            "from_val": drop_run.get("from_val"),
+            "to_val": drop_run.get("to_val"),
+            "buckets": drop_run["buckets"],
+            "baseline_median": baseline,
+        }
+        if end_val < cont_drop_level and pct_b >= min(float(continuous_threshold_pct), 100.0):
+            out["hit_alert"] = True
+
+    spike_run = _best_consecutive_spike_run(vals, ts)
+    if spike_run is not None:
+        end_val = float(spike_run.get("to_val") or 0.0)
+        pct_b = _pct_above_baseline(end_val)
+        out["consecutive_max_spike"] = {
+            "pct": pct_b,
+            "from_ts": spike_run["from_ts"],
+            "to_ts": spike_run["to_ts"],
+            "from_val": spike_run.get("from_val"),
+            "to_val": spike_run.get("to_val"),
+            "buckets": spike_run["buckets"],
+            "baseline_median": baseline,
+        }
+        if end_val > cont_spike_level and pct_b >= float(continuous_threshold_pct):
+            out["hit_alert"] = True
+
+    best_w_drop: Optional[Dict[str, Any]] = None
+    best_w_spike: Optional[Dict[str, Any]] = None
+    for i in range(0, L - span):
+        j = i + span
+        end_val = float(vals[j])
+        if end_val < fast_drop_level:
+            pct_b = _pct_below_baseline(end_val)
+            cand_d = {
+                "pct": pct_b,
+                "from_ts": ts[i],
+                "to_ts": ts[j],
+                "from_val": vals[i],
+                "to_val": vals[j],
+                "window_seconds": int(round(ts[j] - ts[i])),
+                "baseline_median": baseline,
+            }
+            if best_w_drop is None or float(cand_d["pct"]) > float(best_w_drop["pct"]):
+                best_w_drop = cand_d
+        if end_val > fast_spike_level:
+            pct_b = _pct_above_baseline(end_val)
+            cand_s = {
+                "pct": pct_b,
+                "from_ts": ts[i],
+                "to_ts": ts[j],
+                "from_val": vals[i],
+                "to_val": vals[j],
+                "window_seconds": int(round(ts[j] - ts[i])),
+                "baseline_median": baseline,
+            }
+            if best_w_spike is None or float(cand_s["pct"]) > float(best_w_spike["pct"]):
+                best_w_spike = cand_s
+
+    out["window_max_drop"] = best_w_drop
+    out["window_max_spike"] = best_w_spike
+    if best_w_drop is not None and float(best_w_drop.get("pct") or 0.0) >= float(fast_threshold_pct):
+        out["hit_alert"] = True
+    if best_w_spike is not None and float(best_w_spike.get("pct") or 0.0) >= float(fast_threshold_pct):
+        out["hit_alert"] = True
+    return out
+
+
 def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_http_timeseries_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
@@ -7013,11 +7162,12 @@ def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_withdraw_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
-    a = _http_drop_spike_analysis(
+    a = _withdraw_baseline_drop_spike_analysis(
         pts,
         MONITORING_WITHDRAW_ALERT_PCT,
         MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT,
         MONITORING_ALERT_WINDOW_SECONDS,
+        min_baseline_value=MONITORING_WITHDRAW_MIN_BASELINE_VALUE,
     )
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
@@ -7131,11 +7281,19 @@ def _format_extra_analysis_lines(section_label: str, analysis: Dict[str, Any]) -
     fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_9280_ALERT_PCT)
     cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_9280_CONTINUOUS_ALERT_PCT)
     win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
-    lines: List[str] = [
-        "",
-        f"[{section_label}] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
-        f"or continuous drop/spike > {cont_thr:g}%",
-    ]
+    baseline = analysis.get("baseline_median")
+    if analysis.get("alert_rule") == "baseline_median" and baseline is not None:
+        lines = [
+            "",
+            f"[{section_label}] alert when value exceeds median baseline {_fmt_num(baseline)} by "
+            f">{fast_thr:g}% (fast {win_sec//60}m) or >{cont_thr:g}% (continuous)",
+        ]
+    else:
+        lines = [
+            "",
+            f"[{section_label}] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
+            f"or continuous drop/spike > {cont_thr:g}%",
+        ]
     wd = analysis.get("window_max_drop")
     ws = analysis.get("window_max_spike")
     cd = analysis.get("consecutive_max_drop")
