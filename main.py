@@ -6247,11 +6247,14 @@ def _grafana_legend_service_rpc_parts(label: str) -> Tuple[str, str]:
 
 
 def _grafana_legend_text_matches_series(want_label: str, legend_text: str) -> bool:
-    """Strict ``service - rpc`` match; jili vs general ``cluster-route - POST /`` must not cross-match."""
+    """Strict match: exact id (``6005``, ``49``) or ``service - rpc`` (jili vs general)."""
     want_norm = (want_label or "").replace("\n", " ").strip()
     text_norm = (legend_text or "").replace("\n", " ").strip()
     if not want_norm or not text_norm:
         return False
+    want_dash = want_norm.replace("\u2014", "-").replace("\u2013", "-")
+    if " - " not in want_dash:
+        return want_norm.casefold() == text_norm.casefold()
     want_svc, want_rpc = _grafana_legend_service_rpc_parts(want_norm)
     text_svc, text_rpc = _grafana_legend_service_rpc_parts(text_norm)
     if not want_svc or not text_svc:
@@ -6668,6 +6671,48 @@ def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> b
     return False
 
 
+def _grafana_alert_isolate_series_labels(
+    panel_title: str,
+    payload: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Legend label(s) to show alone on alert solo screenshots for ``panel_title``."""
+    if not GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES or not isinstance(payload, dict):
+        return []
+    title = (panel_title or "").strip()
+    if not title:
+        return []
+    if title == GRAFANA_PANEL_TITLE_ERROR_REQ:
+        return _error_req_spiked_series_labels_from_payload(payload)
+    _mute_purge_expired()
+    panel_specs: List[Tuple[str, str, str, Any]] = [
+        ("9280_push", GRAFANA_PANEL_TITLE_9280, MONITORING_9280_SERIES_KEYWORD, _analysis_for_9280_payload),
+        ("deposit", GRAFANA_PANEL_TITLE_DEPOSIT, MONITORING_DEPOSIT_SERIES_KEYWORD, _analysis_for_deposit_payload),
+        ("withdraw", GRAFANA_PANEL_TITLE_WITHDRAW, MONITORING_WITHDRAW_SERIES_KEYWORD, _analysis_for_withdraw_payload),
+        ("provider_jili", GRAFANA_PANEL_TITLE_PROVIDER_JILI, MONITORING_PROVIDER_JILI_SERIES_KEYWORD, _analysis_for_provider_jili_payload),
+        ("provider_general", GRAFANA_PANEL_TITLE_PROVIDER_GENERAL, MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD, _analysis_for_provider_general_payload),
+        ("provider_inhouse", GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE, MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD, _analysis_for_provider_inhouse_payload),
+        ("games_jili", GRAFANA_PANEL_TITLE_GAMES_JILI, MONITORING_GAMES_JILI_SERIES_KEYWORD, _analysis_for_games_jili_payload),
+        ("games_general", GRAFANA_PANEL_TITLE_GAMES_GENERAL, MONITORING_GAMES_GENERAL_SERIES_KEYWORD, _analysis_for_games_general_payload),
+        ("games_inhouse", GRAFANA_PANEL_TITLE_GAMES_INHOUSE, MONITORING_GAMES_INHOUSE_SERIES_KEYWORD, _analysis_for_games_inhouse_payload),
+    ]
+    for kind, g_title, keyword, analyzer in panel_specs:
+        if title != g_title:
+            continue
+        if _monitoring_alert_channel_muted(kind):
+            return []
+        kw = (keyword or "").strip()
+        if not kw:
+            return []
+        for ex in payload.get("extraPanels") or []:
+            if not isinstance(ex, dict) or (ex.get("kind") or "").strip() != kind:
+                continue
+            p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+            if bool(analyzer(p2).get("hit_alert")):
+                return [kw]
+        return []
+    return []
+
+
 def _grafana_build_alert_screenshot_jobs(
     session: requests.Session,
     highlight_panel_titles: Optional[List[str]],
@@ -6678,8 +6723,8 @@ def _grafana_build_alert_screenshot_jobs(
     timezone_param: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Solo alert capture jobs. Error-req panel with multiple spiked series → one job per series
-    (same ``panelId``, different legend isolation).
+    Solo alert capture jobs. When ``GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES=1``, each alerting
+    panel gets ``isolate_series`` set (error_req: one job per spiked series; others: keyword).
     """
     solo_caps = _grafana_resolve_alert_solo_captures(
         session,
@@ -6690,17 +6735,11 @@ def _grafana_build_alert_screenshot_jobs(
     )
     if not solo_caps:
         return []
-    spiked_error_req: List[str] = []
-    if GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES:
-        spiked_error_req = _error_req_spiked_series_labels_from_payload(payload)
     jobs: List[Dict[str, Any]] = []
     for url, solo_title, panel_id in solo_caps:
-        if (
-            GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES
-            and solo_title == GRAFANA_PANEL_TITLE_ERROR_REQ
-            and spiked_error_req
-        ):
-            for lbl in spiked_error_req:
+        isolate_labels = _grafana_alert_isolate_series_labels(solo_title, payload)
+        if isolate_labels:
+            for lbl in isolate_labels:
                 jobs.append({
                     "url": url,
                     "solo_title": solo_title,
@@ -6708,9 +6747,10 @@ def _grafana_build_alert_screenshot_jobs(
                     "isolate_series": lbl,
                 })
             logger.info(
-                "Grafana alert screenshot: error_req %s spiked series → %s solo PNG job(s)",
-                len(spiked_error_req),
-                len(spiked_error_req),
+                "Grafana alert screenshot: %r isolate %s series → %s solo PNG job(s)",
+                solo_title,
+                isolate_labels,
+                len(isolate_labels),
             )
         else:
             jobs.append({
