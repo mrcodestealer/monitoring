@@ -305,7 +305,11 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_CONFIRM_SECONDS": "60",
     # Watchdog 判警是否使用与 /monitoring 相同的拉数窗口（默认 0：窄窗口 eval；设为 1 则与报表一致，避免「报表有大波动但自动告警未扫到」）
     "MONITORING_WATCH_MATCH_REPORT_WINDOW": "0",
-    # Watchdog 告警附带截图的 Grafana URL（相对时间）；与判窗数据窗口无关，默认最近 15 分钟整页
+    # Watchdog 告警截图：1=与告警判窗 payload.window 对齐（推荐）；0=用下面相对时间
+    "MONITORING_WATCH_SCREENSHOT_MATCH_EVAL": "1",
+    # 判窗对齐时，截图范围在 eval 窗口两侧各扩 N 分钟（便于看图）
+    "MONITORING_WATCH_SCREENSHOT_PADDING_MINUTES": "3",
+    # ``MATCH_EVAL=0`` 时生效
     "MONITORING_WATCH_SCREENSHOT_FROM": "now-15m",
     "MONITORING_WATCH_SCREENSHOT_TO": "now",
     "MONITORING_WATCH_SCREENSHOT_TIMEZONE": "browser",
@@ -890,6 +894,13 @@ MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS = max(
 )
 MONITORING_WATCH_CONFIRM_SECONDS = max(
     0.0, _cfg_float("MONITORING_WATCH_CONFIRM_SECONDS", 60.0)
+)
+MONITORING_WATCH_SCREENSHOT_MATCH_EVAL = _lark_env_truthy_or_default(
+    "MONITORING_WATCH_SCREENSHOT_MATCH_EVAL",
+    default=True,
+)
+MONITORING_WATCH_SCREENSHOT_PADDING_MINUTES = max(
+    0, _cfg_int("MONITORING_WATCH_SCREENSHOT_PADDING_MINUTES", 3)
 )
 _tls_analysis_drop = threading.local()
 
@@ -6327,6 +6338,30 @@ def _grafana_playwright_collect_legend_click_targets(page: Any) -> List[Dict[str
     return [x for x in raw if isinstance(x, dict) and str(x.get("text") or "").strip()]
 
 
+def _grafana_watchdog_alert_screenshot_time_range(
+    payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    """
+    Grafana ``from``/``to`` for watchdog alert screenshots.
+
+    Default: align to ``payload['window']`` (same Prometheus eval as the alert text).
+    Fallback: ``MONITORING_WATCH_SCREENSHOT_FROM`` / ``…_TO`` relative strings.
+    """
+    if MONITORING_WATCH_SCREENSHOT_MATCH_EVAL and isinstance(payload, dict):
+        w = payload.get("window") if isinstance(payload.get("window"), dict) else {}
+        su = int(w.get("startUnix") or 0)
+        eu = int(w.get("endUnix") or 0)
+        if su > 0 and eu > su:
+            pad = MONITORING_WATCH_SCREENSHOT_PADDING_MINUTES
+            return (
+                str((su - pad * 60) * 1000),
+                str((eu + pad * 60) * 1000),
+            )
+    rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-15m").strip() or "now-15m"
+    rt = _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip() or "now"
+    return rf, rt
+
+
 def _grafana_playwright_legend_rows_for_isolate(page: Any) -> List[Dict[str, Any]]:
     """Deduped legend rows: ``{text, x, y}`` click centers (color cell / button preferred)."""
     raw = page.evaluate(
@@ -6381,6 +6416,32 @@ def _grafana_playwright_legend_rows_for_isolate(page: Any) -> List[Dict[str, Any
     if not isinstance(raw, list):
         return []
     return [x for x in raw if isinstance(x, dict) and str(x.get("text") or "").strip()]
+
+
+def _grafana_playwright_legend_rows_all(page: Any) -> List[Dict[str, Any]]:
+    """Collect legend rows; scroll legend container so off-screen series (e.g. jili) are included."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for _ in range(14):
+        for row in _grafana_playwright_legend_rows_for_isolate(page):
+            key = str(row.get("text") or "").strip().casefold()
+            if key and key not in merged:
+                merged[key] = row
+        try:
+            page.evaluate(
+                """() => {
+                  const leg = document.querySelector(
+                    '[data-testid="viz-legend"], .viz-legend, section[aria-label="Legend"]'
+                  );
+                  if (!leg) return;
+                  const scroller =
+                    leg.querySelector('[class*="scrollbar-view"], [style*="overflow"]') || leg;
+                  scroller.scrollTop += 56;
+                }"""
+            )
+        except Exception:
+            break
+        page.wait_for_timeout(90)
+    return list(merged.values())
 
 
 def _grafana_playwright_chart_ymax_approx(page: Any) -> float:
@@ -6487,7 +6548,7 @@ def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> b
         _grafana_wait_loading_like_gone(page, min(3000, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)))
 
     try:
-        rows = _grafana_playwright_legend_rows_for_isolate(page)
+        rows = _grafana_playwright_legend_rows_all(page)
         if not rows:
             logger.warning("Grafana screenshot: no legend rows for isolate %r", want[:100])
             return False
@@ -7196,14 +7257,24 @@ def _grafana_watchdog_alert_screenshot_png_list(
     payload: Optional[Dict[str, Any]] = None,
 ) -> List[bytes]:
     """
-    Watchdog alert image(s): Grafana **browser** range ``now-15m`` … ``now`` (plus optional ``timezone``),
-    independent of the shorter Prometheus eval window on the payload.
-    When ``payload`` is provided, each alerting panel may get its own solo PNG.
+    Watchdog alert image(s). Default ``MONITORING_WATCH_SCREENSHOT_MATCH_EVAL=1`` uses the same
+    ``payload['window']`` as the alert (± padding). When ``payload`` is set, solo PNG per panel.
     """
-    su, eu = _monitoring_watch_eval_window_unix()
-    rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-15m").strip() or "now-15m"
-    rt = _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip() or "now"
+    w = payload.get("window") if isinstance(payload, dict) else {}
+    su = int((w or {}).get("startUnix") or 0)
+    eu = int((w or {}).get("endUnix") or 0)
+    if su <= 0 or eu <= su:
+        su, eu = _monitoring_watch_eval_window_unix()
+    rf, rt = _grafana_watchdog_alert_screenshot_time_range(payload)
     tz = _cfg_str("MONITORING_WATCH_SCREENSHOT_TIMEZONE", "browser").strip()
+    logger.info(
+        "Grafana watchdog alert screenshot range from=%s to=%s (match_eval=%s eval_unix=%s..%s)",
+        rf[:40],
+        rt[:40],
+        MONITORING_WATCH_SCREENSHOT_MATCH_EVAL,
+        su,
+        eu,
+    )
     highlight = _monitoring_alert_panel_titles(payload) if payload else []
     return _grafana_headless_screenshot_png_list(
         session,
@@ -9074,8 +9145,7 @@ def _monitoring_send_screenshot_on_card_click(chat_id: str, open_id: str) -> Non
         if su <= 0 or eu <= 0:
             raise RuntimeError(f"invalid screenshot window start={su} end={eu}")
         if alert_hit:
-            rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-15m").strip() or "now-15m"
-            rt = _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip() or "now"
+            rf, rt = _grafana_watchdog_alert_screenshot_time_range(payload)
             tz = _cfg_str("MONITORING_WATCH_SCREENSHOT_TIMEZONE", "browser").strip()
             pngs = _grafana_headless_screenshot_png_list(
                 sess,
