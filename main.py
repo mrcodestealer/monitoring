@@ -613,11 +613,8 @@ def _enumerate_error_req_series_from_payload(
             label = blob.strip() or "series"
             if _error_req_skip_series_label(label):
                 continue
-            pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
-            if not pts:
-                continue
             acc = by_label.setdefault(label, {})
-            for ts, val in pts:
+            for ts, val in _prometheus_result_value_pairs(r if isinstance(r, dict) else {}):
                 acc[ts] = acc.get(ts, 0.0) + val
     out: List[Tuple[str, List[Tuple[float, float]]]] = []
     for lbl, acc in sorted(by_label.items(), key=lambda x: x[0].casefold()):
@@ -7684,16 +7681,7 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
             f"  {len(entries)} series monitored ({spiked_n} spiked, "
             f"{len(entries) - spiked_n} quiet)"
         )
-    detail_entries = entries
-    if len(entries) > 20:
-        spiked_only = [e for e in entries if e.get("spiked")]
-        detail_entries = spiked_only if spiked_only else entries[:12]
-        if len(detail_entries) < len(entries):
-            lines.append(
-                f"  (detail for {len(detail_entries)} of {len(entries)} series; "
-                "see spiked rows or first 12)"
-            )
-    for ent in detail_entries:
+    for ent in entries:
         lbl = str(ent.get("label") or "series")
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         base = sub.get("baseline_median")
@@ -8314,25 +8302,30 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             err_entries = [
                 e for e in (a2.get("series_entries") or []) if isinstance(e, dict)
             ]
-            many_err = len(err_entries) > 8
-            if many_err:
+            if _error_req_all_series_mode():
                 lines.append(
-                    f"  ({len(err_entries)} series; value tables for spikes only — "
-                    "full names below)"
+                    "  (Prometheus omits endpoints with no error samples in the "
+                    "query window — Grafana may list more legends)"
                 )
-                lines.append("```text")
-                for ent in err_entries:
-                    lbl = str(ent.get("label") or "series")
-                    flag = " *" if ent.get("spiked") else ""
-                    lines.append(f"{lbl}{flag}")
-                lines.append("```")
+            compact_tables = len(err_entries) > 8
+            if compact_tables:
+                spiked_n = sum(1 for e in err_entries if e.get("spiked"))
+                lines.append(
+                    f"  ({len(err_entries)} series — each listed below; "
+                    f"value tables for {spiked_n} spiked only)"
+                )
             for ent in err_entries:
                 sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
                 lbl = str(ent.get("label") or sub.get("label") or "series")
                 pts_sub = sub.get("merged_points") or []
-                if many_err and not ent.get("spiked"):
+                spike_mark = " *" if ent.get("spiked") else ""
+                lines.append(f"  · {lbl}{spike_mark}")
+                if compact_tables and not ent.get("spiked"):
+                    if pts_sub:
+                        lines.append("    (quiet — table omitted)")
+                    else:
+                        lines.append("    (no points in query window)")
                     continue
-                lines.append(f"  · {lbl}")
                 if pts_sub:
                     tail_sub = pts_sub[-max_rows:]
                     rows_sub: List[str] = ["time           value"]
@@ -8342,7 +8335,7 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
                     lines.extend(rows_sub)
                     lines.append("```")
                 else:
-                    lines.append(f"  (no points matched for {lbl})")
+                    lines.append("    (no points in query window)")
         else:
             pts2 = a2.get("merged_points") or []
             if pts2:
