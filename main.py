@@ -85,7 +85,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ERROR_REQ_MIN_SPIKE_VALUE": "10",
     # Per-series min spike overrides: ``pattern=25``; ``|`` = all parts must match legend; ``;`` = next rule.
     "MONITORING_ERROR_REQ_SERIES_MIN_SPIKE": (
-        "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=25"
+        "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=25;"
+        "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=15"
     ),
     # Legacy (used only when MONITORING_ERROR_REQ_SERIES is empty):
     "MONITORING_ERROR_REQ_SERIES_A": "RedeemPlayerLuckyCoins",
@@ -6222,74 +6223,136 @@ def _grafana_playwright_capture_viewport_png(page: Any) -> bytes:
         return page.screenshot(type="png", full_page=False)
 
 
+def _grafana_legend_text_matches_series(want_label: str, legend_text: str) -> bool:
+    want = (want_label or "").replace("\n", " ").strip().casefold()
+    text = (legend_text or "").replace("\n", " ").strip().casefold()
+    if not want or not text:
+        return False
+    if text == want or want in text or text in want:
+        return True
+    tail = want.split("/")[-1].strip()
+    if len(tail) > 4 and tail in text:
+        return True
+    if "hypergrid" in want and "hypergrid" in text and "post /refund" in text:
+        return True
+    return False
+
+
+def _grafana_playwright_collect_legend_click_targets(page: Any) -> List[Dict[str, Any]]:
+    """Return ``[{text, x, y}, …]`` for visible Grafana viz legend rows."""
+    raw = page.evaluate(
+        """() => {
+          const out = [];
+          const seen = new Set();
+          const legendText = (el) => {
+            const dt = el.getAttribute('data-testid') || '';
+            const m = dt.match(/VizLegend series\\s*(.*)$/i);
+            if (m && m[1]) {
+              return m[1].trim();
+            }
+            return (
+              el.getAttribute('title') ||
+              el.getAttribute('aria-label') ||
+              el.textContent ||
+              ''
+            ).replace(/\\s+/g, ' ').trim();
+          };
+          const push = (el) => {
+            if (!el || !el.getBoundingClientRect) return;
+            const text = legendText(el);
+            if (!text || text === '-' || seen.has(text)) return;
+            const r = el.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4) return;
+            seen.add(text);
+            out.push({
+              text,
+              x: r.left + r.width / 2,
+              y: r.top + r.height / 2,
+            });
+          };
+          document.querySelectorAll('[data-testid*="VizLegend series"]').forEach(push);
+          const sels = [
+            '[data-testid="viz-legend"] button',
+            '[data-testid="legend-series"] button',
+            'section[aria-label="Legend"] button',
+            '[class*="VizLegend"] button',
+            'div[class*="legend"] button',
+            'table.viz-legend tbody tr',
+            '[class*="Legend"] [role="button"]',
+          ];
+          for (const sel of sels) {
+            document.querySelectorAll(sel).forEach(push);
+          }
+          return out;
+        }"""
+    )
+    if not isinstance(raw, list):
+        return []
+    return [x for x in raw if isinstance(x, dict) and str(x.get("text") or "").strip()]
+
+
 def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> bool:
     """
-    Grafana time-series legend: Ctrl/Cmd+click isolates one series (hide others).
-    Returns True when a matching legend row was clicked.
+    Show only ``series_label``: click every other legend row to hide it (Grafana toggle).
+    Falls back to Ctrl/Cmd+click on the target row when hide-others finds nothing to click.
     """
     want = (series_label or "").strip()
     if not want:
         return False
     try:
-        n = page.evaluate(
-            """([wantLabel]) => {
-              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-              const want = norm(wantLabel);
-              const tail = (want.split('/').pop() || '').trim();
-              const match = (text) => {
-                const t = norm(text);
-                if (!t || !want) return false;
-                if (t === want || want.includes(t) || t.includes(want)) return true;
-                if (tail.length > 4 && t.includes(tail)) return true;
-                return false;
-              };
-              const candidates = [];
-              const push = (el, text) => {
-                const tx = String(text || '').trim();
-                if (!el || !tx) return;
-                candidates.push({ el, text: tx });
-              };
-              document.querySelectorAll(
-                '[data-testid="legend-series"] button, [data-testid="legend-series"] [role="button"], ' +
-                'div[class*="legend"] button, table.viz-legend tbody tr, [class*="VizLegend"] button, ' +
-                '[class*="LegendSeriesIcon"]'
-              ).forEach((el) => {
-                push(el, el.getAttribute('title') || el.getAttribute('aria-label') || el.textContent || '');
-              });
-              let target = null;
-              for (const c of candidates) {
-                if (match(c.text)) { target = c.el; break; }
-              }
-              if (!target) return 0;
-              try { target.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (e) {}
-              const rect = target.getBoundingClientRect();
-              const cx = rect.left + Math.max(1, rect.width / 2);
-              const cy = rect.top + Math.max(1, rect.height / 2);
-              const base = {
-                bubbles: true,
-                cancelable: true,
-                view: window,
-                clientX: cx,
-                clientY: cy,
-                button: 0,
-                ctrlKey: true,
-                metaKey: true,
-              };
-              ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
-                try {
-                  target.dispatchEvent(new MouseEvent(type, base));
-                } catch (e) {}
-              });
-              return 1;
-            }""",
-            [want],
-        )
-        if int(n or 0) > 0:
+        items = _grafana_playwright_collect_legend_click_targets(page)
+        if not items:
+            logger.warning("Grafana screenshot: no legend rows found for isolate %r", want[:100])
+            return False
+        target: Optional[Dict[str, Any]] = None
+        others: List[Dict[str, Any]] = []
+        for it in items:
+            txt = str(it.get("text") or "")
+            if _grafana_legend_text_matches_series(want, txt):
+                if target is None:
+                    target = it
+            else:
+                others.append(it)
+        if target is None:
+            logger.warning(
+                "Grafana screenshot: target legend not found want=%r legends=%s",
+                want[:100],
+                [str(x.get("text") or "")[:60] for x in items[:12]],
+            )
+            return False
+        hidden = 0
+        for it in others:
+            try:
+                page.mouse.click(float(it["x"]), float(it["y"]))
+                page.wait_for_timeout(100)
+                hidden += 1
+            except Exception:
+                continue
+        if hidden > 0:
             page.wait_for_timeout(500)
             _grafana_wait_loading_like_gone(page, min(3000, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)))
-            logger.info("Grafana screenshot: isolated legend series %r", want[:120])
+            logger.info(
+                "Grafana screenshot: isolated %r (hid %s other legend row(s))",
+                want[:100],
+                hidden,
+            )
             return True
-        logger.warning("Grafana screenshot: legend series not found for isolate %r", want[:120])
+        try:
+            page.keyboard.down("Control")
+            page.keyboard.down("Meta")
+            page.mouse.click(float(target["x"]), float(target["y"]))
+        finally:
+            try:
+                page.keyboard.up("Meta")
+            except Exception:
+                pass
+            try:
+                page.keyboard.up("Control")
+            except Exception:
+                pass
+        page.wait_for_timeout(500)
+        logger.info("Grafana screenshot: ctrl/cmd+click isolate %r", want[:100])
+        return True
     except Exception as e:
         logger.warning("Grafana screenshot: legend isolate failed series=%r: %s", want[:80], e)
     return False
@@ -7945,6 +8008,7 @@ def _format_error_req_trigger_lines(
                 fast_threshold_pct,
                 continuous_threshold_pct,
                 window_seconds,
+                spike_only=True,
             )
         )
     return ["\n".join(blocks)] if len(blocks) > 1 else []
@@ -8143,6 +8207,8 @@ def _format_trigger_lines(
     fast_threshold_pct: float,
     continuous_threshold_pct: float,
     window_seconds: int,
+    *,
+    spike_only: bool = False,
 ) -> List[str]:
     out: List[str] = []
     wd = analysis.get("window_max_drop")
@@ -8170,13 +8236,13 @@ def _format_trigger_lines(
         )
 
     fast_hits: List[str] = []
-    if isinstance(wd, dict) and float(wd.get("pct") or 0.0) >= float(fast_threshold_pct):
+    if not spike_only and isinstance(wd, dict) and float(wd.get("pct") or 0.0) >= float(fast_threshold_pct):
         fast_hits.append(_event_text(wd, "DROP", fast_threshold_pct))
     if isinstance(ws, dict) and float(ws.get("pct") or 0.0) >= float(fast_threshold_pct):
         fast_hits.append(_event_text(ws, "SPIKE", fast_threshold_pct))
 
     cont_hits: List[str] = []
-    if isinstance(cd, dict) and float(cd.get("pct") or 0.0) >= float(continuous_threshold_pct):
+    if not spike_only and isinstance(cd, dict) and float(cd.get("pct") or 0.0) >= float(continuous_threshold_pct):
         cont_hits.append(_event_text(cd, "DROP", continuous_threshold_pct))
     if isinstance(cs, dict) and float(cs.get("pct") or 0.0) >= float(continuous_threshold_pct):
         cont_hits.append(_event_text(cs, "SPIKE", continuous_threshold_pct))
