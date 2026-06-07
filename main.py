@@ -81,6 +81,8 @@ _CFG: Dict[str, Any] = {
         "grpc.promotion.FrontendSpecialEventService/ReceiveEventLoginReward"
     ),
     "MONITORING_ERROR_REQ_MIN_BASELINE_VALUE": "0",
+    # Spike peak (errors/min) must reach this absolute level to alert — suppresses 1→2 style noise.
+    "MONITORING_ERROR_REQ_MIN_SPIKE_VALUE": "10",
     # Legacy (used only when MONITORING_ERROR_REQ_SERIES is empty):
     "MONITORING_ERROR_REQ_SERIES_A": "RedeemPlayerLuckyCoins",
     "MONITORING_ERROR_REQ_SERIES_A_LABEL": "RedeemPlayerLuckyCoins",
@@ -536,6 +538,9 @@ MONITORING_ERROR_REQ_EXCLUDE_PARTS = _cfg_substring_parts(
 MONITORING_ERROR_REQ_MIN_BASELINE_VALUE = max(
     0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_BASELINE_VALUE", 0.0)
 )
+MONITORING_ERROR_REQ_MIN_SPIKE_VALUE = max(
+    0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_SPIKE_VALUE", 10.0)
+)
 
 
 def _error_req_all_series_mode() -> bool:
@@ -555,6 +560,35 @@ def _error_req_skip_series_label(label: str) -> bool:
     """Grafana sometimes returns a bare ``-`` placeholder row — not a real endpoint."""
     s = (label or "").strip()
     return not s or s in ("-", "—")
+
+
+def _error_req_series_display_label(legend_format: str, metric: Dict[str, Any]) -> str:
+    """Resolve ``{{service}} - {{rpc}}`` style legends from Prometheus metric labels."""
+    md = metric if isinstance(metric, dict) else {}
+    service = str(md.get("service") or "").strip()
+    rpc = str(md.get("rpc") or "").strip()
+    if service and rpc:
+        return f"{service} - {rpc}"
+    lg = str(legend_format or "").strip()
+    if lg and "{{" not in lg:
+        return _series_label_blob(lg, md).strip() or "series"
+    parts = [str(v).strip() for v in md.values() if v is not None and str(v).strip()]
+    if parts:
+        return " ".join(parts)
+    return lg if lg and "{{" not in lg else ""
+
+
+def _error_req_skip_series_row(
+    display_label: str, pts: List[Tuple[float, float]], *, legend_format: str = ""
+) -> bool:
+    if _error_req_skip_series_label(display_label):
+        return True
+    lg = str(legend_format or "")
+    if "{{" in lg and not display_label:
+        return True
+    if pts and all(float(v) == 0.0 for _, v in pts) and "{{" in lg:
+        return True
+    return False
 
 
 def _error_req_exclude_summary() -> str:
@@ -610,11 +644,12 @@ def _enumerate_error_req_series_from_payload(
             blob = _series_label_blob(lg, md)
             if _series_matches_error_req_exclude(blob):
                 continue
-            label = blob.strip() or "series"
-            if _error_req_skip_series_label(label):
+            pts_row = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
+            label = _error_req_series_display_label(lg, md)
+            if _error_req_skip_series_row(label, pts_row, legend_format=lg):
                 continue
             acc = by_label.setdefault(label, {})
-            for ts, val in _prometheus_result_value_pairs(r if isinstance(r, dict) else {}):
+            for ts, val in pts_row:
                 acc[ts] = acc.get(ts, 0.0) + val
     out: List[Tuple[str, List[Tuple[float, float]]]] = []
     for lbl, acc in sorted(by_label.items(), key=lambda x: x[0].casefold()):
@@ -7563,6 +7598,37 @@ def _series_analysis_has_spike(
     return False
 
 
+def _error_req_spike_peak_value(spike: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(spike, dict):
+        return 0.0
+    try:
+        return float(spike.get("to_val") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _error_req_analysis_has_spike(
+    analysis: Dict[str, Any], fast_threshold_pct: float, continuous_threshold_pct: float
+) -> bool:
+    """Like :func:`_series_analysis_has_spike` but requires peak ``>= MONITORING_ERROR_REQ_MIN_SPIKE_VALUE``."""
+    min_peak = float(MONITORING_ERROR_REQ_MIN_SPIKE_VALUE)
+    ws = analysis.get("window_max_spike")
+    if (
+        isinstance(ws, dict)
+        and float(ws.get("pct") or 0.0) >= float(fast_threshold_pct)
+        and _error_req_spike_peak_value(ws) >= min_peak
+    ):
+        return True
+    cs = analysis.get("consecutive_max_spike")
+    if (
+        isinstance(cs, dict)
+        and float(cs.get("pct") or 0.0) >= float(continuous_threshold_pct)
+        and _error_req_spike_peak_value(cs) >= min_peak
+    ):
+        return True
+    return False
+
+
 def _analysis_for_error_req_points(
     pts: List[Tuple[float, float]], *, label: str = ""
 ) -> Dict[str, Any]:
@@ -7602,7 +7668,7 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         series_rows = _enumerate_error_req_series_from_payload(payload)
         for lbl, raw_pts in series_rows:
             a = _analysis_for_error_req_points(raw_pts, label=lbl)
-            spiked = _series_analysis_has_spike(
+            spiked = _error_req_analysis_has_spike(
                 a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
             )
             entries.append({"label": lbl, "spiked": spiked, "analysis": a})
@@ -7611,7 +7677,7 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         for lbl, parts in _error_req_series_specs():
             a = _analysis_for_error_req_series(payload, parts, label=lbl)
-            spiked = _series_analysis_has_spike(
+            spiked = _error_req_analysis_has_spike(
                 a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
             )
             entries.append({"label": lbl, "spiked": spiked, "analysis": a})
@@ -7640,7 +7706,8 @@ def _format_error_req_trigger_lines(
         return []
     blocks: List[str] = [
         f"[{GRAFANA_PANEL_TITLE_ERROR_REQ}] SPIKE — value exceeded median baseline "
-        f"by >{fast_threshold_pct:g}% (fast) or >{continuous_threshold_pct:g}% (continuous)"
+        f"by >{fast_threshold_pct:g}% (fast) or >{continuous_threshold_pct:g}% (continuous) "
+        f"and peak >={MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min"
     ]
     for ent in analysis.get("series_entries") or []:
         if not isinstance(ent, dict) or not ent.get("spiked"):
@@ -7672,7 +7739,8 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
     lines: List[str] = [
         "",
         f"[Error req] spike vs median baseline — alert if any series exceeds baseline by "
-        f">{fast_thr:g}% (fast {win_sec//60}m) or >{cont_thr:g}% (continuous); "
+        f">{fast_thr:g}% (fast {win_sec//60}m) or >{cont_thr:g}% (continuous) "
+        f"and peak >={MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min; "
         f"excludes {_error_req_exclude_summary()}",
     ]
     if _error_req_all_series_mode() and entries:
@@ -7685,8 +7753,10 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
         lbl = str(ent.get("label") or "series")
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         base = sub.get("baseline_median")
+        spiked = bool(ent.get("spiked"))
+        pct_spike = _series_analysis_has_spike(sub, fast_thr, cont_thr)
         lines.append(
-            f"  {lbl}: spike={'yes' if ent.get('spiked') else 'no'}"
+            f"  {lbl}: spike={'yes' if spiked else 'no'}"
             + (f" (median baseline {_fmt_num(base)})" if base is not None else "")
         )
         ws = sub.get("window_max_spike")
@@ -7695,6 +7765,12 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
             f"    within {win_sec//60}m vs baseline: +{(ws or {}).get('pct', 'n/a')}% / "
             f"continuous +{(cs or {}).get('pct', 'n/a')}%"
         )
+        if pct_spike and not spiked:
+            peak = max(_error_req_spike_peak_value(ws), _error_req_spike_peak_value(cs))
+            lines.append(
+                f"    (suppressed: peak {_fmt_num(peak)} < min "
+                f"{_fmt_num(MONITORING_ERROR_REQ_MIN_SPIKE_VALUE)} errors/min)"
+            )
     return lines
 
 
