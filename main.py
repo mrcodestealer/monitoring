@@ -73,10 +73,13 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_PANEL_TITLE_WITHDRAW": "提款 (Withdrawal)",
     "MONITORING_WITHDRAW_SERIES_KEYWORD": "InitiateWithdrawal",
     "GRAFANA_PANEL_TITLE_ERROR_REQ": "错误请求数/1m",
-    # Semicolon ``;`` = separate series; pipe ``|`` = ALL substrings must match one series.
-    # Alert when **either** series exceeds median baseline (spike only). Append ``;pattern`` to add series.
-    "MONITORING_ERROR_REQ_SERIES": "RedeemPlayerLuckyCoins;igo-sw-http-main-apisix-pp|POST /refund",
-    "MONITORING_ERROR_REQ_EXCLUDE": "ReceiveEventLoginReward",
+    # ``*`` or ``all`` = every series on the panel except ``MONITORING_ERROR_REQ_EXCLUDE``.
+    # Whitelist mode: semicolon ``;`` = separate series; pipe ``|`` = ALL substrings must match.
+    "MONITORING_ERROR_REQ_SERIES": "*",
+    "MONITORING_ERROR_REQ_EXCLUDE": (
+        "fpms-nt-ali-prod-promotion-rollout|"
+        "grpc.promotion.FrontendSpecialEventService/ReceiveEventLoginReward"
+    ),
     "MONITORING_ERROR_REQ_MIN_BASELINE_VALUE": "0",
     # Legacy (used only when MONITORING_ERROR_REQ_SERIES is empty):
     "MONITORING_ERROR_REQ_SERIES_A": "RedeemPlayerLuckyCoins",
@@ -526,18 +529,45 @@ MONITORING_ERROR_REQ_SERIES_B_LABEL = _cfg_str(
     "MONITORING_ERROR_REQ_SERIES_B_LABEL", "POST /refund"
 ).strip()
 MONITORING_ERROR_REQ_EXCLUDE_PARTS = _cfg_substring_parts(
-    "MONITORING_ERROR_REQ_EXCLUDE", "ReceiveEventLoginReward"
+    "MONITORING_ERROR_REQ_EXCLUDE",
+    "fpms-nt-ali-prod-promotion-rollout|"
+    "grpc.promotion.FrontendSpecialEventService/ReceiveEventLoginReward",
 )
 MONITORING_ERROR_REQ_MIN_BASELINE_VALUE = max(
     0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_BASELINE_VALUE", 0.0)
 )
 
 
+def _error_req_all_series_mode() -> bool:
+    raw = (_cfg_str("MONITORING_ERROR_REQ_SERIES", "") or "").strip().casefold()
+    return raw in ("*", "all")
+
+
+def _series_matches_error_req_exclude(blob: str) -> bool:
+    """Exclude when **all** ``MONITORING_ERROR_REQ_EXCLUDE`` pipe-parts appear in the legend blob."""
+    parts = MONITORING_ERROR_REQ_EXCLUDE_PARTS
+    if not parts:
+        return False
+    return _series_matches_substring_parts(blob, parts)
+
+
+def _error_req_exclude_summary() -> str:
+    parts = MONITORING_ERROR_REQ_EXCLUDE_PARTS
+    if not parts:
+        return "—"
+    if len(parts) == 1:
+        return parts[0]
+    return " & ".join(parts)
+
+
 def _error_req_series_specs() -> List[Tuple[str, List[str]]]:
     """
-    ``(display_label, match_parts)`` per monitored series.
-    ``MONITORING_ERROR_REQ_SERIES``: ``a;b|c`` → two series; falls back to legacy A/B if unset.
+    ``(display_label, match_parts)`` per monitored series (whitelist mode only).
+    ``MONITORING_ERROR_REQ_SERIES`` ``*``/``all`` → use :func:`_enumerate_error_req_series_from_payload`.
+    Empty config falls back to legacy A/B.
     """
+    if _error_req_all_series_mode():
+        return []
     raw = (_cfg_str("MONITORING_ERROR_REQ_SERIES", "") or "").strip()
     if not raw:
         out: List[Tuple[str, List[str]]] = []
@@ -559,7 +589,48 @@ def _error_req_series_specs() -> List[Tuple[str, List[str]]]:
     return specs
 
 
-def _error_req_series_labels_summary() -> str:
+def _enumerate_error_req_series_from_payload(
+    payload: Dict[str, Any],
+) -> List[Tuple[str, List[Tuple[float, float]]]]:
+    """Every distinct series on the panel payload, minus ``MONITORING_ERROR_REQ_EXCLUDE``."""
+    by_label: Dict[str, Dict[float, float]] = {}
+    for s in payload.get("series") or []:
+        lg = str(s.get("legendFormat") or "")
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            metric = r.get("metric") or {}
+            md = metric if isinstance(metric, dict) else {}
+            blob = _series_label_blob(lg, md)
+            if _series_matches_error_req_exclude(blob):
+                continue
+            pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
+            if not pts:
+                continue
+            label = blob.strip() or "series"
+            acc = by_label.setdefault(label, {})
+            for ts, val in pts:
+                acc[ts] = acc.get(ts, 0.0) + val
+    out: List[Tuple[str, List[Tuple[float, float]]]] = []
+    for lbl, acc in sorted(by_label.items(), key=lambda x: x[0].casefold()):
+        out.append((lbl, sorted(acc.items(), key=lambda x: x[0])))
+    return out
+
+
+def _error_req_series_labels_summary(
+    payload: Optional[Dict[str, Any]] = None,
+    analysis: Optional[Dict[str, Any]] = None,
+) -> str:
+    if _error_req_all_series_mode():
+        n: Optional[int] = None
+        if isinstance(analysis, dict):
+            ents = analysis.get("series_entries") or []
+            if isinstance(ents, list):
+                n = len(ents)
+        ex = _error_req_exclude_summary()
+        if n is not None:
+            return f"all panel series ({n}, excluding {ex})"
+        return f"all panel series (excluding {ex})"
     labels = [lbl for lbl, _ in _error_req_series_specs()]
     return " + ".join(labels) if labels else "—"
 GRAFANA_PANEL_TITLE_PROVIDER_JILI = _cfg_str(
@@ -6750,8 +6821,10 @@ def _series_matches_substring_parts(blob: str, parts: List[str]) -> bool:
 
 
 def _series_matches_exclude_parts(blob: str, exclude_parts: List[str]) -> bool:
-    b = (blob or "").casefold()
-    return any(p.strip().casefold() in b for p in exclude_parts if p.strip())
+    """True when **all** pipe-parts in ``exclude_parts`` appear in the legend blob."""
+    if not exclude_parts:
+        return False
+    return _series_matches_substring_parts(blob, exclude_parts)
 
 
 def _merge_series_points_by_substrings(
@@ -7485,12 +7558,9 @@ def _series_analysis_has_spike(
     return False
 
 
-def _analysis_for_error_req_series(
-    payload: Dict[str, Any], include_parts: List[str], *, label: str = ""
+def _analysis_for_error_req_points(
+    pts: List[Tuple[float, float]], *, label: str = ""
 ) -> Dict[str, Any]:
-    pts = _merge_series_points_by_substrings(
-        payload, include_parts, MONITORING_ERROR_REQ_EXCLUDE_PARTS
-    )
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
     a = _withdraw_baseline_drop_spike_analysis(
@@ -7506,25 +7576,45 @@ def _analysis_for_error_req_series(
     return a
 
 
+def _analysis_for_error_req_series(
+    payload: Dict[str, Any], include_parts: List[str], *, label: str = ""
+) -> Dict[str, Any]:
+    pts = _merge_series_points_by_substrings(
+        payload, include_parts, MONITORING_ERROR_REQ_EXCLUDE_PARTS
+    )
+    return _analysis_for_error_req_points(pts, label=label)
+
+
 def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     ``错误请求数/1m``: spike vs **median baseline** per series; alert if **any** series spikes.
-    Excludes legends matching ``MONITORING_ERROR_REQ_EXCLUDE`` (e.g. ReceiveEventLoginReward).
+    Default: all panel series except ``MONITORING_ERROR_REQ_EXCLUDE`` (AND match on pipe-parts).
     """
     entries: List[Dict[str, Any]] = []
     total_pts = 0
     merged_all: List[List[Any]] = []
-    for lbl, parts in _error_req_series_specs():
-        a = _analysis_for_error_req_series(payload, parts, label=lbl)
-        spiked = _series_analysis_has_spike(
-            a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
-        )
-        entries.append({"label": lbl, "spiked": spiked, "analysis": a})
-        total_pts += int(a.get("point_count") or 0)
-        merged_all.extend(a.get("merged_points") or [])
+    if _error_req_all_series_mode():
+        series_rows = _enumerate_error_req_series_from_payload(payload)
+        for lbl, raw_pts in series_rows:
+            a = _analysis_for_error_req_points(raw_pts, label=lbl)
+            spiked = _series_analysis_has_spike(
+                a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
+            )
+            entries.append({"label": lbl, "spiked": spiked, "analysis": a})
+            total_pts += int(a.get("point_count") or 0)
+            merged_all.extend(a.get("merged_points") or [])
+    else:
+        for lbl, parts in _error_req_series_specs():
+            a = _analysis_for_error_req_series(payload, parts, label=lbl)
+            spiked = _series_analysis_has_spike(
+                a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
+            )
+            entries.append({"label": lbl, "spiked": spiked, "analysis": a})
+            total_pts += int(a.get("point_count") or 0)
+            merged_all.extend(a.get("merged_points") or [])
     return {
         "hit_alert": any(bool(e.get("spiked")) for e in entries),
-        "dual_spike_required": True,
+        "dual_spike_required": False,
         "alert_rule": "baseline_median_any_series",
         "series_entries": entries,
         "fast_threshold_pct": MONITORING_ERROR_REQ_ALERT_PCT,
@@ -7571,15 +7661,31 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
     fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_ERROR_REQ_ALERT_PCT)
     cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT)
     win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
+    entries = [
+        e for e in (analysis.get("series_entries") or []) if isinstance(e, dict)
+    ]
     lines: List[str] = [
         "",
         f"[Error req] spike vs median baseline — alert if any series exceeds baseline by "
         f">{fast_thr:g}% (fast {win_sec//60}m) or >{cont_thr:g}% (continuous); "
-        f"excludes {', '.join(MONITORING_ERROR_REQ_EXCLUDE_PARTS) or '—'}",
+        f"excludes {_error_req_exclude_summary()}",
     ]
-    for ent in analysis.get("series_entries") or []:
-        if not isinstance(ent, dict):
-            continue
+    if _error_req_all_series_mode() and entries:
+        spiked_n = sum(1 for e in entries if e.get("spiked"))
+        lines.append(
+            f"  {len(entries)} series monitored ({spiked_n} spiked, "
+            f"{len(entries) - spiked_n} quiet)"
+        )
+    detail_entries = entries
+    if len(entries) > 20:
+        spiked_only = [e for e in entries if e.get("spiked")]
+        detail_entries = spiked_only if spiked_only else entries[:12]
+        if len(detail_entries) < len(entries):
+            lines.append(
+                f"  (detail for {len(detail_entries)} of {len(entries)} series; "
+                "see spiked rows or first 12)"
+            )
+    for ent in detail_entries:
         lbl = str(ent.get("label") or "series")
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         base = sub.get("baseline_median")
@@ -8160,7 +8266,7 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
         elif k == "error_req_1m":
             a2 = _analysis_for_error_req_payload(p2)
             title = GRAFANA_PANEL_TITLE_ERROR_REQ
-            series = _error_req_series_labels_summary()
+            series = _error_req_series_labels_summary(analysis=a2)
             extra_footer = _format_error_req_extra_analysis_lines(a2)
         elif k == "provider_jili":
             a2 = _analysis_for_provider_jili_payload(p2)
@@ -8197,12 +8303,27 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
         lines.append("")
         lines.append(f"[{title}] series: {series}")
         if k == "error_req_1m":
-            for ent in a2.get("series_entries") or []:
-                if not isinstance(ent, dict):
-                    continue
+            err_entries = [
+                e for e in (a2.get("series_entries") or []) if isinstance(e, dict)
+            ]
+            many_err = len(err_entries) > 8
+            if many_err:
+                lines.append(
+                    f"  ({len(err_entries)} series; value tables for spikes only — "
+                    "full names below)"
+                )
+                lines.append("```text")
+                for ent in err_entries:
+                    lbl = str(ent.get("label") or "series")
+                    flag = " *" if ent.get("spiked") else ""
+                    lines.append(f"{lbl}{flag}")
+                lines.append("```")
+            for ent in err_entries:
                 sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
                 lbl = str(ent.get("label") or sub.get("label") or "series")
                 pts_sub = sub.get("merged_points") or []
+                if many_err and not ent.get("spiked"):
+                    continue
                 lines.append(f"  · {lbl}")
                 if pts_sub:
                     tail_sub = pts_sub[-max_rows:]
