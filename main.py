@@ -83,6 +83,10 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ERROR_REQ_MIN_BASELINE_VALUE": "0",
     # Spike peak (errors/min) must reach this absolute level to alert — suppresses 1→2 style noise.
     "MONITORING_ERROR_REQ_MIN_SPIKE_VALUE": "10",
+    # Per-series min spike overrides: ``pattern=25``; ``|`` = all parts must match legend; ``;`` = next rule.
+    "MONITORING_ERROR_REQ_SERIES_MIN_SPIKE": (
+        "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=25"
+    ),
     # Legacy (used only when MONITORING_ERROR_REQ_SERIES is empty):
     "MONITORING_ERROR_REQ_SERIES_A": "RedeemPlayerLuckyCoins",
     "MONITORING_ERROR_REQ_SERIES_A_LABEL": "RedeemPlayerLuckyCoins",
@@ -174,6 +178,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT_BORDER_PX": "4",
     # 1=告警截图用 Grafana d-solo 单面板（视口 PNG，适合 Lark 卡片）；0=告警仍整页+红框
     "GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL": "1",
+    # 1=错误请求数/1m 告警时对每个 spiked series Ctrl/Cmd+click 图例单独截一张（多 series → 多张图）
+    "GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES": "1",
     "GRAFANA_SCREENSHOT_ALERT_SOLO_WIDTH": "1200",
     "GRAFANA_SCREENSHOT_ALERT_SOLO_HEIGHT": "560",
     # 1=压扁显示 No data 且无图表的大面板（仅改 height，不碰 react-grid transform）；0=关
@@ -543,6 +549,34 @@ MONITORING_ERROR_REQ_MIN_SPIKE_VALUE = max(
 )
 
 
+def _error_req_series_min_spike_overrides() -> List[Tuple[List[str], float]]:
+    """``(match_parts, min_peak)`` from ``MONITORING_ERROR_REQ_SERIES_MIN_SPIKE``."""
+    raw = (_cfg_str("MONITORING_ERROR_REQ_SERIES_MIN_SPIKE", "") or "").strip()
+    out: List[Tuple[List[str], float]] = []
+    for entry in raw.split(";"):
+        chunk = entry.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        pat, _, val_s = chunk.rpartition("=")
+        parts = [p.strip() for p in pat.split("|") if p.strip()]
+        if not parts:
+            continue
+        try:
+            val = max(0.0, float(val_s.strip()))
+        except (TypeError, ValueError):
+            continue
+        out.append((parts, val))
+    return out
+
+
+def _error_req_min_spike_for_label(label: str) -> float:
+    lbl = (label or "").strip()
+    for parts, val in _error_req_series_min_spike_overrides():
+        if _series_matches_substring_parts(lbl, parts):
+            return val
+    return float(MONITORING_ERROR_REQ_MIN_SPIKE_VALUE)
+
+
 def _error_req_all_series_mode() -> bool:
     raw = (_cfg_str("MONITORING_ERROR_REQ_SERIES", "") or "").strip().casefold()
     return raw in ("*", "all")
@@ -777,6 +811,10 @@ GRAFANA_SCREENSHOT_ALERT_SOLO_WIDTH = max(
 )
 GRAFANA_SCREENSHOT_ALERT_SOLO_HEIGHT = max(
     240, min(1600, _cfg_int("GRAFANA_SCREENSHOT_ALERT_SOLO_HEIGHT", 560))
+)
+GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES = _lark_env_truthy_or_default(
+    "GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES",
+    default=True,
 )
 GRAFANA_USER = (
     _cfg_str("GRAFANA_USER")
@@ -6184,15 +6222,144 @@ def _grafana_playwright_capture_viewport_png(page: Any) -> bytes:
         return page.screenshot(type="png", full_page=False)
 
 
+def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> bool:
+    """
+    Grafana time-series legend: Ctrl/Cmd+click isolates one series (hide others).
+    Returns True when a matching legend row was clicked.
+    """
+    want = (series_label or "").strip()
+    if not want:
+        return False
+    try:
+        n = page.evaluate(
+            """([wantLabel]) => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const want = norm(wantLabel);
+              const tail = (want.split('/').pop() || '').trim();
+              const match = (text) => {
+                const t = norm(text);
+                if (!t || !want) return false;
+                if (t === want || want.includes(t) || t.includes(want)) return true;
+                if (tail.length > 4 && t.includes(tail)) return true;
+                return false;
+              };
+              const candidates = [];
+              const push = (el, text) => {
+                const tx = String(text || '').trim();
+                if (!el || !tx) return;
+                candidates.push({ el, text: tx });
+              };
+              document.querySelectorAll(
+                '[data-testid="legend-series"] button, [data-testid="legend-series"] [role="button"], ' +
+                'div[class*="legend"] button, table.viz-legend tbody tr, [class*="VizLegend"] button, ' +
+                '[class*="LegendSeriesIcon"]'
+              ).forEach((el) => {
+                push(el, el.getAttribute('title') || el.getAttribute('aria-label') || el.textContent || '');
+              });
+              let target = null;
+              for (const c of candidates) {
+                if (match(c.text)) { target = c.el; break; }
+              }
+              if (!target) return 0;
+              try { target.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (e) {}
+              const rect = target.getBoundingClientRect();
+              const cx = rect.left + Math.max(1, rect.width / 2);
+              const cy = rect.top + Math.max(1, rect.height / 2);
+              const base = {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: cx,
+                clientY: cy,
+                button: 0,
+                ctrlKey: true,
+                metaKey: true,
+              };
+              ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+                try {
+                  target.dispatchEvent(new MouseEvent(type, base));
+                } catch (e) {}
+              });
+              return 1;
+            }""",
+            [want],
+        )
+        if int(n or 0) > 0:
+            page.wait_for_timeout(500)
+            _grafana_wait_loading_like_gone(page, min(3000, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)))
+            logger.info("Grafana screenshot: isolated legend series %r", want[:120])
+            return True
+        logger.warning("Grafana screenshot: legend series not found for isolate %r", want[:120])
+    except Exception as e:
+        logger.warning("Grafana screenshot: legend isolate failed series=%r: %s", want[:80], e)
+    return False
+
+
+def _grafana_build_alert_screenshot_jobs(
+    session: requests.Session,
+    highlight_panel_titles: Optional[List[str]],
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    relative_from: Optional[str] = None,
+    relative_to: Optional[str] = None,
+    timezone_param: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Solo alert capture jobs. Error-req panel with multiple spiked series → one job per series
+    (same ``panelId``, different legend isolation).
+    """
+    solo_caps = _grafana_resolve_alert_solo_captures(
+        session,
+        highlight_panel_titles,
+        relative_from=relative_from,
+        relative_to=relative_to,
+        timezone_param=timezone_param,
+    )
+    if not solo_caps:
+        return []
+    spiked_error_req: List[str] = []
+    if GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES:
+        spiked_error_req = _error_req_spiked_series_labels_from_payload(payload)
+    jobs: List[Dict[str, Any]] = []
+    for url, solo_title, panel_id in solo_caps:
+        if (
+            GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES
+            and solo_title == GRAFANA_PANEL_TITLE_ERROR_REQ
+            and spiked_error_req
+        ):
+            for lbl in spiked_error_req:
+                jobs.append({
+                    "url": url,
+                    "solo_title": solo_title,
+                    "panel_id": panel_id,
+                    "isolate_series": lbl,
+                })
+            logger.info(
+                "Grafana alert screenshot: error_req %s spiked series → %s solo PNG job(s)",
+                len(spiked_error_req),
+                len(spiked_error_req),
+            )
+        else:
+            jobs.append({
+                "url": url,
+                "solo_title": solo_title,
+                "panel_id": panel_id,
+                "isolate_series": None,
+            })
+    return jobs
+
+
 def _grafana_playwright_render_solo_panel_and_png(
     page: Any,
     url: str,
     timeout_ms: int,
     *,
     highlight_panel_title: Optional[str] = None,
+    isolate_series_label: Optional[str] = None,
 ) -> bytes:
     """
     Navigate to ``/d-solo/…?panelId=`` and capture a single focused chart (alert path).
+    When ``isolate_series_label`` is set, Ctrl/Cmd+click that legend row first (one series only).
     """
     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     try:
@@ -6214,6 +6381,9 @@ def _grafana_playwright_render_solo_panel_and_png(
     if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
         page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
     _grafana_close_open_menus(page)
+    if (isolate_series_label or "").strip():
+        _grafana_playwright_isolate_legend_series(page, str(isolate_series_label).strip())
+        page.wait_for_timeout(200)
     if highlight_panel_title and GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT:
         _grafana_playwright_highlight_alert_panels(page, [highlight_panel_title])
         page.wait_for_timeout(120)
@@ -6232,6 +6402,7 @@ def _grafana_playwright_render_page_and_png(
     *,
     highlight_panel_titles: Optional[List[str]] = None,
     solo_primary_title: Optional[str] = None,
+    isolate_series_label: Optional[str] = None,
 ) -> bytes:
     if "/d-solo/" in (url or ""):
         return _grafana_playwright_render_solo_panel_and_png(
@@ -6240,6 +6411,7 @@ def _grafana_playwright_render_page_and_png(
             timeout_ms,
             highlight_panel_title=solo_primary_title
             or ((highlight_panel_titles or [None])[0] if highlight_panel_titles else None),
+            isolate_series_label=isolate_series_label,
         )
     return _grafana_playwright_render_dashboard_and_png(
         page,
@@ -6278,6 +6450,7 @@ class GrafanaPlaywrightKeeper:
         *,
         highlight_panel_titles: Optional[List[str]] = None,
         solo_primary_title: Optional[str] = None,
+        isolate_series_label: Optional[str] = None,
     ) -> bytes:
         warm_wait = max(120.0, float(timeout_ms) / 1000.0 + 45.0)
         if not self._ready.wait(timeout=warm_wait):
@@ -6294,6 +6467,7 @@ class GrafanaPlaywrightKeeper:
                 "timeout_ms": int(timeout_ms),
                 "highlight_panel_titles": list(highlight_panel_titles or []),
                 "solo_primary_title": (solo_primary_title or "").strip() or None,
+                "isolate_series_label": (isolate_series_label or "").strip() or None,
                 "ev": ev,
                 "box": box,
             }
@@ -6429,6 +6603,7 @@ class GrafanaPlaywrightKeeper:
                         max(5000, jto),
                         highlight_panel_titles=job.get("highlight_panel_titles") or None,
                         solo_primary_title=job.get("solo_primary_title"),
+                        isolate_series_label=job.get("isolate_series_label"),
                     )
                 except Exception as ex:
                     box["err"] = ex
@@ -6482,6 +6657,7 @@ def _grafana_headless_screenshot_png_at_url(
     *,
     highlight_panel_titles: Optional[List[str]] = None,
     solo_primary_title: Optional[str] = None,
+    isolate_series_label: Optional[str] = None,
 ) -> bytes:
     """Single Playwright capture for one dashboard or d-solo URL."""
     try:
@@ -6502,6 +6678,7 @@ def _grafana_headless_screenshot_png_at_url(
                 timeout_ms,
                 highlight_panel_titles=highlight_panel_titles,
                 solo_primary_title=solo_primary_title,
+                isolate_series_label=isolate_series_label,
             )
         except Exception as e:
             logger.warning(
@@ -6515,6 +6692,7 @@ def _grafana_headless_screenshot_png_at_url(
         timeout_ms,
         highlight_panel_titles=highlight_panel_titles,
         solo_primary_title=solo_primary_title,
+        isolate_series_label=isolate_series_label,
     )
 
 
@@ -6527,6 +6705,7 @@ def _grafana_headless_screenshot_png_list(
     relative_to: Optional[str] = None,
     timezone_param: Optional[str] = None,
     highlight_panel_titles: Optional[List[str]] = None,
+    alert_payload: Optional[Dict[str, Any]] = None,
 ) -> List[bytes]:
     """
     Headless Chromium (Playwright) — one or more PNG bytes.
@@ -6535,30 +6714,38 @@ def _grafana_headless_screenshot_png_list(
 
     When ``highlight_panel_titles`` is set and ``GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL=1``, captures each
     listed panel via ``/d-solo/{uid}/{slug}?panelId=…`` (viewport per panel; includes ``/mo {panel}``).
+    Error-req with multiple spiked series → one PNG per series (legend isolated).
 
     See :func:`_grafana_headless_screenshot_png` for install notes and tuning knobs.
     """
     rel_eff = GRAFANA_SCREENSHOT_RELATIVE_RANGE or bool(
         (relative_from or "").strip() or (relative_to or "").strip()
     )
-    solo_caps = _grafana_resolve_alert_solo_captures(
+    solo_jobs = _grafana_build_alert_screenshot_jobs(
         session,
         highlight_panel_titles,
+        alert_payload,
         relative_from=relative_from,
         relative_to=relative_to,
         timezone_param=timezone_param,
     )
-    if solo_caps:
+    if solo_jobs:
         pngs: List[bytes] = []
-        for url, solo_title, panel_id in solo_caps:
+        for job in solo_jobs:
+            url = str(job.get("url") or "")
+            solo_title = str(job.get("solo_title") or "")
+            panel_id = int(job.get("panel_id") or 0)
+            isolate_series = (job.get("isolate_series") or "").strip() or None
             highlight_for_render = (
                 [solo_title] if solo_title and GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT else None
             )
             logger.info(
-                "Grafana screenshot: relative_range=%s alert solo panelId=%s title=%r url=%s",
+                "Grafana screenshot: relative_range=%s alert solo panelId=%s title=%r "
+                "isolate_series=%r url=%s",
                 rel_eff,
                 panel_id,
                 solo_title,
+                (isolate_series or "")[:100] or None,
                 url[:300] + ("…" if len(url) > 300 else ""),
             )
             pngs.append(
@@ -6567,6 +6754,7 @@ def _grafana_headless_screenshot_png_list(
                     url,
                     highlight_panel_titles=highlight_for_render,
                     solo_primary_title=solo_title,
+                    isolate_series_label=isolate_series,
                 )
             )
         return pngs
@@ -6628,6 +6816,7 @@ def _grafana_ephemeral_playwright_screenshot_png(
     *,
     highlight_panel_titles: Optional[List[str]] = None,
     solo_primary_title: Optional[str] = None,
+    isolate_series_label: Optional[str] = None,
 ) -> bytes:
     """One-shot Chromium launch (no keeper reuse). Used as fallback when keeper fails or returns blank."""
     from playwright.sync_api import sync_playwright
@@ -6676,6 +6865,7 @@ def _grafana_ephemeral_playwright_screenshot_png(
                 timeout_ms,
                 highlight_panel_titles=highlight_panel_titles,
                 solo_primary_title=solo_primary_title,
+                isolate_series_label=isolate_series_label,
             )
         finally:
             browser.close()
@@ -6703,6 +6893,7 @@ def _grafana_watchdog_alert_screenshot_png_list(
         relative_to=rt,
         timezone_param=tz or None,
         highlight_panel_titles=highlight or None,
+        alert_payload=payload,
     )
 
 
@@ -7610,8 +7801,8 @@ def _error_req_spike_peak_value(spike: Optional[Dict[str, Any]]) -> float:
 def _error_req_analysis_has_spike(
     analysis: Dict[str, Any], fast_threshold_pct: float, continuous_threshold_pct: float
 ) -> bool:
-    """Like :func:`_series_analysis_has_spike` but requires peak ``>= MONITORING_ERROR_REQ_MIN_SPIKE_VALUE``."""
-    min_peak = float(MONITORING_ERROR_REQ_MIN_SPIKE_VALUE)
+    """Like :func:`_series_analysis_has_spike` but requires peak ``>=`` per-series min (default global)."""
+    min_peak = _error_req_min_spike_for_label(str(analysis.get("label") or ""))
     ws = analysis.get("window_max_spike")
     if (
         isinstance(ws, dict)
@@ -7671,7 +7862,12 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             spiked = _error_req_analysis_has_spike(
                 a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
             )
-            entries.append({"label": lbl, "spiked": spiked, "analysis": a})
+            entries.append({
+                "label": lbl,
+                "spiked": spiked,
+                "min_spike": _error_req_min_spike_for_label(lbl),
+                "analysis": a,
+            })
             total_pts += int(a.get("point_count") or 0)
             merged_all.extend(a.get("merged_points") or [])
     else:
@@ -7680,7 +7876,12 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             spiked = _error_req_analysis_has_spike(
                 a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
             )
-            entries.append({"label": lbl, "spiked": spiked, "analysis": a})
+            entries.append({
+                "label": lbl,
+                "spiked": spiked,
+                "min_spike": _error_req_min_spike_for_label(lbl),
+                "analysis": a,
+            })
             total_pts += int(a.get("point_count") or 0)
             merged_all.extend(a.get("merged_points") or [])
     return {
@@ -7696,6 +7897,28 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _error_req_spiked_series_labels_from_payload(
+    payload: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Spiked series display labels for per-series alert screenshots."""
+    if not isinstance(payload, dict):
+        return []
+    for ex in payload.get("extraPanels") or []:
+        if not isinstance(ex, dict) or (ex.get("kind") or "").strip() != "error_req_1m":
+            continue
+        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+        a = _analysis_for_error_req_payload(p2)
+        out: List[str] = []
+        for ent in a.get("series_entries") or []:
+            if not isinstance(ent, dict) or not ent.get("spiked"):
+                continue
+            lbl = str(ent.get("label") or "").strip()
+            if lbl:
+                out.append(lbl)
+        return out
+    return []
+
+
 def _format_error_req_trigger_lines(
     analysis: Dict[str, Any],
     fast_threshold_pct: float,
@@ -7707,7 +7930,7 @@ def _format_error_req_trigger_lines(
     blocks: List[str] = [
         f"[{GRAFANA_PANEL_TITLE_ERROR_REQ}] SPIKE — value exceeded median baseline "
         f"by >{fast_threshold_pct:g}% (fast) or >{continuous_threshold_pct:g}% (continuous) "
-        f"and peak >={MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min"
+        f"and peak >= per-series min (default {MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min)"
     ]
     for ent in analysis.get("series_entries") or []:
         if not isinstance(ent, dict) or not ent.get("spiked"):
@@ -7740,7 +7963,7 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
         "",
         f"[Error req] spike vs median baseline — alert if any series exceeds baseline by "
         f">{fast_thr:g}% (fast {win_sec//60}m) or >{cont_thr:g}% (continuous) "
-        f"and peak >={MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min; "
+        f"and peak >= per-series min (default {MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min); "
         f"excludes {_error_req_exclude_summary()}",
     ]
     if _error_req_all_series_mode() and entries:
@@ -7754,10 +7977,16 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         base = sub.get("baseline_median")
         spiked = bool(ent.get("spiked"))
+        min_spike = float(ent.get("min_spike") or _error_req_min_spike_for_label(lbl))
         pct_spike = _series_analysis_has_spike(sub, fast_thr, cont_thr)
+        meta: List[str] = []
+        if base is not None:
+            meta.append(f"median baseline {_fmt_num(base)}")
+        if min_spike != MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:
+            meta.append(f"min peak {min_spike:g}")
         lines.append(
             f"  {lbl}: spike={'yes' if spiked else 'no'}"
-            + (f" (median baseline {_fmt_num(base)})" if base is not None else "")
+            + (f" ({', '.join(meta)})" if meta else "")
         )
         ws = sub.get("window_max_spike")
         cs = sub.get("consecutive_max_spike")
@@ -7769,7 +7998,7 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
             peak = max(_error_req_spike_peak_value(ws), _error_req_spike_peak_value(cs))
             lines.append(
                 f"    (suppressed: peak {_fmt_num(peak)} < min "
-                f"{_fmt_num(MONITORING_ERROR_REQ_MIN_SPIKE_VALUE)} errors/min)"
+                f"{_fmt_num(min_spike)} errors/min)"
             )
     return lines
 
@@ -8529,6 +8758,7 @@ def _monitoring_send_screenshot_on_card_click(chat_id: str, open_id: str) -> Non
                 relative_to=rt,
                 timezone_param=tz or None,
                 highlight_panel_titles=highlight or None,
+                alert_payload=payload,
             )
         else:
             pngs = [_grafana_headless_screenshot_png(sess, su, eu)]
@@ -9048,6 +9278,7 @@ def _monitoring_background_worker(
                                 su,
                                 eu,
                                 highlight_panel_titles=highlight or None,
+                                alert_payload=payload if alert_hit else None,
                             )
                             recv_type = "chat_id" if chat_id else "open_id"
                             recv_id = (chat_id or open_id or "").strip()
