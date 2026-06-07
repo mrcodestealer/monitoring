@@ -8239,10 +8239,6 @@ def _error_req_spiked_series_labels_from_payload(
     return []
 
 
-def _bold_fmt_num(v: Any) -> str:
-    return f"**{_fmt_num(v)}**"
-
-
 def _pick_alert_spike_drop_event(
     analysis: Dict[str, Any],
     fast_threshold_pct: float,
@@ -8282,8 +8278,8 @@ def _format_spike_drop_alert_block(
     emoji = "📈" if direction == "SPIKE" else "📉"
     verb = "increased" if direction == "SPIKE" else "decreased"
     return (
-        f"{emoji} **{graph_label}** — **{series_label}** **{direction}**\n"
-        f"- {_bold_fmt_num(from_val)} {verb} to {_bold_fmt_num(to_val)}"
+        f"{emoji} {graph_label} — {series_label} {direction}\n"
+        f"{_fmt_num(from_val)} {verb} to {_fmt_num(to_val)}"
     )
 
 
@@ -8644,7 +8640,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(a_http.get("hit_alert"))):
             reasons = [_format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "HTTP", a_http)]
         if reasons:
-            reason_blocks.append("\n\n".join(reasons))
+            reason_blocks.extend(reasons)
     if show_extra:
         for ex in payload.get("extraPanels") or []:
             if not isinstance(ex, dict):
@@ -8755,11 +8751,11 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or bool(a2.get("hit_alert"))):
                     reasons2 = [_format_simple_series_alert_block(g_lbl, s_lbl, a2)]
             if reasons2:
-                reason_blocks.append("\n\n".join(reasons2))
+                reason_blocks.extend(reasons2)
     if not reason_blocks:
         lines.append("Alert fired but no panel matched text details (no analyzable points).")
     else:
-        lines.append("\n────────\n".join(reason_blocks))
+        lines.append("\n\n".join(reason_blocks))
     _append_monitoring_alert_target_user_mention(lines)
     return "\n".join(lines)
 
