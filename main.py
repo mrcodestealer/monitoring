@@ -87,7 +87,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ERROR_REQ_SERIES_MIN_SPIKE": (
         "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=25;"
         "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=20;"
-        "igo-sw-cluster-route|POST /=15"
+        "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=15;"
+        "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=15"
     ),
     # Legacy (used only when MONITORING_ERROR_REQ_SERIES is empty):
     "MONITORING_ERROR_REQ_SERIES_A": "RedeemPlayerLuckyCoins",
@@ -6224,19 +6225,41 @@ def _grafana_playwright_capture_viewport_png(page: Any) -> bytes:
         return page.screenshot(type="png", full_page=False)
 
 
+def _grafana_legend_service_rpc_parts(label: str) -> Tuple[str, str]:
+    """Split ``service - rpc`` legend; returns casefolded ``(service, rpc)``."""
+    raw = (label or "").replace("\n", " ").strip()
+    if " - " in raw:
+        svc, rpc = raw.split(" - ", 1)
+        return svc.strip().casefold(), rpc.strip().casefold()
+    return raw.casefold(), ""
+
+
 def _grafana_legend_text_matches_series(want_label: str, legend_text: str) -> bool:
-    want = (want_label or "").replace("\n", " ").strip().casefold()
-    text = (legend_text or "").replace("\n", " ").strip().casefold()
-    if not want or not text:
+    """Strict match so e.g. jili vs general ``cluster-route - POST /`` do not cross-match."""
+    want_svc, want_rpc = _grafana_legend_service_rpc_parts(want_label)
+    text_svc, text_rpc = _grafana_legend_service_rpc_parts(legend_text)
+    if not want_svc or not text_svc:
         return False
-    if text == want or want in text or text in want:
+    if want_svc == text_svc and want_rpc == text_rpc:
         return True
-    tail = want.split("/")[-1].strip()
-    if len(tail) > 4 and tail in text:
+    if want_rpc and text_rpc and want_rpc != text_rpc:
+        return False
+    if want_svc == text_svc:
         return True
-    if "hypergrid" in want and "hypergrid" in text and "post /refund" in text:
-        return True
+    if len(text_svc) >= 16 and (want_svc.startswith(text_svc) or text_svc.startswith(want_svc)):
+        return want_rpc == text_rpc
     return False
+
+
+def _grafana_legend_match_score(want_label: str, legend_text: str) -> int:
+    """Higher = better; 0 = no match."""
+    if not _grafana_legend_text_matches_series(want_label, legend_text):
+        return 0
+    want_svc, want_rpc = _grafana_legend_service_rpc_parts(want_label)
+    text_svc, text_rpc = _grafana_legend_service_rpc_parts(legend_text)
+    if want_svc == text_svc and want_rpc == text_rpc:
+        return 1000 + len(text_svc)
+    return 100 + len(text_svc)
 
 
 def _grafana_playwright_collect_legend_click_targets(page: Any) -> List[Dict[str, Any]]:
@@ -6305,22 +6328,31 @@ def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> b
         if not items:
             logger.warning("Grafana screenshot: no legend rows found for isolate %r", want[:100])
             return False
-        target: Optional[Dict[str, Any]] = None
-        others: List[Dict[str, Any]] = []
+        scored: List[Tuple[int, Dict[str, Any]]] = []
         for it in items:
             txt = str(it.get("text") or "")
-            if _grafana_legend_text_matches_series(want, txt):
-                if target is None:
-                    target = it
-            else:
-                others.append(it)
-        if target is None:
+            sc = _grafana_legend_match_score(want, txt)
+            if sc > 0:
+                scored.append((sc, it))
+        if not scored:
             logger.warning(
                 "Grafana screenshot: target legend not found want=%r legends=%s",
                 want[:100],
                 [str(x.get("text") or "")[:60] for x in items[:12]],
             )
             return False
+        scored.sort(key=lambda x: x[0], reverse=True)
+        target = scored[0][1]
+        target_txt = str(target.get("text") or "")
+        others = [
+            it for it in items
+            if str(it.get("text") or "").strip().casefold() != target_txt.strip().casefold()
+        ]
+        logger.info(
+            "Grafana screenshot: legend isolate target=%r (score=%s)",
+            target_txt[:120],
+            scored[0][0],
+        )
         hidden = 0
         for it in others:
             try:
