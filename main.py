@@ -8015,36 +8015,84 @@ def _error_req_spiked_series_labels_from_payload(
     return []
 
 
+def _bold_fmt_num(v: Any) -> str:
+    return f"**{_fmt_num(v)}**"
+
+
+def _pick_alert_spike_drop_event(
+    analysis: Dict[str, Any],
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    *,
+    spike_only: bool = False,
+) -> Optional[Tuple[str, Any, Any]]:
+    """Strongest qualifying spike/drop: (direction, from_val, to_val)."""
+    wd = analysis.get("window_max_drop")
+    ws = analysis.get("window_max_spike")
+    cd = analysis.get("consecutive_max_drop")
+    cs = analysis.get("consecutive_max_spike")
+    candidates: List[Tuple[str, Dict[str, Any]]] = []
+    if not spike_only and isinstance(wd, dict) and float(wd.get("pct") or 0.0) >= float(fast_threshold_pct):
+        candidates.append(("DROP", wd))
+    if isinstance(ws, dict) and float(ws.get("pct") or 0.0) >= float(fast_threshold_pct):
+        candidates.append(("SPIKE", ws))
+    if not spike_only and isinstance(cd, dict) and float(cd.get("pct") or 0.0) >= float(continuous_threshold_pct):
+        candidates.append(("DROP", cd))
+    if isinstance(cs, dict) and float(cs.get("pct") or 0.0) >= float(continuous_threshold_pct):
+        candidates.append(("SPIKE", cs))
+    if not candidates:
+        return None
+    direction, ev = max(candidates, key=lambda t: float(t[1].get("pct") or 0.0))
+    base = ev.get("baseline_median")
+    from_val = base if base is not None else ev.get("from_val")
+    return direction, from_val, ev.get("to_val")
+
+
+def _format_spike_drop_alert_block(
+    graph_label: str,
+    series_label: str,
+    direction: str,
+    from_val: Any,
+    to_val: Any,
+) -> str:
+    emoji = "📈" if direction == "SPIKE" else "📉"
+    verb = "increased" if direction == "SPIKE" else "decreased"
+    return (
+        f"{emoji} **{graph_label}** — **{series_label}** **{direction}**\n"
+        f"- {_bold_fmt_num(from_val)} {verb} to {_bold_fmt_num(to_val)}"
+    )
+
+
 def _format_error_req_trigger_lines(
     analysis: Dict[str, Any],
     fast_threshold_pct: float,
     continuous_threshold_pct: float,
     window_seconds: int,
 ) -> List[str]:
+    del window_seconds  # per-series blocks only; window already reflected in analysis
     if not bool(analysis.get("hit_alert")):
         return []
-    blocks: List[str] = [
-        f"[{GRAFANA_PANEL_TITLE_ERROR_REQ}] SPIKE — value exceeded median baseline "
-        f"by >{fast_threshold_pct:g}% (fast) or >{continuous_threshold_pct:g}% (continuous) "
-        f"and peak >= per-series min (default {MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min)"
+    spiked = [
+        e for e in (analysis.get("series_entries") or [])
+        if isinstance(e, dict) and e.get("spiked")
     ]
-    for ent in analysis.get("series_entries") or []:
-        if not isinstance(ent, dict) or not ent.get("spiked"):
-            continue
+    if not spiked:
+        return []
+    blocks: List[str] = []
+    for ent in spiked:
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         lbl = str(ent.get("label") or sub.get("label") or "series")
-        blocks.extend(
-            _format_trigger_lines(
-                GRAFANA_PANEL_TITLE_ERROR_REQ,
-                lbl,
-                sub,
-                fast_threshold_pct,
-                continuous_threshold_pct,
-                window_seconds,
-                spike_only=True,
-            )
+        picked = _pick_alert_spike_drop_event(
+            sub, fast_threshold_pct, continuous_threshold_pct, spike_only=True
         )
-    return ["\n".join(blocks)] if len(blocks) > 1 else []
+        if picked:
+            direction, from_val, to_val = picked
+            blocks.append(
+                _format_spike_drop_alert_block(
+                    GRAFANA_PANEL_TITLE_ERROR_REQ, lbl, direction, from_val, to_val
+                )
+            )
+    return blocks
 
 
 def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
@@ -8243,51 +8291,16 @@ def _format_trigger_lines(
     *,
     spike_only: bool = False,
 ) -> List[str]:
-    out: List[str] = []
-    wd = analysis.get("window_max_drop")
-    ws = analysis.get("window_max_spike")
-    cd = analysis.get("consecutive_max_drop")
-    cs = analysis.get("consecutive_max_spike")
-    win_m = max(1, int(round(float(window_seconds) / 60.0)))
-
-    def _pct_text(v: Any) -> str:
-        try:
-            f = float(v)
-            if abs(f - round(f)) < 1e-6:
-                return f"{int(round(f)):,}"
-            return f"{f:,.2f}"
-        except (TypeError, ValueError):
-            return str(v)
-
-    def _event_text(ev: Dict[str, Any], direction: str, threshold_pct: float) -> str:
-        sign = "+" if direction == "SPIKE" else "-"
-        pct = _pct_text(ev.get("pct"))
-        return (
-            f"{direction} {sign}{pct}% (>{threshold_pct:g}%) "
-            f"{_fmt_num(ev.get('from_val'))} ({_fmt_ts_short(ev.get('from_ts'))}) -> "
-            f"{_fmt_num(ev.get('to_val'))} ({_fmt_ts_short(ev.get('to_ts'))})"
-        )
-
-    fast_hits: List[str] = []
-    if not spike_only and isinstance(wd, dict) and float(wd.get("pct") or 0.0) >= float(fast_threshold_pct):
-        fast_hits.append(_event_text(wd, "DROP", fast_threshold_pct))
-    if isinstance(ws, dict) and float(ws.get("pct") or 0.0) >= float(fast_threshold_pct):
-        fast_hits.append(_event_text(ws, "SPIKE", fast_threshold_pct))
-
-    cont_hits: List[str] = []
-    if not spike_only and isinstance(cd, dict) and float(cd.get("pct") or 0.0) >= float(continuous_threshold_pct):
-        cont_hits.append(_event_text(cd, "DROP", continuous_threshold_pct))
-    if isinstance(cs, dict) and float(cs.get("pct") or 0.0) >= float(continuous_threshold_pct):
-        cont_hits.append(_event_text(cs, "SPIKE", continuous_threshold_pct))
-
-    if fast_hits or cont_hits:
-        block: List[str] = [f"[{graph_label}] {series_label}"]
-        if fast_hits:
-            block.append(f"Fast ({win_m}m): {' | '.join(fast_hits)}")
-        if cont_hits:
-            block.append(f"Continuous: {' | '.join(cont_hits)}")
-        out.append("\n".join(block))
-    return out
+    del window_seconds
+    picked = _pick_alert_spike_drop_event(
+        analysis, fast_threshold_pct, continuous_threshold_pct, spike_only=spike_only
+    )
+    if not picked:
+        return []
+    direction, from_val, to_val = picked
+    return [
+        _format_spike_drop_alert_block(graph_label, series_label, direction, from_val, to_val)
+    ]
 
 
 def _format_alert_series_table_footer(
@@ -8377,7 +8390,6 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     _mute_purge_expired()
     lines: List[str] = [
         "[ALERT] Monitoring thresholds exceeded",
-        "Fast = sharpest move within ~2 minutes; Continuous = longest steady climb or drop.",
         "",
     ]
     reason_blocks: List[str] = []
@@ -8407,8 +8419,6 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 reasons.append(fb)
         if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(a_http.get("hit_alert"))):
             reasons = [_format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "HTTP", a_http)]
-        elif reasons and not MONITORING_SIMPLE_ALERT_TEXT:
-            reasons.append(_format_alert_series_table_footer(GRAFANA_PANEL_TITLE, "HTTP", a_http))
         if reasons:
             reason_blocks.append("\n\n".join(reasons))
     if show_extra:
@@ -8520,8 +8530,6 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                         reasons2.append(fb2)
                 if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or bool(a2.get("hit_alert"))):
                     reasons2 = [_format_simple_series_alert_block(g_lbl, s_lbl, a2)]
-                elif reasons2 and not MONITORING_SIMPLE_ALERT_TEXT:
-                    reasons2.append(_format_alert_series_table_footer(g_lbl, s_lbl, a2))
             if reasons2:
                 reason_blocks.append("\n\n".join(reasons2))
     if not reason_blocks:
