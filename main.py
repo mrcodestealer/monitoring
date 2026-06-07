@@ -551,6 +551,12 @@ def _series_matches_error_req_exclude(blob: str) -> bool:
     return _series_matches_substring_parts(blob, parts)
 
 
+def _error_req_skip_series_label(label: str) -> bool:
+    """Grafana sometimes returns a bare ``-`` placeholder row — not a real endpoint."""
+    s = (label or "").strip()
+    return not s or s in ("-", "—")
+
+
 def _error_req_exclude_summary() -> str:
     parts = MONITORING_ERROR_REQ_EXCLUDE_PARTS
     if not parts:
@@ -604,10 +610,12 @@ def _enumerate_error_req_series_from_payload(
             blob = _series_label_blob(lg, md)
             if _series_matches_error_req_exclude(blob):
                 continue
+            label = blob.strip() or "series"
+            if _error_req_skip_series_label(label):
+                continue
             pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
             if not pts:
                 continue
-            label = blob.strip() or "series"
             acc = by_label.setdefault(label, {})
             for ts, val in pts:
                 acc[ts] = acc.get(ts, 0.0) + val
