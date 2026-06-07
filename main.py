@@ -86,7 +86,7 @@ _CFG: Dict[str, Any] = {
     # Per-series min spike overrides: ``pattern=25``; ``|`` = all parts must match legend; ``;`` = next rule.
     "MONITORING_ERROR_REQ_SERIES_MIN_SPIKE": (
         "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=25;"
-        "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=15"
+        "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=20"
     ),
     # Legacy (used only when MONITORING_ERROR_REQ_SERIES is empty):
     "MONITORING_ERROR_REQ_SERIES_A": "RedeemPlayerLuckyCoins",
