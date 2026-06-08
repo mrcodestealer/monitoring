@@ -320,7 +320,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_QUIET_START_MINUTE": "59",
     "MONITORING_WATCH_QUIET_END_HOUR": "0",
     "MONITORING_WATCH_QUIET_END_MINUTE": "10",
-    # Tag person
+    # Tag person（0=临时关闭告警与 /mo 文末 @；恢复时改回 1）
+    "MONITORING_ALERT_AT_USER_ENABLE": "0",
     "TARGET_USER_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
     # 告警 / 超阈值 /mo 文末仅 @ 此人时追加的说明（空=只 @ 不追加句子）
     "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
@@ -840,6 +841,10 @@ MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/mo")
 MONITORING_MUTE_TRIGGER = _cfg_str("MONITORING_MUTE_TRIGGER", "/m").strip()
 MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").strip()
 TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
+MONITORING_ALERT_AT_USER_ENABLE = _lark_env_truthy_or_default(
+    "MONITORING_ALERT_AT_USER_ENABLE",
+    default=True,
+)
 MONITORING_ALERT_AT_USER_NOTE = _cfg_str(
     "MONITORING_ALERT_AT_USER_NOTE",
     "It might be event started or false alert kindly check",
@@ -8706,7 +8711,7 @@ def _format_trigger_fallback_line(
 
 def _append_monitoring_alert_target_user_mention(lines: List[str]) -> None:
     """Alert / threshold hits: mention only ``TARGET_USER_OPEN_ID`` with optional disclaimer line."""
-    if not TARGET_USER_OPEN_ID:
+    if not MONITORING_ALERT_AT_USER_ENABLE or not TARGET_USER_OPEN_ID:
         return
     lines.append("")
     if MONITORING_ALERT_AT_USER_NOTE:
