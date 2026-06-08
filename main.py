@@ -284,6 +284,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_GAMES_GENERAL_ALERT_PCT": 15,
     "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT": 15,
     "MONITORING_GAMES_INHOUSE_ENABLE": "1",
+    # Games panels: spike/drop vs **median baseline** in eval window (not bucket-to-bucket %).
     "MONITORING_GAMES_INHOUSE_ALERT_PCT": 15,
     "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT": 15,
     "MONITORING_ALERT_WINDOW_SECONDS": 120,
@@ -8559,8 +8560,61 @@ def _analysis_for_provider_inhouse_payload(payload: Dict[str, Any]) -> Dict[str,
     )
 
 
+def _analysis_for_keyword_baseline_payload(
+    payload: Dict[str, Any],
+    keyword: str,
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    *,
+    min_baseline_value: float = 0.0,
+) -> Dict[str, Any]:
+    """Like :func:`_analysis_for_keyword_payload` but spike/drop vs window **median baseline**."""
+    pts = _merge_series_points_by_keyword(payload, keyword)
+    pts_filtered = _filter_low_outlier_points(pts, ratio_to_median=0.28)
+    if len(pts_filtered) != len(pts):
+        logger.info(
+            "keyword baseline filter applied keyword=%r points=%s->%s",
+            keyword,
+            len(pts),
+            len(pts_filtered),
+        )
+    pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="max")
+    pts_filtered = _trim_trailing_minute_buckets(pts_filtered, _analysis_drop_n())
+    a = _withdraw_baseline_drop_spike_analysis(
+        pts_filtered,
+        fast_threshold_pct,
+        continuous_threshold_pct,
+        MONITORING_ALERT_WINDOW_SECONDS,
+        min_baseline_value=min_baseline_value,
+    )
+    a["point_count"] = len(pts_filtered)
+    a["merged_points"] = [[t, v] for t, v in pts_filtered]
+    if not pts:
+        sample_labels: List[str] = []
+        for s in payload.get("series") or []:
+            prom = s.get("prometheus") if isinstance(s.get("prometheus"), dict) else {}
+            pdata = prom.get("data") if isinstance(prom.get("data"), dict) else {}
+            for r in pdata.get("result") or []:
+                metric = r.get("metric") if isinstance(r.get("metric"), dict) else {}
+                lbl = str(metric.get("series") or metric.get("name") or "").strip()
+                if not lbl:
+                    lbl = " ".join(str(v) for v in metric.values() if str(v).strip()).strip()
+                if lbl and lbl not in sample_labels:
+                    sample_labels.append(lbl)
+                if len(sample_labels) >= 20:
+                    break
+            if len(sample_labels) >= 20:
+                break
+        logger.info(
+            "keyword no match keyword=%r sample_series=%s",
+            keyword,
+            sample_labels[:20],
+        )
+    return a
+
+
 def _analysis_for_games_jili_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _analysis_for_keyword_payload(
+    return _analysis_for_keyword_baseline_payload(
         payload,
         MONITORING_GAMES_JILI_SERIES_KEYWORD,
         MONITORING_GAMES_JILI_ALERT_PCT,
@@ -8569,7 +8623,7 @@ def _analysis_for_games_jili_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _analysis_for_games_general_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _analysis_for_keyword_payload(
+    return _analysis_for_keyword_baseline_payload(
         payload,
         MONITORING_GAMES_GENERAL_SERIES_KEYWORD,
         MONITORING_GAMES_GENERAL_ALERT_PCT,
@@ -8578,7 +8632,7 @@ def _analysis_for_games_general_payload(payload: Dict[str, Any]) -> Dict[str, An
 
 
 def _analysis_for_games_inhouse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _analysis_for_keyword_payload(
+    return _analysis_for_keyword_baseline_payload(
         payload,
         MONITORING_GAMES_INHOUSE_SERIES_KEYWORD,
         MONITORING_GAMES_INHOUSE_ALERT_PCT,
