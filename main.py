@@ -88,7 +88,8 @@ _CFG: Dict[str, Any] = {
         "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=25;"
         "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=20;"
         "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=15;"
-        "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=15"
+        "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=15;"
+        "igo-prod-ali-igo-sw-internal|POST /fpms/request=20"
     ),
     # Legacy (used only when MONITORING_ERROR_REQ_SERIES is empty):
     "MONITORING_ERROR_REQ_SERIES_A": "RedeemPlayerLuckyCoins",
