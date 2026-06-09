@@ -86,6 +86,8 @@ _CFG: Dict[str, Any] = {
     # Per-series min spike overrides: ``pattern=25``; ``|`` = all parts must match legend; ``;`` = next rule.
     "MONITORING_ERROR_REQ_SERIES_MIN_SPIKE": (
         "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=25;"
+        "fpms-nt-ali-prod-promotion-rollout|GetRemainingChances=25;"
+        "fpms-nt-ali-prod-promotion-rollout|ClaimPlayerPalayokBlast=25;"
         "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=20;"
         "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=15;"
         "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=15;"
