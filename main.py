@@ -89,7 +89,7 @@ _CFG: Dict[str, Any] = {
         "fpms-nt-ali-prod-promotion-rollout|GetRemainingChances=25;"
         "fpms-nt-ali-prod-promotion-rollout|ClaimPlayerPalayokBlast=25;"
         "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=20;"
-        "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=15;"
+        "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=25;"
         "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=15;"
         "igo-prod-ali-igo-sw-internal|POST /fpms/request=20"
     ),
@@ -6263,7 +6263,14 @@ def _grafana_legend_text_matches_series(want_label: str, legend_text: str) -> bo
         return False
     want_dash = want_norm.replace("\u2014", "-").replace("\u2013", "-")
     if " - " not in want_dash:
-        return want_norm.casefold() == text_norm.casefold()
+        want_cf = want_norm.casefold()
+        text_cf = text_norm.casefold()
+        if want_cf == text_cf:
+            return True
+        # ``9280 + Push`` must not match ``9280 + Push - 7Days`` / ``- 24Hours``.
+        if text_cf.startswith(want_cf):
+            return False
+        return False
     want_svc, want_rpc = _grafana_legend_service_rpc_parts(want_norm)
     text_svc, text_rpc = _grafana_legend_service_rpc_parts(text_norm)
     if not want_svc or not text_svc:
@@ -6290,11 +6297,31 @@ def _grafana_legend_match_score(want_label: str, legend_text: str) -> int:
     """Higher = better; 0 = no match."""
     if not _grafana_legend_text_matches_series(want_label, legend_text):
         return 0
+    want_norm = (want_label or "").replace("\n", " ").strip()
+    text_norm = (legend_text or "").replace("\n", " ").strip()
+    if want_norm.casefold() == text_norm.casefold():
+        return 10000 + len(text_norm)
     want_svc, want_rpc = _grafana_legend_service_rpc_parts(want_label)
     text_svc, text_rpc = _grafana_legend_service_rpc_parts(legend_text)
     if want_svc == text_svc and want_rpc == text_rpc:
         return 1000 + len(text_svc)
     return 100 + len(text_svc)
+
+
+def _grafana_playwright_isolate_legend_by_testid(page: Any, series_label: str) -> bool:
+    """Double-click ``[data-testid="VizLegend series {label}"]`` when Grafana uses exact test ids."""
+    want = (series_label or "").strip()
+    if not want:
+        return False
+    try:
+        loc = page.locator(f'[data-testid="VizLegend series {want}"]')
+        if loc.count() < 1:
+            return False
+        loc.first.scroll_into_view_if_needed(timeout=8000)
+        loc.first.dblclick(timeout=8000)
+        return True
+    except Exception:
+        return False
 
 
 def _grafana_playwright_collect_legend_click_targets(page: Any) -> List[Dict[str, Any]]:
@@ -6497,6 +6524,12 @@ def _grafana_playwright_legend_isolate_verified(page: Any, want_label: str) -> b
                 const wn = norm(wantLabel);
                 const tn = norm(legendText);
                 if (!wn || !tn) return false;
+                const wantDash = wn.replace(/[\\u2013\\u2014]/g, '-');
+                if (!wantDash.includes(' - ')) {
+                  if (wn.toLowerCase() === tn.toLowerCase()) return true;
+                  if (tn.toLowerCase().startsWith(wn.toLowerCase())) return false;
+                  return false;
+                }
                 const w = parts(wn);
                 const t = parts(tn);
                 if (!w.svc || !t.svc) return false;
@@ -6560,6 +6593,15 @@ def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> b
         _grafana_wait_loading_like_gone(page, min(3000, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)))
 
     try:
+        if _grafana_playwright_isolate_legend_by_testid(page, want):
+            _after_isolate_wait()
+            if _grafana_playwright_legend_isolate_verified(page, want):
+                logger.info(
+                    "Grafana screenshot: legend testid dblclick isolate want=%r",
+                    want[:100],
+                )
+                return True
+
         rows = _grafana_playwright_legend_rows_all(page)
         if not rows:
             logger.warning("Grafana screenshot: no legend rows for isolate %r", want[:100])
@@ -7475,6 +7517,9 @@ def _keyword_matches_series_labels(keyword: str, legend_format: str, metric: Dic
     if kw_raw.isdigit():
         boundary = re.compile(r"(^|[^0-9])" + re.escape(kw_raw) + r"([^0-9]|$)")
         return bool(boundary.search(lg_cf) or boundary.search(mb_cf))
+    # ``9280 + Push`` must not fuzzy-match ``9280 + Push - 7Days``.
+    if lg_cf.startswith(kw_cf + " - ") or mb_cf.startswith(kw_cf + " - "):
+        return False
     return kw_cf in lg_cf or kw_cf in mb_cf
 
 
