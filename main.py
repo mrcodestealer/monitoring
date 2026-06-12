@@ -72,6 +72,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DEPOSIT_SERIES_KEYWORD": "createProposal",
     "GRAFANA_PANEL_TITLE_WITHDRAW": "提款 (Withdrawal)",
     "MONITORING_WITHDRAW_SERIES_KEYWORD": "InitiateWithdrawal",
+    "GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN": "FPMS-NT 登入人数 (Login)",
+    "MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD": "Authenticate",
     "GRAFANA_PANEL_TITLE_ERROR_REQ": "错误请求数/1m",
     # ``*`` or ``all`` = every series on the panel except ``MONITORING_ERROR_REQ_EXCLUDE``.
     # Whitelist mode: semicolon ``;`` = separate series; pipe ``|`` = ALL substrings must match.
@@ -88,6 +90,7 @@ _CFG: Dict[str, Any] = {
         "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=25;"
         "fpms-nt-ali-prod-promotion-rollout|GetRemainingChances=25;"
         "fpms-nt-ali-prod-promotion-rollout|ClaimPlayerPalayokBlast=25;"
+        "fpms-nt-ali-prod-promotion-rollout|CheckAndCreateMission=25;"
         "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=20;"
         "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=25;"
         "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=15;"
@@ -267,6 +270,10 @@ _CFG: Dict[str, Any] = {
     # Withdraw only: spike/drop vs **median baseline** of eval window (not bucket-to-bucket %).
     # 例 median=200、80% → spike 需 >360；median=30 时 40 仅 +33% vs baseline，20→40 不告警。
     "MONITORING_WITHDRAW_MIN_BASELINE_VALUE": "0",
+    "MONITORING_FPMS_NT_LOGIN_ENABLE": "1",
+    # Authenticate logins: SPIKE only when value is +100% vs eval-window median baseline.
+    "MONITORING_FPMS_NT_LOGIN_ALERT_PCT": 100,
+    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT": 100,
     "MONITORING_ERROR_REQ_ENABLE": "1",
     "MONITORING_ERROR_REQ_ALERT_PCT": 50,
     "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 80,
@@ -535,6 +542,12 @@ GRAFANA_PANEL_TITLE_DEPOSIT = _cfg_str("GRAFANA_PANEL_TITLE_DEPOSIT", "主站充
 MONITORING_DEPOSIT_SERIES_KEYWORD = _cfg_str("MONITORING_DEPOSIT_SERIES_KEYWORD", "createProposal").strip()
 GRAFANA_PANEL_TITLE_WITHDRAW = _cfg_str("GRAFANA_PANEL_TITLE_WITHDRAW", "提款 (Withdrawal)")
 MONITORING_WITHDRAW_SERIES_KEYWORD = _cfg_str("MONITORING_WITHDRAW_SERIES_KEYWORD", "InitiateWithdrawal").strip()
+GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN = _cfg_str(
+    "GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN", "FPMS-NT 登入人数 (Login)"
+)
+MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD = _cfg_str(
+    "MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD", "Authenticate"
+).strip()
 GRAFANA_PANEL_TITLE_ERROR_REQ = _cfg_str("GRAFANA_PANEL_TITLE_ERROR_REQ", "错误请求数/1m")
 MONITORING_ERROR_REQ_SERIES_A_PARTS = _cfg_substring_parts(
     "MONITORING_ERROR_REQ_SERIES_A", "RedeemPlayerLuckyCoins"
@@ -862,6 +875,10 @@ MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", 60.0
 MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", 80.0)
 MONITORING_WITHDRAW_MIN_BASELINE_VALUE = max(
     0.0, _cfg_float("MONITORING_WITHDRAW_MIN_BASELINE_VALUE", 0.0)
+)
+MONITORING_FPMS_NT_LOGIN_ALERT_PCT = _cfg_float("MONITORING_FPMS_NT_LOGIN_ALERT_PCT", 100.0)
+MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT", 100.0
 )
 MONITORING_ERROR_REQ_ALERT_PCT = _cfg_float("MONITORING_ERROR_REQ_ALERT_PCT", 50.0)
 MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT = _cfg_float(
@@ -1719,6 +1736,8 @@ def _monitoring_enabled_panel_catalog() -> List[Dict[str, str]]:
         out.append({"kind": "deposit", "title": GRAFANA_PANEL_TITLE_DEPOSIT})
     if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
         out.append({"kind": "withdraw", "title": GRAFANA_PANEL_TITLE_WITHDRAW})
+    if _lark_env_truthy("MONITORING_FPMS_NT_LOGIN_ENABLE"):
+        out.append({"kind": "fpms_nt_login", "title": GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN})
     if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
         out.append({"kind": "error_req_1m", "title": GRAFANA_PANEL_TITLE_ERROR_REQ})
     if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
@@ -3742,6 +3761,17 @@ def fetch_monitoring_payload(
             extra.append({"kind": "withdraw", "payload": pw})
         except Exception:
             logger.exception("fetch withdraw panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_FPMS_NT_LOGIN_ENABLE"):
+        try:
+            pl = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": "fpms_nt_login", "payload": pl})
+        except Exception:
+            logger.exception("fetch FPMS-NT login panel failed (optional monitor)")
     if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
         try:
             pe = _fetch_panel_series_by_title(
@@ -4165,6 +4195,8 @@ def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
         out.append(("deposit", f"Deposit · {GRAFANA_PANEL_TITLE_DEPOSIT}"))
     if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
         out.append(("withdraw", f"Withdraw · {GRAFANA_PANEL_TITLE_WITHDRAW}"))
+    if _lark_env_truthy("MONITORING_FPMS_NT_LOGIN_ENABLE"):
+        out.append(("fpms_nt_login", f"Login · {GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN}"))
     if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
         out.append(("error_req_1m", f"Error req · {GRAFANA_PANEL_TITLE_ERROR_REQ}"))
     if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
@@ -5884,6 +5916,14 @@ def _monitoring_alert_panel_titles(payload: Optional[Dict[str, Any]]) -> List[st
             MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT,
         ),
         (
+            "fpms_nt_login",
+            GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN,
+            MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD,
+            _analysis_for_fpms_nt_login_payload,
+            MONITORING_FPMS_NT_LOGIN_ALERT_PCT,
+            MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT,
+        ),
+        (
             "error_req_1m",
             GRAFANA_PANEL_TITLE_ERROR_REQ,
             _error_req_series_labels_summary(),
@@ -6308,20 +6348,269 @@ def _grafana_legend_match_score(want_label: str, legend_text: str) -> int:
     return 100 + len(text_svc)
 
 
+def _grafana_legend_normalize_label(label: str) -> str:
+    return re.sub(r"\s+", " ", (label or "").replace("\n", " ")).strip()
+
+
+def _grafana_legend_labels_exact_equal(want_label: str, legend_text: str) -> bool:
+    """Case-insensitive full-string equality (``9280 + Push`` ≠ ``9280 + Push - 7Days``)."""
+    a = _grafana_legend_normalize_label(want_label).casefold()
+    b = _grafana_legend_normalize_label(legend_text).casefold()
+    return bool(a and b and a == b)
+
+
 def _grafana_playwright_isolate_legend_by_testid(page: Any, series_label: str) -> bool:
-    """Double-click ``[data-testid="VizLegend series {label}"]`` when Grafana uses exact test ids."""
+    """Double-click the legend row whose ``data-testid`` label equals ``series_label`` exactly."""
     want = (series_label or "").strip()
     if not want:
         return False
     try:
-        loc = page.locator(f'[data-testid="VizLegend series {want}"]')
-        if loc.count() < 1:
-            return False
-        loc.first.scroll_into_view_if_needed(timeout=8000)
-        loc.first.dblclick(timeout=8000)
-        return True
+        clicked = page.evaluate(
+            """({ want }) => {
+              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
+              const wantN = norm(want).toLowerCase();
+              const labelOf = (el) => {
+                const dt = el.getAttribute('data-testid') || '';
+                const m = dt.match(/VizLegend series\\s*(.*)$/i);
+                return m && m[1] ? norm(m[1]).toLowerCase() : '';
+              };
+              let target = null;
+              for (const el of document.querySelectorAll('[data-testid*="VizLegend series"]')) {
+                if (labelOf(el) === wantN) {
+                  target = el;
+                  break;
+                }
+              }
+              if (!target) return false;
+              const btn =
+                target.querySelector('button,[role="button"],td:first-child,[class*="SeriesIcon"]') ||
+                target;
+              btn.scrollIntoView({ block: 'center', inline: 'nearest' });
+              const r = btn.getBoundingClientRect();
+              const opts = {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: r.left + r.width / 2,
+                clientY: r.top + r.height / 2,
+              };
+              btn.dispatchEvent(new MouseEvent('dblclick', opts));
+              return true;
+            }""",
+            {"want": want},
+        )
+        return bool(clicked)
     except Exception:
         return False
+
+
+def _grafana_want_legend_exact_only(want_label: str) -> bool:
+    """Labels without `` - `` (e.g. ``9280 + Push``) must not fuzzy-match ``… - 7Days`` variants."""
+    raw = (want_label or "").replace("\u2014", "-").replace("\u2013", "-")
+    return " - " not in raw.strip()
+
+
+def _grafana_playwright_legend_visible_labels(page: Any) -> List[str]:
+    try:
+        raw = page.evaluate(
+            """() => {
+              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
+              const legendTextOf = (el) => {
+                const dt = el.getAttribute('data-testid') || '';
+                const m = dt.match(/VizLegend series\\s*(.*)$/i);
+                if (m && m[1]) return norm(m[1]);
+                const row = el.closest('tr');
+                if (row) return norm(row.textContent || '');
+                return norm(el.textContent || '');
+              };
+              const isHidden = (el) => {
+                const cls = (el.className || '') + ' ' + ((el.closest('tr') || {}).className || '');
+                if (/inactive|disabled|unchecked|hidden/i.test(cls)) return true;
+                const st = window.getComputedStyle(el);
+                if (parseFloat(st.opacity) < 0.35) return true;
+                return false;
+              };
+              const visible = [];
+              document.querySelectorAll('[data-testid*="VizLegend series"], table.viz-legend tbody tr').forEach((el) => {
+                if (isHidden(el)) return;
+                const text = legendTextOf(el);
+                if (text && text !== '-') visible.push(text);
+              });
+              return [...new Set(visible)];
+            }"""
+        )
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _grafana_playwright_legend_isolate_verified(page: Any, want_label: str) -> bool:
+    """True when exactly one visible legend row matches ``want_label``."""
+    want = (want_label or "").strip()
+    if not want:
+        return False
+    exact_only = _grafana_want_legend_exact_only(want)
+    try:
+        ok = page.evaluate(
+            """({ want, exactOnly }) => {
+              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
+              const wantN = norm(want).toLowerCase();
+              const parts = (label) => {
+                const raw = norm(label);
+                const i = raw.indexOf(' - ');
+                if (i < 0) return { svc: raw.toLowerCase(), rpc: '' };
+                return { svc: raw.slice(0, i).trim().toLowerCase(), rpc: raw.slice(i + 3).trim().toLowerCase() };
+              };
+              const matches = (wantLabel, legendText) => {
+                const wn = norm(wantLabel);
+                const tn = norm(legendText);
+                if (!wn || !tn) return false;
+                if (exactOnly) return wn.toLowerCase() === tn.toLowerCase();
+                const wantDash = wn.replace(/[\\u2013\\u2014]/g, '-');
+                if (!wantDash.includes(' - ')) {
+                  if (wn.toLowerCase() === tn.toLowerCase()) return true;
+                  if (tn.toLowerCase().startsWith(wn.toLowerCase())) return false;
+                  return false;
+                }
+                const w = parts(wn);
+                const t = parts(tn);
+                if (!w.svc || !t.svc) return false;
+                if (w.svc === t.svc && w.rpc === t.rpc) return true;
+                if (w.rpc && t.rpc && w.rpc !== t.rpc) return false;
+                let svcMatch = w.svc === t.svc;
+                if (!svcMatch) {
+                  const longer = w.svc.length >= t.svc.length ? w.svc : t.svc;
+                  const shorter = w.svc.length >= t.svc.length ? t.svc : w.svc;
+                  if (shorter.length >= 20 && longer.startsWith(shorter)) svcMatch = true;
+                }
+                if (!svcMatch) return false;
+                if (!w.rpc || !t.rpc) return true;
+                return w.rpc === t.rpc;
+              };
+              const legendTextOf = (el) => {
+                const dt = el.getAttribute('data-testid') || '';
+                const m = dt.match(/VizLegend series\\s*(.*)$/i);
+                if (m && m[1]) return norm(m[1]);
+                const row = el.closest('tr');
+                if (row) return norm(row.textContent || '');
+                return norm(el.textContent || '');
+              };
+              const isHidden = (el) => {
+                const cls = (el.className || '') + ' ' + ((el.closest('tr') || {}).className || '');
+                if (/inactive|disabled|unchecked|hidden/i.test(cls)) return true;
+                const st = window.getComputedStyle(el);
+                if (parseFloat(st.opacity) < 0.35) return true;
+                return false;
+              };
+              const visible = [];
+              document.querySelectorAll('[data-testid*="VizLegend series"], table.viz-legend tbody tr').forEach((el) => {
+                if (isHidden(el)) return;
+                const text = legendTextOf(el);
+                if (text && text !== '-') visible.push(text);
+              });
+              const uniq = [...new Set(visible)];
+              if (uniq.length !== 1) return false;
+              return matches(want, uniq[0]);
+            }""",
+            {"want": want, "exactOnly": exact_only},
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> bool:
+    """
+    Show only ``series_label`` on the solo panel chart (Grafana legend double-click isolate).
+
+    Uses exact label matching for names like ``9280 + Push`` so ``9280 + Push - 7Days`` is never
+    selected. Does not treat Y-axis rescale as success — verify must pass.
+    """
+    want = (series_label or "").strip()
+    if not want:
+        return False
+    exact_only = _grafana_want_legend_exact_only(want)
+
+    def _after_isolate_wait() -> None:
+        page.wait_for_timeout(700)
+        _grafana_wait_loading_like_gone(page, min(3000, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)))
+
+    def _legend_matches(text: str) -> bool:
+        if exact_only:
+            return _grafana_legend_labels_exact_equal(want, text)
+        return _grafana_legend_text_matches_series(want, text)
+
+    try:
+        if _grafana_playwright_isolate_legend_by_testid(page, want):
+            _after_isolate_wait()
+            if _grafana_playwright_legend_isolate_verified(page, want):
+                logger.info(
+                    "Grafana screenshot: legend testid dblclick isolate want=%r",
+                    want[:100],
+                )
+                return True
+
+        rows = _grafana_playwright_legend_rows_all(page)
+        if not rows:
+            logger.warning("Grafana screenshot: no legend rows for isolate %r", want[:100])
+            return False
+        targets = [r for r in rows if _legend_matches(str(r.get("text") or ""))]
+        if not targets:
+            logger.warning(
+                "Grafana screenshot: target legend not found want=%r legends=%s",
+                want[:100],
+                [str(r.get("text") or "")[:60] for r in rows[:15]],
+            )
+            return False
+        targets.sort(
+            key=lambda r: _grafana_legend_match_score(want, str(r.get("text") or "")),
+            reverse=True,
+        )
+        target = targets[0]
+        target_txt = str(target.get("text") or "")
+
+        page.mouse.dblclick(float(target["x"]), float(target["y"]))
+        _after_isolate_wait()
+        if _grafana_playwright_legend_isolate_verified(page, want):
+            logger.info(
+                "Grafana screenshot: legend isolate ok method=dblclick want=%r target=%r",
+                want[:100],
+                target_txt[:120],
+            )
+            return True
+
+        for loc in page.locator('[data-testid*="VizLegend series"]').all():
+            try:
+                dt = loc.get_attribute("data-testid") or ""
+            except Exception:
+                continue
+            m = re.search(r"VizLegend series\s*(.*)$", dt, re.I)
+            text = (m.group(1).strip() if m else "").strip()
+            if not text or not _legend_matches(text):
+                continue
+            loc.scroll_into_view_if_needed(timeout=8000)
+            loc.dblclick(timeout=8000)
+            _after_isolate_wait()
+            if _grafana_playwright_legend_isolate_verified(page, want):
+                logger.info(
+                    "Grafana screenshot: legend playwright dblclick fallback want=%r legend=%r",
+                    want[:100],
+                    text[:120],
+                )
+                return True
+
+        visible = _grafana_playwright_legend_visible_labels(page)
+        logger.warning(
+            "Grafana screenshot: legend isolate verify failed want=%r target=%r visible=%s",
+            want[:100],
+            target_txt[:120],
+            [v[:60] for v in visible[:12]],
+        )
+    except Exception as e:
+        logger.warning("Grafana screenshot: legend isolate failed series=%r: %s", want[:80], e)
+    return False
 
 
 def _grafana_playwright_collect_legend_click_targets(page: Any) -> List[Dict[str, Any]]:
@@ -6505,223 +6794,6 @@ def _grafana_playwright_chart_ymax_approx(page: Any) -> float:
         return 0.0
 
 
-def _grafana_playwright_legend_isolate_verified(page: Any, want_label: str) -> bool:
-    """True when every visible legend row matches ``want_label`` (ideally exactly one)."""
-    want = (want_label or "").strip()
-    if not want:
-        return False
-    try:
-        ok = page.evaluate(
-            """({ want }) => {
-              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
-              const parts = (label) => {
-                const raw = norm(label);
-                const i = raw.indexOf(' - ');
-                if (i < 0) return { svc: raw.toLowerCase(), rpc: '' };
-                return { svc: raw.slice(0, i).trim().toLowerCase(), rpc: raw.slice(i + 3).trim().toLowerCase() };
-              };
-              const matches = (wantLabel, legendText) => {
-                const wn = norm(wantLabel);
-                const tn = norm(legendText);
-                if (!wn || !tn) return false;
-                const wantDash = wn.replace(/[\\u2013\\u2014]/g, '-');
-                if (!wantDash.includes(' - ')) {
-                  if (wn.toLowerCase() === tn.toLowerCase()) return true;
-                  if (tn.toLowerCase().startsWith(wn.toLowerCase())) return false;
-                  return false;
-                }
-                const w = parts(wn);
-                const t = parts(tn);
-                if (!w.svc || !t.svc) return false;
-                if (w.svc === t.svc && w.rpc === t.rpc) return true;
-                if (w.rpc && t.rpc && w.rpc !== t.rpc) return false;
-                let svcMatch = w.svc === t.svc;
-                if (!svcMatch) {
-                  const longer = w.svc.length >= t.svc.length ? w.svc : t.svc;
-                  const shorter = w.svc.length >= t.svc.length ? t.svc : w.svc;
-                  if (shorter.length >= 20 && longer.startsWith(shorter)) svcMatch = true;
-                }
-                if (!svcMatch) return false;
-                if (!w.rpc || !t.rpc) return true;
-                return w.rpc === t.rpc;
-              };
-              const legendTextOf = (el) => {
-                const dt = el.getAttribute('data-testid') || '';
-                const m = dt.match(/VizLegend series\\s*(.*)$/i);
-                if (m && m[1]) return norm(m[1]);
-                const row = el.closest('tr');
-                if (row) return norm(row.textContent || '');
-                return norm(el.textContent || '');
-              };
-              const isHidden = (el) => {
-                const cls = (el.className || '') + ' ' + ((el.closest('tr') || {}).className || '');
-                if (/inactive|disabled|unchecked|hidden/i.test(cls)) return true;
-                const st = window.getComputedStyle(el);
-                if (parseFloat(st.opacity) < 0.35) return true;
-                return false;
-              };
-              const visible = [];
-              document.querySelectorAll('[data-testid*="VizLegend series"], table.viz-legend tbody tr').forEach((el) => {
-                if (isHidden(el)) return;
-                const text = legendTextOf(el);
-                if (text && text !== '-') visible.push(text);
-              });
-              const uniq = [...new Set(visible)];
-              if (!uniq.length) return false;
-              return uniq.every((t) => matches(want, t));
-            }""",
-            {"want": want},
-        )
-        return bool(ok)
-    except Exception:
-        return False
-
-
-def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> bool:
-    """
-    Show only ``series_label`` on the solo panel chart.
-
-    In-page JS (dedupe legend rows by label, click inner button, verify) — Playwright dblclick
-    alone often leaves all series visible on table-style legends.
-    """
-    want = (series_label or "").strip()
-    if not want:
-        return False
-
-    def _after_isolate_wait() -> None:
-        page.wait_for_timeout(700)
-        _grafana_wait_loading_like_gone(page, min(3000, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)))
-
-    try:
-        if _grafana_playwright_isolate_legend_by_testid(page, want):
-            _after_isolate_wait()
-            if _grafana_playwright_legend_isolate_verified(page, want):
-                logger.info(
-                    "Grafana screenshot: legend testid dblclick isolate want=%r",
-                    want[:100],
-                )
-                return True
-
-        rows = _grafana_playwright_legend_rows_all(page)
-        if not rows:
-            logger.warning("Grafana screenshot: no legend rows for isolate %r", want[:100])
-            return False
-        targets = [
-            r for r in rows if _grafana_legend_text_matches_series(want, str(r.get("text") or ""))
-        ]
-        if not targets:
-            logger.warning(
-                "Grafana screenshot: target legend not found want=%r legends=%s",
-                want[:100],
-                [str(r.get("text") or "")[:60] for r in rows[:15]],
-            )
-            return False
-        targets.sort(
-            key=lambda r: _grafana_legend_match_score(want, str(r.get("text") or "")),
-            reverse=True,
-        )
-        target = targets[0]
-        target_txt = str(target.get("text") or "")
-        ymax_before = _grafana_playwright_chart_ymax_approx(page)
-
-        page.mouse.dblclick(float(target["x"]), float(target["y"]))
-        page.wait_for_timeout(400)
-        _after_isolate_wait()
-        if _grafana_playwright_legend_isolate_verified(page, want):
-            logger.info(
-                "Grafana screenshot: legend isolate ok method=dblclick want=%r target=%r",
-                want[:100],
-                target_txt[:120],
-            )
-            return True
-
-        for row in rows:
-            txt = str(row.get("text") or "")
-            if _grafana_legend_text_matches_series(want, txt):
-                continue
-            try:
-                page.mouse.click(float(row["x"]), float(row["y"]))
-                page.wait_for_timeout(180)
-            except Exception:
-                continue
-        page.wait_for_timeout(400)
-        _after_isolate_wait()
-        ymax_after_hide = _grafana_playwright_chart_ymax_approx(page)
-        scale_ok = (
-            ymax_before > 800
-            and ymax_after_hide > 0
-            and ymax_after_hide < ymax_before * 0.45
-        )
-        if _grafana_playwright_legend_isolate_verified(page, want) or scale_ok:
-            logger.info(
-                "Grafana screenshot: legend isolate ok method=hide_others want=%r target=%r "
-                "ymax_before=%s ymax_after=%s",
-                want[:100],
-                target_txt[:120],
-                ymax_before,
-                ymax_after_hide,
-            )
-            return True
-
-        ymax_final = ymax_after_hide
-        try:
-            page.mouse.click(float(target["x"]), float(target["y"]))
-            page.wait_for_timeout(200)
-            ymax_final = _grafana_playwright_chart_ymax_approx(page)
-        except Exception:
-            pass
-        scale_ok_final = (
-            ymax_before > 800
-            and ymax_final > 0
-            and ymax_final < ymax_before * 0.45
-        )
-        if _grafana_playwright_legend_isolate_verified(page, want) or scale_ok_final:
-            logger.info(
-                "Grafana screenshot: legend isolate ok method=ensure_target want=%r target=%r",
-                want[:100],
-                target_txt[:120],
-            )
-            return True
-
-        logger.warning(
-            "Grafana screenshot: legend isolate verify failed want=%r target=%r "
-            "ymax_before=%s ymax_after=%s rows=%s",
-            want[:100],
-            target_txt[:120],
-            ymax_before,
-            ymax_final,
-            [str(r.get("text") or "")[:50] for r in rows[:12]],
-        )
-        scored_loc: List[Tuple[int, Any, str]] = []
-        for loc in page.locator('[data-testid*="VizLegend series"]').all():
-            try:
-                dt = loc.get_attribute("data-testid") or ""
-            except Exception:
-                continue
-            m = re.search(r"VizLegend series\s*(.*)$", dt, re.I)
-            text = (m.group(1).strip() if m else "").strip()
-            if not text:
-                continue
-            sc = _grafana_legend_match_score(want, text)
-            if sc > 0:
-                scored_loc.append((sc, loc, text))
-        if scored_loc:
-            scored_loc.sort(key=lambda x: x[0], reverse=True)
-            _, loc, text = scored_loc[0]
-            loc.scroll_into_view_if_needed(timeout=8000)
-            loc.dblclick(timeout=8000)
-            _after_isolate_wait()
-            logger.info(
-                "Grafana screenshot: legend playwright dblclick fallback want=%r legend=%r",
-                want[:100],
-                text[:120],
-            )
-            return _grafana_playwright_legend_isolate_verified(page, want)
-    except Exception as e:
-        logger.warning("Grafana screenshot: legend isolate failed series=%r: %s", want[:80], e)
-    return False
-
-
 def _grafana_alert_isolate_series_labels(
     panel_title: str,
     payload: Optional[Dict[str, Any]],
@@ -6739,6 +6811,7 @@ def _grafana_alert_isolate_series_labels(
         ("9280_push", GRAFANA_PANEL_TITLE_9280, MONITORING_9280_SERIES_KEYWORD, _analysis_for_9280_payload),
         ("deposit", GRAFANA_PANEL_TITLE_DEPOSIT, MONITORING_DEPOSIT_SERIES_KEYWORD, _analysis_for_deposit_payload),
         ("withdraw", GRAFANA_PANEL_TITLE_WITHDRAW, MONITORING_WITHDRAW_SERIES_KEYWORD, _analysis_for_withdraw_payload),
+        ("fpms_nt_login", GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN, MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD, _analysis_for_fpms_nt_login_payload),
         ("provider_jili", GRAFANA_PANEL_TITLE_PROVIDER_JILI, MONITORING_PROVIDER_JILI_SERIES_KEYWORD, _analysis_for_provider_jili_payload),
         ("provider_general", GRAFANA_PANEL_TITLE_PROVIDER_GENERAL, MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD, _analysis_for_provider_general_payload),
         ("provider_inhouse", GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE, MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD, _analysis_for_provider_inhouse_payload),
@@ -7876,6 +7949,10 @@ def _merge_withdraw_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]
     return _merge_series_points_by_keyword(payload, MONITORING_WITHDRAW_SERIES_KEYWORD)
 
 
+def _merge_fpms_nt_login_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
+    return _merge_series_points_by_keyword(payload, MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD)
+
+
 def _filter_low_outlier_points(
     points: List[Tuple[float, float]],
     ratio_to_median: float = 0.10,
@@ -8259,6 +8336,35 @@ def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
+    return a
+
+
+def _analysis_for_fpms_nt_login_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """``Authenticate`` logins: SPIKE only when +100% vs eval-window median baseline."""
+    pts = _merge_fpms_nt_login_points(payload)
+    pts_filtered = _filter_low_outlier_points(pts, ratio_to_median=0.28)
+    if len(pts_filtered) != len(pts):
+        logger.info(
+            "FPMS-NT login baseline filter applied points=%s->%s",
+            len(pts),
+            len(pts_filtered),
+        )
+    pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="sum")
+    pts_filtered = _trim_trailing_minute_buckets(pts_filtered, _analysis_drop_n())
+    a = _withdraw_baseline_drop_spike_analysis(
+        pts_filtered,
+        MONITORING_FPMS_NT_LOGIN_ALERT_PCT,
+        MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT,
+        MONITORING_ALERT_WINDOW_SECONDS,
+        min_baseline_value=0.0,
+    )
+    a["point_count"] = len(pts_filtered)
+    a["merged_points"] = [[t, v] for t, v in pts_filtered]
+    a["hit_alert"] = _series_analysis_has_spike(
+        a,
+        MONITORING_FPMS_NT_LOGIN_ALERT_PCT,
+        MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT,
+    )
     return a
 
 
@@ -8869,6 +8975,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             if _monitoring_alert_channel_muted(kind):
                 continue
             p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+            spike_only_fmt = False
             if kind == "9280_push":
                 g_lbl = GRAFANA_PANEL_TITLE_9280
                 s_lbl = MONITORING_9280_SERIES_KEYWORD
@@ -8887,6 +8994,13 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 a2 = _analysis_for_withdraw_payload(p2)
                 fast2 = MONITORING_WITHDRAW_ALERT_PCT
                 cont2 = MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT
+            elif kind == "fpms_nt_login":
+                g_lbl = GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN
+                s_lbl = MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD
+                a2 = _analysis_for_fpms_nt_login_payload(p2)
+                fast2 = MONITORING_FPMS_NT_LOGIN_ALERT_PCT
+                cont2 = MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT
+                spike_only_fmt = True
             elif kind == "error_req_1m":
                 g_lbl = GRAFANA_PANEL_TITLE_ERROR_REQ
                 s_lbl = _error_req_series_labels_summary()
@@ -8954,6 +9068,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                     fast2,
                     cont2,
                     MONITORING_ALERT_WINDOW_SECONDS,
+                    spike_only=spike_only_fmt,
                 )
                 if not reasons2:
                     fb2 = _format_trigger_fallback_line(
@@ -9003,6 +9118,8 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
         if k == "deposit" and bool(_analysis_for_deposit_payload(p2).get("hit_alert")):
             return True
         if k == "withdraw" and bool(_analysis_for_withdraw_payload(p2).get("hit_alert")):
+            return True
+        if k == "fpms_nt_login" and bool(_analysis_for_fpms_nt_login_payload(p2).get("hit_alert")):
             return True
         if k == "error_req_1m" and bool(_analysis_for_error_req_payload(p2).get("hit_alert")):
             return True
@@ -9109,6 +9226,11 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             title = GRAFANA_PANEL_TITLE_WITHDRAW
             series = MONITORING_WITHDRAW_SERIES_KEYWORD
             extra_footer = _format_extra_analysis_lines("Withdraw", a2)
+        elif k == "fpms_nt_login":
+            a2 = _analysis_for_fpms_nt_login_payload(p2)
+            title = GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN
+            series = MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines("FPMS-NT Login", a2)
         elif k == "error_req_1m":
             a2 = _analysis_for_error_req_payload(p2)
             title = GRAFANA_PANEL_TITLE_ERROR_REQ
