@@ -6359,49 +6359,50 @@ def _grafana_legend_labels_exact_equal(want_label: str, legend_text: str) -> boo
     return bool(a and b and a == b)
 
 
-def _grafana_playwright_isolate_legend_by_testid(page: Any, series_label: str) -> bool:
-    """Double-click the legend row whose ``data-testid`` label equals ``series_label`` exactly."""
+def _grafana_clear_text_selection(page: Any) -> None:
+    """Drop any text selection a click left behind (legend labels get selected, shown as blue)."""
+    try:
+        page.evaluate(
+            "() => { const s = window.getSelection && window.getSelection();"
+            " if (s && s.removeAllRanges) s.removeAllRanges(); }"
+        )
+    except Exception:
+        pass
+
+
+def _grafana_playwright_legend_click_exact(
+    page: Any, series_label: str, *, double: bool = False
+) -> bool:
+    """
+    Real Playwright click on the legend item whose ``data-testid`` label equals ``series_label``.
+
+    A **single** click is Grafana's "isolate this series" action. A synthetic JS ``dblclick``
+    event never triggers React's ``onClick`` (it only selected the label text before), so we use
+    a real mouse click on the located element instead.
+    """
     want = (series_label or "").strip()
     if not want:
         return False
+    want_n = _grafana_legend_normalize_label(want).casefold()
     try:
-        clicked = page.evaluate(
-            """({ want }) => {
-              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
-              const wantN = norm(want).toLowerCase();
-              const labelOf = (el) => {
-                const dt = el.getAttribute('data-testid') || '';
-                const m = dt.match(/VizLegend series\\s*(.*)$/i);
-                return m && m[1] ? norm(m[1]).toLowerCase() : '';
-              };
-              let target = null;
-              for (const el of document.querySelectorAll('[data-testid*="VizLegend series"]')) {
-                if (labelOf(el) === wantN) {
-                  target = el;
-                  break;
-                }
-              }
-              if (!target) return false;
-              const btn =
-                target.querySelector('button,[role="button"],td:first-child,[class*="SeriesIcon"]') ||
-                target;
-              btn.scrollIntoView({ block: 'center', inline: 'nearest' });
-              const r = btn.getBoundingClientRect();
-              const opts = {
-                bubbles: true,
-                cancelable: true,
-                view: window,
-                clientX: r.left + r.width / 2,
-                clientY: r.top + r.height / 2,
-              };
-              btn.dispatchEvent(new MouseEvent('dblclick', opts));
-              return true;
-            }""",
-            {"want": want},
-        )
-        return bool(clicked)
+        for loc in page.locator('[data-testid*="VizLegend series"]').all():
+            try:
+                dt = loc.get_attribute("data-testid") or ""
+            except Exception:
+                continue
+            m = re.search(r"VizLegend series\s*(.*)$", dt, re.I)
+            label = _grafana_legend_normalize_label(m.group(1) if m else "").casefold()
+            if label != want_n:
+                continue
+            loc.scroll_into_view_if_needed(timeout=8000)
+            if double:
+                loc.dblclick(timeout=8000)
+            else:
+                loc.click(timeout=8000)
+            return True
     except Exception:
         return False
+    return False
 
 
 def _grafana_want_legend_exact_only(want_label: str) -> bool:
@@ -6523,10 +6524,11 @@ def _grafana_playwright_legend_isolate_verified(page: Any, want_label: str) -> b
 
 def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> bool:
     """
-    Show only ``series_label`` on the solo panel chart (Grafana legend double-click isolate).
+    Show only ``series_label`` on the solo panel chart.
 
+    Grafana isolates a series on a **single** click of its legend label (click again restores all).
     Uses exact label matching for names like ``9280 + Push`` so ``9280 + Push - 7Days`` is never
-    selected. Does not treat Y-axis rescale as success — verify must pass.
+    selected. Y-axis rescale is not treated as success — verify must pass.
     """
     want = (series_label or "").strip()
     if not want:
@@ -6542,12 +6544,15 @@ def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> b
             return _grafana_legend_labels_exact_equal(want, text)
         return _grafana_legend_text_matches_series(want, text)
 
+    target_txt = want
     try:
-        if _grafana_playwright_isolate_legend_by_testid(page, want):
+        # Primary: real single click on the exact-label legend item (React onClick = isolate).
+        if _grafana_playwright_legend_click_exact(page, want, double=False):
+            _grafana_clear_text_selection(page)
             _after_isolate_wait()
             if _grafana_playwright_legend_isolate_verified(page, want):
                 logger.info(
-                    "Grafana screenshot: legend testid dblclick isolate want=%r",
+                    "Grafana screenshot: legend single-click isolate want=%r",
                     want[:100],
                 )
                 return True
@@ -6571,7 +6576,21 @@ def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> b
         target = targets[0]
         target_txt = str(target.get("text") or "")
 
+        # Fallback 1: coordinate single click on the matched legend row.
+        page.mouse.click(float(target["x"]), float(target["y"]))
+        _grafana_clear_text_selection(page)
+        _after_isolate_wait()
+        if _grafana_playwright_legend_isolate_verified(page, want):
+            logger.info(
+                "Grafana screenshot: legend isolate ok method=click want=%r target=%r",
+                want[:100],
+                target_txt[:120],
+            )
+            return True
+
+        # Fallback 2: builds where a single click toggles one series → double-click isolate.
         page.mouse.dblclick(float(target["x"]), float(target["y"]))
+        _grafana_clear_text_selection(page)
         _after_isolate_wait()
         if _grafana_playwright_legend_isolate_verified(page, want):
             logger.info(
@@ -6580,26 +6599,6 @@ def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> b
                 target_txt[:120],
             )
             return True
-
-        for loc in page.locator('[data-testid*="VizLegend series"]').all():
-            try:
-                dt = loc.get_attribute("data-testid") or ""
-            except Exception:
-                continue
-            m = re.search(r"VizLegend series\s*(.*)$", dt, re.I)
-            text = (m.group(1).strip() if m else "").strip()
-            if not text or not _legend_matches(text):
-                continue
-            loc.scroll_into_view_if_needed(timeout=8000)
-            loc.dblclick(timeout=8000)
-            _after_isolate_wait()
-            if _grafana_playwright_legend_isolate_verified(page, want):
-                logger.info(
-                    "Grafana screenshot: legend playwright dblclick fallback want=%r legend=%r",
-                    want[:100],
-                    text[:120],
-                )
-                return True
 
         visible = _grafana_playwright_legend_visible_labels(page)
         logger.warning(
