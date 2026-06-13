@@ -271,9 +271,9 @@ _CFG: Dict[str, Any] = {
     # 例 median=200、80% → spike 需 >360；median=30 时 40 仅 +33% vs baseline，20→40 不告警。
     "MONITORING_WITHDRAW_MIN_BASELINE_VALUE": "0",
     "MONITORING_FPMS_NT_LOGIN_ENABLE": "1",
-    # Authenticate logins: SPIKE only when value is +100% vs eval-window median baseline.
-    "MONITORING_FPMS_NT_LOGIN_ALERT_PCT": 100,
-    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT": 100,
+    # Authenticate logins: spike/drop vs eval-window **median baseline** (>50% fast or continuous).
+    "MONITORING_FPMS_NT_LOGIN_ALERT_PCT": 50,
+    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT": 50,
     "MONITORING_ERROR_REQ_ENABLE": "1",
     "MONITORING_ERROR_REQ_ALERT_PCT": 50,
     "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 80,
@@ -876,9 +876,9 @@ MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_CONTI
 MONITORING_WITHDRAW_MIN_BASELINE_VALUE = max(
     0.0, _cfg_float("MONITORING_WITHDRAW_MIN_BASELINE_VALUE", 0.0)
 )
-MONITORING_FPMS_NT_LOGIN_ALERT_PCT = _cfg_float("MONITORING_FPMS_NT_LOGIN_ALERT_PCT", 100.0)
+MONITORING_FPMS_NT_LOGIN_ALERT_PCT = _cfg_float("MONITORING_FPMS_NT_LOGIN_ALERT_PCT", 50.0)
 MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT", 100.0
+    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT", 50.0
 )
 MONITORING_ERROR_REQ_ALERT_PCT = _cfg_float("MONITORING_ERROR_REQ_ALERT_PCT", 50.0)
 MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT = _cfg_float(
@@ -8343,7 +8343,7 @@ def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _analysis_for_fpms_nt_login_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """``Authenticate`` logins: SPIKE only when +100% vs eval-window median baseline."""
+    """``Authenticate`` logins: spike/drop vs eval-window median baseline (>50% default)."""
     pts = _merge_fpms_nt_login_points(payload)
     pts_filtered = _filter_low_outlier_points(pts, ratio_to_median=0.28)
     if len(pts_filtered) != len(pts):
@@ -8363,11 +8363,6 @@ def _analysis_for_fpms_nt_login_payload(payload: Dict[str, Any]) -> Dict[str, An
     )
     a["point_count"] = len(pts_filtered)
     a["merged_points"] = [[t, v] for t, v in pts_filtered]
-    a["hit_alert"] = _series_analysis_has_spike(
-        a,
-        MONITORING_FPMS_NT_LOGIN_ALERT_PCT,
-        MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT,
-    )
     return a
 
 
@@ -9087,7 +9082,6 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 a2 = _analysis_for_fpms_nt_login_payload(p2)
                 fast2 = MONITORING_FPMS_NT_LOGIN_ALERT_PCT
                 cont2 = MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT
-                spike_only_fmt = True
             elif kind == "error_req_1m":
                 g_lbl = GRAFANA_PANEL_TITLE_ERROR_REQ
                 s_lbl = _error_req_series_labels_summary()
