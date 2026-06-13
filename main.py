@@ -96,6 +96,16 @@ _CFG: Dict[str, Any] = {
         "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=45;"
         "igo-prod-ali-igo-sw-internal|POST /fpms/request=20"
     ),
+    # Per-series continuous spike % overrides (default ``MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT``).
+    "MONITORING_ERROR_REQ_SERIES_CONTINUOUS_PCT": (
+        "fpms-nt-ali-prod-promotion-rollout|grpc.promotion.v1.FrontendLuckyCoinsService/GetPlayerLuckyCoins=40;"
+        "fpms-nt-ali-prod-promotion-rollout|grpc.promotion.FrontendLuckyCoinsService/GetPlayerLuckyCoins=40"
+    ),
+    # Per-series: alert on **continuous spike only** (skip fast within-window rule). Same ``|`` match syntax.
+    "MONITORING_ERROR_REQ_SERIES_CONTINUOUS_ONLY": (
+        "fpms-nt-ali-prod-promotion-rollout|grpc.promotion.v1.FrontendLuckyCoinsService/GetPlayerLuckyCoins;"
+        "fpms-nt-ali-prod-promotion-rollout|grpc.promotion.FrontendLuckyCoinsService/GetPlayerLuckyCoins"
+    ),
     # Legacy (used only when MONITORING_ERROR_REQ_SERIES is empty):
     "MONITORING_ERROR_REQ_SERIES_A": "RedeemPlayerLuckyCoins",
     "MONITORING_ERROR_REQ_SERIES_A_LABEL": "RedeemPlayerLuckyCoins",
@@ -574,9 +584,9 @@ MONITORING_ERROR_REQ_MIN_SPIKE_VALUE = max(
 )
 
 
-def _error_req_series_min_spike_overrides() -> List[Tuple[List[str], float]]:
-    """``(match_parts, min_peak)`` from ``MONITORING_ERROR_REQ_SERIES_MIN_SPIKE``."""
-    raw = (_cfg_str("MONITORING_ERROR_REQ_SERIES_MIN_SPIKE", "") or "").strip()
+def _error_req_series_pct_overrides(cfg_key: str) -> List[Tuple[List[str], float]]:
+    """``(match_parts, pct)`` from a ``pattern=value`` config (``|`` = all parts must match legend)."""
+    raw = (_cfg_str(cfg_key, "") or "").strip()
     out: List[Tuple[List[str], float]] = []
     for entry in raw.split(";"):
         chunk = entry.strip()
@@ -594,12 +604,56 @@ def _error_req_series_min_spike_overrides() -> List[Tuple[List[str], float]]:
     return out
 
 
+def _error_req_series_min_spike_overrides() -> List[Tuple[List[str], float]]:
+    """``(match_parts, min_peak)`` from ``MONITORING_ERROR_REQ_SERIES_MIN_SPIKE``."""
+    return _error_req_series_pct_overrides("MONITORING_ERROR_REQ_SERIES_MIN_SPIKE")
+
+
+def _error_req_series_continuous_pct_overrides() -> List[Tuple[List[str], float]]:
+    return _error_req_series_pct_overrides("MONITORING_ERROR_REQ_SERIES_CONTINUOUS_PCT")
+
+
+def _error_req_series_continuous_only_patterns() -> List[List[str]]:
+    raw = (_cfg_str("MONITORING_ERROR_REQ_SERIES_CONTINUOUS_ONLY", "") or "").strip()
+    out: List[List[str]] = []
+    for entry in raw.split(";"):
+        parts = [p.strip() for p in entry.strip().split("|") if p.strip()]
+        if parts:
+            out.append(parts)
+    return out
+
+
 def _error_req_min_spike_for_label(label: str) -> float:
     lbl = (label or "").strip()
     for parts, val in _error_req_series_min_spike_overrides():
         if _series_matches_substring_parts(lbl, parts):
             return val
     return float(MONITORING_ERROR_REQ_MIN_SPIKE_VALUE)
+
+
+def _error_req_continuous_pct_for_label(label: str) -> float:
+    lbl = (label or "").strip()
+    for parts, val in _error_req_series_continuous_pct_overrides():
+        if _series_matches_substring_parts(lbl, parts):
+            return val
+    return float(MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT)
+
+
+def _error_req_continuous_only_for_label(label: str) -> bool:
+    lbl = (label or "").strip()
+    for parts in _error_req_series_continuous_only_patterns():
+        if _series_matches_substring_parts(lbl, parts):
+            return True
+    return False
+
+
+def _error_req_thresholds_for_label(label: str) -> Tuple[float, float, bool]:
+    """``(fast_pct, continuous_pct, continuous_only)`` for one error-req series legend."""
+    lbl = (label or "").strip()
+    cont = _error_req_continuous_pct_for_label(lbl)
+    cont_only = _error_req_continuous_only_for_label(lbl)
+    fast = float(MONITORING_ERROR_REQ_ALERT_PCT)
+    return fast, cont, cont_only
 
 
 def _error_req_all_series_mode() -> bool:
@@ -8472,18 +8526,55 @@ def _pick_error_req_spike_event(
     return best.get("to_ts"), best.get("to_val")
 
 
+def _error_req_uses_baseline_continuous_rules(label: str) -> bool:
+    return _error_req_continuous_only_for_label(label)
+
+
 def _error_req_analysis_has_spike(
-    analysis: Dict[str, Any], fast_threshold_pct: float, continuous_threshold_pct: float
+    analysis: Dict[str, Any],
+    fast_threshold_pct: Optional[float] = None,
+    continuous_threshold_pct: Optional[float] = None,
 ) -> bool:
-    """Alert when an upward spike reaches the per-series absolute min peak (errors/min)."""
+    """Absolute min-peak spike by default; baseline continuous % for configured series."""
+    lbl = str(analysis.get("label") or "")
+    if _error_req_uses_baseline_continuous_rules(lbl):
+        _, cont_thr, _ = _error_req_thresholds_for_label(lbl)
+        if continuous_threshold_pct is not None:
+            cont_thr = float(continuous_threshold_pct)
+        min_peak = _error_req_min_spike_for_label(lbl)
+        cs = analysis.get("consecutive_max_spike")
+        if (
+            isinstance(cs, dict)
+            and float(cs.get("pct") or 0.0) >= float(cont_thr)
+            and _error_req_spike_peak_value(cs) >= min_peak
+        ):
+            return True
+        return False
     del fast_threshold_pct, continuous_threshold_pct
-    min_peak = _error_req_min_spike_for_label(str(analysis.get("label") or ""))
+    min_peak = _error_req_min_spike_for_label(lbl)
     return bool(_error_req_qualifying_spike_events(analysis, min_peak))
 
 
 def _analysis_for_error_req_points(
     pts: List[Tuple[float, float]], *, label: str = ""
 ) -> Dict[str, Any]:
+    if _error_req_uses_baseline_continuous_rules(label):
+        pts_work = _snap_series_to_monitoring_minutes(pts, how="sum")
+        pts_work = _trim_trailing_minute_buckets(pts_work, _analysis_drop_n())
+        cont_thr = _error_req_continuous_pct_for_label(label)
+        a = _withdraw_baseline_drop_spike_analysis(
+            pts_work,
+            MONITORING_ERROR_REQ_ALERT_PCT,
+            cont_thr,
+            MONITORING_ALERT_WINDOW_SECONDS,
+            min_baseline_value=MONITORING_ERROR_REQ_MIN_BASELINE_VALUE,
+        )
+        a["point_count"] = len(pts_work)
+        a["merged_points"] = [[t, v] for t, v in pts_work]
+        a["label"] = label
+        a["alert_rule"] = "baseline_continuous_only"
+        a["hit_alert"] = False
+        return a
     min_peak = _error_req_min_spike_for_label(label)
     return _error_req_absolute_spike_analysis(pts, label=label, min_peak=min_peak)
 
@@ -8510,13 +8601,13 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         series_rows = _enumerate_error_req_series_from_payload(payload)
         for lbl, raw_pts in series_rows:
             a = _analysis_for_error_req_points(raw_pts, label=lbl)
-            spiked = _error_req_analysis_has_spike(
-                a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
-            )
+            spiked = _error_req_analysis_has_spike(a)
             entries.append({
                 "label": lbl,
                 "spiked": spiked,
                 "min_spike": _error_req_min_spike_for_label(lbl),
+                "continuous_pct": _error_req_continuous_pct_for_label(lbl),
+                "continuous_only": _error_req_continuous_only_for_label(lbl),
                 "analysis": a,
             })
             total_pts += int(a.get("point_count") or 0)
@@ -8524,13 +8615,13 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         for lbl, parts in _error_req_series_specs():
             a = _analysis_for_error_req_series(payload, parts, label=lbl)
-            spiked = _error_req_analysis_has_spike(
-                a, MONITORING_ERROR_REQ_ALERT_PCT, MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
-            )
+            spiked = _error_req_analysis_has_spike(a)
             entries.append({
                 "label": lbl,
                 "spiked": spiked,
                 "min_spike": _error_req_min_spike_for_label(lbl),
+                "continuous_pct": _error_req_continuous_pct_for_label(lbl),
+                "continuous_only": _error_req_continuous_only_for_label(lbl),
                 "analysis": a,
             })
             total_pts += int(a.get("point_count") or 0)
@@ -8666,6 +8757,26 @@ def _format_error_req_trigger_lines(
     for ent in spiked:
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         lbl = str(ent.get("label") or sub.get("label") or "series")
+        cont_only = bool(ent.get("continuous_only") or _error_req_continuous_only_for_label(lbl))
+        if cont_only:
+            cont_thr = float(ent.get("continuous_pct") or _error_req_continuous_pct_for_label(lbl))
+            picked_evt = _pick_alert_spike_drop_event(
+                sub, 999.0, cont_thr, spike_only=True
+            )
+            if picked_evt:
+                direction, from_val, to_val, from_ts, to_ts = picked_evt
+                blocks.append(
+                    _format_spike_drop_alert_block(
+                        GRAFANA_PANEL_TITLE_ERROR_REQ,
+                        lbl,
+                        direction,
+                        from_val,
+                        to_val,
+                        from_ts,
+                        to_ts,
+                    )
+                )
+            continue
         min_peak = float(ent.get("min_spike") or _error_req_min_spike_for_label(lbl))
         picked = _pick_error_req_spike_event(sub, min_peak)
         if picked:
@@ -8702,7 +8813,14 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         spiked = bool(ent.get("spiked"))
         min_spike = float(ent.get("min_spike") or _error_req_min_spike_for_label(lbl))
-        meta: List[str] = [f"min peak {min_spike:g}"]
+        cont_thr = float(ent.get("continuous_pct") or _error_req_continuous_pct_for_label(lbl))
+        cont_only = bool(ent.get("continuous_only") or _error_req_continuous_only_for_label(lbl))
+        meta: List[str] = []
+        if cont_only:
+            meta.append(f"continuous {cont_thr:g}%")
+            meta.append("continuous-only")
+        else:
+            meta.append(f"min peak {min_spike:g}")
         lines.append(
             f"  {lbl}: spike={'yes' if spiked else 'no'}"
             + (f" ({', '.join(meta)})" if meta else "")
@@ -8714,6 +8832,14 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
                 f"{_fmt_num(peak_ev.get('from_val'))} → {_fmt_ts_short(peak_ev.get('to_ts'))} "
                 f"{_fmt_num(peak_ev.get('to_val'))}"
             )
+        elif cont_only:
+            cs = sub.get("consecutive_max_spike")
+            if isinstance(cs, dict):
+                lines.append(
+                    f"    continuous vs baseline: +{(cs or {}).get('pct', 'n/a')}%"
+                )
+            elif not spiked:
+                lines.append("    (no continuous spike to threshold in window)")
         elif not spiked:
             lines.append("    (no upward rise to min peak in window)")
     return lines
