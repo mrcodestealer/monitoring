@@ -8241,7 +8241,11 @@ def _withdraw_baseline_drop_spike_analysis(
     for i in range(0, L - span):
         j = i + span
         end_val = float(vals[j])
-        if end_val < fast_drop_level:
+        # Require real movement across the window: a DROP must actually fall and a
+        # SPIKE must actually rise. Otherwise a flat region sitting above/below the
+        # median baseline (e.g. flat 30 while baseline is dragged down by a later
+        # drop to 9) would mislabel "30 → 30" as a spike.
+        if end_val < fast_drop_level and float(vals[j]) < float(vals[i]):
             pct_b = _pct_below_baseline(end_val)
             cand_d = {
                 "pct": pct_b,
@@ -8254,7 +8258,7 @@ def _withdraw_baseline_drop_spike_analysis(
             }
             if best_w_drop is None or float(cand_d["pct"]) > float(best_w_drop["pct"]):
                 best_w_drop = cand_d
-        if end_val > fast_spike_level:
+        if end_val > fast_spike_level and float(vals[j]) > float(vals[i]):
             pct_b = _pct_above_baseline(end_val)
             cand_s = {
                 "pct": pct_b,
