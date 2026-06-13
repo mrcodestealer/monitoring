@@ -278,24 +278,24 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ERROR_REQ_ALERT_PCT": 50,
     "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 80,
     "MONITORING_PROVIDER_JILI_ENABLE": "1",
-    "MONITORING_PROVIDER_JILI_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_PROVIDER_JILI_ALERT_PCT": 25,
+    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_PROVIDER_GENERAL_ENABLE": "1",
-    "MONITORING_PROVIDER_GENERAL_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_PROVIDER_GENERAL_ALERT_PCT": 25,
+    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_PROVIDER_INHOUSE_ENABLE": "1",
-    "MONITORING_PROVIDER_INHOUSE_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_PROVIDER_INHOUSE_ALERT_PCT": 25,
+    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_GAMES_JILI_ENABLE": "1",
-    "MONITORING_GAMES_JILI_ALERT_PCT": 15,
-    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_GAMES_JILI_ALERT_PCT": 25,
+    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_GAMES_GENERAL_ENABLE": "1",
-    "MONITORING_GAMES_GENERAL_ALERT_PCT": 15,
-    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_GAMES_GENERAL_ALERT_PCT": 25,
+    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_GAMES_INHOUSE_ENABLE": "1",
     # Games panels: spike/drop vs **median baseline** in eval window (not bucket-to-bucket %).
-    "MONITORING_GAMES_INHOUSE_ALERT_PCT": 15,
-    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT": 15,
+    "MONITORING_GAMES_INHOUSE_ALERT_PCT": 25,
+    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_ALERT_WINDOW_SECONDS": 120,
     # 1=alert text skips Fast/Continuous SPIKE/DROP lines; only a short time/value tail (Grafana-like).
     "MONITORING_SIMPLE_ALERT_TEXT": "0",
@@ -884,29 +884,29 @@ MONITORING_ERROR_REQ_ALERT_PCT = _cfg_float("MONITORING_ERROR_REQ_ALERT_PCT", 50
 MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT = _cfg_float(
     "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT", 80.0
 )
-MONITORING_PROVIDER_JILI_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_JILI_ALERT_PCT", 15.0)
+MONITORING_PROVIDER_JILI_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_JILI_ALERT_PCT", 25.0)
 MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT", 15.0
+    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT", 25.0
 )
-MONITORING_PROVIDER_GENERAL_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_GENERAL_ALERT_PCT", 15.0)
+MONITORING_PROVIDER_GENERAL_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_GENERAL_ALERT_PCT", 25.0)
 MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT", 15.0
+    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT", 25.0
 )
-MONITORING_PROVIDER_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_INHOUSE_ALERT_PCT", 15.0)
+MONITORING_PROVIDER_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_INHOUSE_ALERT_PCT", 25.0)
 MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
+    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT", 25.0
 )
-MONITORING_GAMES_JILI_ALERT_PCT = _cfg_float("MONITORING_GAMES_JILI_ALERT_PCT", 15.0)
+MONITORING_GAMES_JILI_ALERT_PCT = _cfg_float("MONITORING_GAMES_JILI_ALERT_PCT", 25.0)
 MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT", 15.0
+    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT", 25.0
 )
-MONITORING_GAMES_GENERAL_ALERT_PCT = _cfg_float("MONITORING_GAMES_GENERAL_ALERT_PCT", 15.0)
+MONITORING_GAMES_GENERAL_ALERT_PCT = _cfg_float("MONITORING_GAMES_GENERAL_ALERT_PCT", 25.0)
 MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT", 15.0
+    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT", 25.0
 )
-MONITORING_GAMES_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_GAMES_INHOUSE_ALERT_PCT", 15.0)
+MONITORING_GAMES_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_GAMES_INHOUSE_ALERT_PCT", 25.0)
 MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
+    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT", 25.0
 )
 MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 120))
 MONITORING_DROP_LAST_MERGED_MINUTES = max(
@@ -8515,8 +8515,13 @@ def _pick_alert_spike_drop_event(
     continuous_threshold_pct: float,
     *,
     spike_only: bool = False,
-) -> Optional[Tuple[str, Any, Any]]:
-    """Strongest qualifying spike/drop: (direction, from_val, to_val)."""
+) -> Optional[Tuple[str, Any, Any, Any, Any]]:
+    """Strongest qualifying spike/drop: (direction, from_val, to_val, from_ts, to_ts).
+
+    Reports the actual start/end buckets (value + timestamp) of the run so the
+    text is verifiable against the chart, rather than the median baseline which
+    has no single timestamp.
+    """
     wd = analysis.get("window_max_drop")
     ws = analysis.get("window_max_spike")
     cd = analysis.get("consecutive_max_drop")
@@ -8533,9 +8538,13 @@ def _pick_alert_spike_drop_event(
     if not candidates:
         return None
     direction, ev = max(candidates, key=lambda t: float(t[1].get("pct") or 0.0))
-    base = ev.get("baseline_median")
-    from_val = base if base is not None else ev.get("from_val")
-    return direction, from_val, ev.get("to_val")
+    return (
+        direction,
+        ev.get("from_val"),
+        ev.get("to_val"),
+        ev.get("from_ts"),
+        ev.get("to_ts"),
+    )
 
 
 def _format_spike_drop_alert_block(
@@ -8544,12 +8553,24 @@ def _format_spike_drop_alert_block(
     direction: str,
     from_val: Any,
     to_val: Any,
+    from_ts: Any = None,
+    to_ts: Any = None,
 ) -> str:
     emoji = "📈" if direction == "SPIKE" else "📉"
     verb = "increased" if direction == "SPIKE" else "decreased"
+    from_part = (
+        f"{_fmt_ts_short(from_ts)} value of {_fmt_num(from_val)}"
+        if from_ts is not None
+        else f"value of {_fmt_num(from_val)}"
+    )
+    to_part = (
+        f"{_fmt_ts_short(to_ts)} value of {_fmt_num(to_val)}"
+        if to_ts is not None
+        else f"value of {_fmt_num(to_val)}"
+    )
     return (
         f"{emoji} {graph_label} — {series_label} {direction}\n"
-        f"{_fmt_num(from_val)} {verb} to {_fmt_num(to_val)}"
+        f"{from_part} {verb} to {to_part}"
     )
 
 
@@ -8576,10 +8597,10 @@ def _format_error_req_trigger_lines(
             sub, fast_threshold_pct, continuous_threshold_pct, spike_only=True
         )
         if picked:
-            direction, from_val, to_val = picked
+            direction, from_val, to_val, from_ts, to_ts = picked
             blocks.append(
                 _format_spike_drop_alert_block(
-                    GRAFANA_PANEL_TITLE_ERROR_REQ, lbl, direction, from_val, to_val
+                    GRAFANA_PANEL_TITLE_ERROR_REQ, lbl, direction, from_val, to_val, from_ts, to_ts
                 )
             )
     return blocks
@@ -8840,9 +8861,11 @@ def _format_trigger_lines(
     )
     if not picked:
         return []
-    direction, from_val, to_val = picked
+    direction, from_val, to_val, from_ts, to_ts = picked
     return [
-        _format_spike_drop_alert_block(graph_label, series_label, direction, from_val, to_val)
+        _format_spike_drop_alert_block(
+            graph_label, series_label, direction, from_val, to_val, from_ts, to_ts
+        )
     ]
 
 
