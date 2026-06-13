@@ -93,7 +93,7 @@ _CFG: Dict[str, Any] = {
         "fpms-nt-ali-prod-promotion-rollout|CheckAndCreateMission=25;"
         "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=20;"
         "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=25;"
-        "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=15;"
+        "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=45;"
         "igo-prod-ali-igo-sw-internal|POST /fpms/request=20"
     ),
     # Legacy (used only when MONITORING_ERROR_REQ_SERIES is empty):
@@ -8392,44 +8392,105 @@ def _error_req_spike_peak_value(spike: Optional[Dict[str, Any]]) -> float:
         return 0.0
 
 
+def _error_req_spike_is_upward(spike: Optional[Dict[str, Any]]) -> bool:
+    """True when the spike event is an actual increase (not flat or a decrease to the level)."""
+    if not isinstance(spike, dict):
+        return False
+    try:
+        from_v = float(spike.get("from_val") or 0.0)
+        to_v = float(spike.get("to_val") or 0.0)
+        return to_v > from_v
+    except (TypeError, ValueError):
+        return False
+
+
+def _error_req_absolute_spike_analysis(
+    points: List[Tuple[float, float]],
+    *,
+    label: str = "",
+    min_peak: float,
+) -> Dict[str, Any]:
+    """
+    Alert when any minute bucket **rises** to ``>= min_peak`` vs the prior bucket
+    (e.g. 40→45 triggers; 50→45 does not).
+    """
+    pts = _snap_series_to_monitoring_minutes(points, how="sum")
+    pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
+    out: Dict[str, Any] = {
+        "pointCount": len(pts),
+        "point_count": len(pts),
+        "hit_alert": False,
+        "alert_rule": "absolute_peak",
+        "label": label,
+        "min_peak": float(min_peak),
+        "peak_spike": None,
+        "merged_points": [[t, v] for t, v in pts],
+    }
+    if len(pts) < 2 or float(min_peak) <= 0:
+        return out
+
+    candidates: List[Dict[str, Any]] = []
+    for j in range(1, len(pts)):
+        from_ts, from_val = pts[j - 1]
+        to_ts, to_val = pts[j]
+        fv = float(from_val)
+        tv = float(to_val)
+        if tv >= float(min_peak) and tv > fv:
+            pct = round((tv - fv) / fv * 100.0, 2) if fv > 0 else 0.0
+            candidates.append({
+                "from_ts": from_ts,
+                "to_ts": to_ts,
+                "from_val": fv,
+                "to_val": tv,
+                "pct": pct,
+            })
+
+    if candidates:
+        best = max(candidates, key=lambda e: (float(e["to_val"]), float(e["to_ts"])))
+        out["peak_spike"] = best
+        out["hit_alert"] = True
+    return out
+
+
+def _error_req_qualifying_spike_events(
+    analysis: Dict[str, Any], min_peak: float
+) -> List[Dict[str, Any]]:
+    """Upward minute-to-minute move reaching ``>= min_peak`` (absolute errors/min)."""
+    ev = analysis.get("peak_spike")
+    if (
+        isinstance(ev, dict)
+        and _error_req_spike_is_upward(ev)
+        and _error_req_spike_peak_value(ev) >= float(min_peak)
+    ):
+        return [ev]
+    return []
+
+
+def _pick_error_req_spike_event(
+    analysis: Dict[str, Any], min_peak: float
+) -> Optional[Tuple[Any, Any]]:
+    """Best qualifying upward spike: ``(peak_ts, peak_val)``."""
+    candidates = _error_req_qualifying_spike_events(analysis, min_peak)
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda e: float(e.get("to_val") or 0.0))
+    return best.get("to_ts"), best.get("to_val")
+
+
 def _error_req_analysis_has_spike(
     analysis: Dict[str, Any], fast_threshold_pct: float, continuous_threshold_pct: float
 ) -> bool:
-    """Like :func:`_series_analysis_has_spike` but requires peak ``>=`` per-series min (default global)."""
+    """Alert when an upward spike reaches the per-series absolute min peak (errors/min)."""
+    del fast_threshold_pct, continuous_threshold_pct
     min_peak = _error_req_min_spike_for_label(str(analysis.get("label") or ""))
-    ws = analysis.get("window_max_spike")
-    if (
-        isinstance(ws, dict)
-        and float(ws.get("pct") or 0.0) >= float(fast_threshold_pct)
-        and _error_req_spike_peak_value(ws) >= min_peak
-    ):
-        return True
-    cs = analysis.get("consecutive_max_spike")
-    if (
-        isinstance(cs, dict)
-        and float(cs.get("pct") or 0.0) >= float(continuous_threshold_pct)
-        and _error_req_spike_peak_value(cs) >= min_peak
-    ):
-        return True
-    return False
+    return bool(_error_req_qualifying_spike_events(analysis, min_peak))
 
 
 def _analysis_for_error_req_points(
     pts: List[Tuple[float, float]], *, label: str = ""
 ) -> Dict[str, Any]:
-    pts = _snap_series_to_monitoring_minutes(pts, how="sum")
-    pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
-    a = _withdraw_baseline_drop_spike_analysis(
-        pts,
-        MONITORING_ERROR_REQ_ALERT_PCT,
-        MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
-        min_baseline_value=MONITORING_ERROR_REQ_MIN_BASELINE_VALUE,
-    )
-    a["point_count"] = len(pts)
-    a["merged_points"] = [[t, v] for t, v in pts]
-    a["label"] = label
-    return a
+    min_peak = _error_req_min_spike_for_label(label)
+    return _error_req_absolute_spike_analysis(pts, label=label, min_peak=min_peak)
 
 
 def _analysis_for_error_req_series(
@@ -8443,8 +8504,9 @@ def _analysis_for_error_req_series(
 
 def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    ``错误请求数/1m``: spike vs **median baseline** per series; alert if **any** series spikes.
-    Default: all panel series except ``MONITORING_ERROR_REQ_EXCLUDE`` (AND match on pipe-parts).
+    ``错误请求数/1m``: alert when **any** series rises minute-to-minute to its
+    per-series absolute min peak (e.g. 40→45). Default: all panel series except
+    ``MONITORING_ERROR_REQ_EXCLUDE`` (AND match on pipe-parts).
     """
     entries: List[Dict[str, Any]] = []
     total_pts = 0
@@ -8481,7 +8543,7 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "hit_alert": any(bool(e.get("spiked")) for e in entries),
         "dual_spike_required": False,
-        "alert_rule": "baseline_median_any_series",
+        "alert_rule": "absolute_peak_any_series",
         "series_entries": entries,
         "fast_threshold_pct": MONITORING_ERROR_REQ_ALERT_PCT,
         "continuous_threshold_pct": MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT,
@@ -8578,13 +8640,25 @@ def _format_spike_drop_alert_block(
     )
 
 
+def _format_error_req_spike_alert_block(
+    graph_label: str,
+    series_label: str,
+    peak_ts: Any,
+    peak_val: Any,
+) -> str:
+    return (
+        f"📈 {graph_label} — {series_label} SPIKE\n"
+        f"{_fmt_ts_short(peak_ts)} reached {_fmt_num(peak_val)} value"
+    )
+
+
 def _format_error_req_trigger_lines(
     analysis: Dict[str, Any],
     fast_threshold_pct: float,
     continuous_threshold_pct: float,
     window_seconds: int,
 ) -> List[str]:
-    del window_seconds  # per-series blocks only; window already reflected in analysis
+    del fast_threshold_pct, continuous_threshold_pct, window_seconds
     if not bool(analysis.get("hit_alert")):
         return []
     spiked = [
@@ -8597,14 +8671,13 @@ def _format_error_req_trigger_lines(
     for ent in spiked:
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         lbl = str(ent.get("label") or sub.get("label") or "series")
-        picked = _pick_alert_spike_drop_event(
-            sub, fast_threshold_pct, continuous_threshold_pct, spike_only=True
-        )
+        min_peak = float(ent.get("min_spike") or _error_req_min_spike_for_label(lbl))
+        picked = _pick_error_req_spike_event(sub, min_peak)
         if picked:
-            direction, from_val, to_val, from_ts, to_ts = picked
+            peak_ts, peak_val = picked
             blocks.append(
-                _format_spike_drop_alert_block(
-                    GRAFANA_PANEL_TITLE_ERROR_REQ, lbl, direction, from_val, to_val, from_ts, to_ts
+                _format_error_req_spike_alert_block(
+                    GRAFANA_PANEL_TITLE_ERROR_REQ, lbl, peak_ts, peak_val
                 )
             )
     return blocks
@@ -8613,17 +8686,14 @@ def _format_error_req_trigger_lines(
 def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
     if MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS:
         return []
-    fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_ERROR_REQ_ALERT_PCT)
-    cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT)
-    win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
     entries = [
         e for e in (analysis.get("series_entries") or []) if isinstance(e, dict)
     ]
     lines: List[str] = [
         "",
-        f"[Error req] spike vs median baseline — alert if any series exceeds baseline by "
-        f">{fast_thr:g}% (fast {win_sec//60}m) or >{cont_thr:g}% (continuous) "
-        f"and peak >= per-series min (default {MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min); "
+        f"[Error req] alert when any series **increases** to its per-series min peak "
+        f"(default {MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min); "
+        f"decreases and sub-threshold spikes are ignored; "
         f"excludes {_error_req_exclude_summary()}",
     ]
     if _error_req_all_series_mode() and entries:
@@ -8635,31 +8705,22 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
     for ent in entries:
         lbl = str(ent.get("label") or "series")
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
-        base = sub.get("baseline_median")
         spiked = bool(ent.get("spiked"))
         min_spike = float(ent.get("min_spike") or _error_req_min_spike_for_label(lbl))
-        pct_spike = _series_analysis_has_spike(sub, fast_thr, cont_thr)
-        meta: List[str] = []
-        if base is not None:
-            meta.append(f"median baseline {_fmt_num(base)}")
-        if min_spike != MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:
-            meta.append(f"min peak {min_spike:g}")
+        meta: List[str] = [f"min peak {min_spike:g}"]
         lines.append(
             f"  {lbl}: spike={'yes' if spiked else 'no'}"
             + (f" ({', '.join(meta)})" if meta else "")
         )
-        ws = sub.get("window_max_spike")
-        cs = sub.get("consecutive_max_spike")
-        lines.append(
-            f"    within {win_sec//60}m vs baseline: +{(ws or {}).get('pct', 'n/a')}% / "
-            f"continuous +{(cs or {}).get('pct', 'n/a')}%"
-        )
-        if pct_spike and not spiked:
-            peak = max(_error_req_spike_peak_value(ws), _error_req_spike_peak_value(cs))
+        peak_ev = sub.get("peak_spike") if isinstance(sub.get("peak_spike"), dict) else {}
+        if peak_ev:
             lines.append(
-                f"    (suppressed: peak {_fmt_num(peak)} < min "
-                f"{_fmt_num(min_spike)} errors/min)"
+                f"    last qualifying rise: {_fmt_ts_short(peak_ev.get('from_ts'))} "
+                f"{_fmt_num(peak_ev.get('from_val'))} → {_fmt_ts_short(peak_ev.get('to_ts'))} "
+                f"{_fmt_num(peak_ev.get('to_val'))}"
             )
+        elif not spiked:
+            lines.append("    (no upward rise to min peak in window)")
     return lines
 
 
