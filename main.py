@@ -91,6 +91,7 @@ _CFG: Dict[str, Any] = {
         "fpms-nt-ali-prod-promotion-rollout|GetRemainingChances=25;"
         "fpms-nt-ali-prod-promotion-rollout|ClaimPlayerPalayokBlast=25;"
         "fpms-nt-ali-prod-promotion-rollout|CheckAndCreateMission=25;"
+        "fpms-nt-ali-prod-promotion-rollout|GetRecentMilyonaryoWinners=45;"
         "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=20;"
         "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=25;"
         "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=45;"
