@@ -125,7 +125,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_GAMES_GENERAL_SERIES_KEYWORD": "1492288",
     "GRAFANA_PANEL_TITLE_GAMES_INHOUSE": "IGO Distributions of Games（Inhouse）",
     "MONITORING_GAMES_INHOUSE_SERIES_KEYWORD": "6005",
-    "GRAFANA_DASHBOARD_FROM": "now-30m",
+    "GRAFANA_DASHBOARD_FROM": "now-1h",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 900,
@@ -328,20 +328,25 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_CONFIRM_SECONDS": "60",
     # Watchdog 判警是否使用与 /monitoring 相同的拉数窗口（默认 0：窄窗口 eval；设为 1 则与报表一致，避免「报表有大波动但自动告警未扫到」）
     "MONITORING_WATCH_MATCH_REPORT_WINDOW": "0",
-    # Watchdog 告警截图：1=与告警判窗 payload.window 对齐（推荐）；0=用下面相对时间
-    "MONITORING_WATCH_SCREENSHOT_MATCH_EVAL": "1",
-    # 判窗对齐时，截图范围在 eval 窗口两侧各扩 N 分钟（便于看图）
+    # Watchdog 告警截图：0=用下面相对时间（默认 1h）；1=与告警判窗 payload.window 对齐
+    "MONITORING_WATCH_SCREENSHOT_MATCH_EVAL": "0",
+    # 判窗对齐时，截图范围在 eval 窗口两侧各扩 N 分钟（``MATCH_EVAL=1`` 时生效）
     "MONITORING_WATCH_SCREENSHOT_PADDING_MINUTES": "3",
     # ``MATCH_EVAL=0`` 时生效
-    "MONITORING_WATCH_SCREENSHOT_FROM": "now-15m",
+    "MONITORING_WATCH_SCREENSHOT_FROM": "now-1h",
     "MONITORING_WATCH_SCREENSHOT_TO": "now",
     "MONITORING_WATCH_SCREENSHOT_TIMEZONE": "browser",
-    # 每日静默：该时段内不拉数、不判警（默认 23:59:00～次日 00:10:00 前一刻，跨午夜；本地机器时间）
+    # 每日静默：该时段内不拉数、不判警（本地机器时间；可配两段）
     "MONITORING_WATCH_QUIET_WINDOW_ENABLE": "1",
-    "MONITORING_WATCH_QUIET_START_HOUR": "23",
+    "MONITORING_WATCH_QUIET_START_HOUR": "19",
     "MONITORING_WATCH_QUIET_START_MINUTE": "59",
-    "MONITORING_WATCH_QUIET_END_HOUR": "0",
-    "MONITORING_WATCH_QUIET_END_MINUTE": "10",
+    "MONITORING_WATCH_QUIET_END_HOUR": "20",
+    "MONITORING_WATCH_QUIET_END_MINUTE": "16",
+    "MONITORING_WATCH_QUIET2_ENABLE": "1",
+    "MONITORING_WATCH_QUIET2_START_HOUR": "0",
+    "MONITORING_WATCH_QUIET2_START_MINUTE": "0",
+    "MONITORING_WATCH_QUIET2_END_HOUR": "0",
+    "MONITORING_WATCH_QUIET2_END_MINUTE": "16",
     # Tag person（0=临时关闭告警与 /mo 文末 @；恢复时改回 1）
     "MONITORING_ALERT_AT_USER_ENABLE": "0",
     "TARGET_USER_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
@@ -824,8 +829,8 @@ GRAFANA_PANEL_TITLE_GAMES_INHOUSE = _cfg_str(
 MONITORING_GAMES_INHOUSE_SERIES_KEYWORD = _cfg_str(
     "MONITORING_GAMES_INHOUSE_SERIES_KEYWORD", "6005"
 ).strip()
-# Browser URL time range for screenshots (default last 30 minutes, aligned with /monitoring tables).
-GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-30m")
+# Browser URL time range for screenshots (default last 1 hour).
+GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-1h")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 # Prometheus query_range step (seconds); 60 → up to 15 buckets in 15m when lookback=900
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
@@ -3683,37 +3688,75 @@ def fetch_request_total_1m_series(
     )
 
 
-def _monitoring_watch_daily_quiet_tod_bounds() -> Tuple[int, int]:
+def _monitoring_watch_quiet_tod_interval(
+    start_hour: int, start_minute: int, end_hour: int, end_minute: int
+) -> Tuple[int, int]:
+    sh = max(0, min(23, int(start_hour)))
+    sm = max(0, min(59, int(start_minute)))
+    eh = max(0, min(23, int(end_hour)))
+    em = max(0, min(59, int(end_minute)))
+    return sh * 3600 + sm * 60, eh * 3600 + em * 60
+
+
+def _monitoring_watch_daily_quiet_intervals() -> List[Tuple[int, int]]:
     """
-    Local-time quiet window as (start_tod_seconds, end_tod_seconds) with **end exclusive**:
-    quiet when ``tod >= start`` OR ``tod < end`` (handles wrap past midnight).
-    Default: [23:59:00, 00:10:00) → about 11 minutes.
-    Returns ``(-1, -1)`` when ``MONITORING_WATCH_QUIET_WINDOW_ENABLE=0``.
+    Local-time quiet windows as ``(start_tod_seconds, end_tod_seconds)`` with **end exclusive**.
+    Returns empty when ``MONITORING_WATCH_QUIET_WINDOW_ENABLE=0``.
     """
     if not _lark_env_truthy("MONITORING_WATCH_QUIET_WINDOW_ENABLE"):
-        return -1, -1
-    sh = max(0, min(23, _cfg_int("MONITORING_WATCH_QUIET_START_HOUR", 23)))
-    sm = max(0, min(59, _cfg_int("MONITORING_WATCH_QUIET_START_MINUTE", 59)))
-    eh = max(0, min(23, _cfg_int("MONITORING_WATCH_QUIET_END_HOUR", 0)))
-    em = max(0, min(59, _cfg_int("MONITORING_WATCH_QUIET_END_MINUTE", 10)))
-    start_sec = sh * 3600 + sm * 60
-    end_sec = eh * 3600 + em * 60
-    return start_sec, end_sec
+        return []
+    intervals: List[Tuple[int, int]] = [
+        _monitoring_watch_quiet_tod_interval(
+            _cfg_int("MONITORING_WATCH_QUIET_START_HOUR", 19),
+            _cfg_int("MONITORING_WATCH_QUIET_START_MINUTE", 59),
+            _cfg_int("MONITORING_WATCH_QUIET_END_HOUR", 20),
+            _cfg_int("MONITORING_WATCH_QUIET_END_MINUTE", 16),
+        )
+    ]
+    if _lark_env_truthy("MONITORING_WATCH_QUIET2_ENABLE"):
+        intervals.append(
+            _monitoring_watch_quiet_tod_interval(
+                _cfg_int("MONITORING_WATCH_QUIET2_START_HOUR", 0),
+                _cfg_int("MONITORING_WATCH_QUIET2_START_MINUTE", 0),
+                _cfg_int("MONITORING_WATCH_QUIET2_END_HOUR", 0),
+                _cfg_int("MONITORING_WATCH_QUIET2_END_MINUTE", 16),
+            )
+        )
+    return intervals
 
 
-def _monitoring_watch_in_daily_quiet_local(now: Optional[float] = None) -> bool:
-    """True if current **local** time lies in the configured daily quiet window."""
-    start_sec, end_sec = _monitoring_watch_daily_quiet_tod_bounds()
-    if start_sec < 0:
-        return False
-    t = time.time() if now is None else float(now)
-    lt = time.localtime(t)
-    tod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+def _monitoring_watch_tod_in_quiet_interval(tod: int, start_sec: int, end_sec: int) -> bool:
     if start_sec < end_sec:
         return start_sec <= tod < end_sec
     if start_sec == end_sec:
         return False
     return tod >= start_sec or tod < end_sec
+
+
+def _monitoring_watch_daily_quiet_tod_bounds() -> Tuple[int, int]:
+    """
+    Legacy single-window helper — returns the first configured interval.
+    Default: [19:59:00, 20:16:00) → 7:59pm–8:15pm daily (end exclusive).
+    Returns ``(-1, -1)`` when quiet windows are disabled.
+    """
+    intervals = _monitoring_watch_daily_quiet_intervals()
+    if not intervals:
+        return -1, -1
+    return intervals[0]
+
+
+def _monitoring_watch_in_daily_quiet_local(now: Optional[float] = None) -> bool:
+    """True if current **local** time lies in any configured daily quiet window."""
+    intervals = _monitoring_watch_daily_quiet_intervals()
+    if not intervals:
+        return False
+    t = time.time() if now is None else float(now)
+    lt = time.localtime(t)
+    tod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+    return any(
+        _monitoring_watch_tod_in_quiet_interval(tod, start_sec, end_sec)
+        for start_sec, end_sec in intervals
+    )
 
 
 def _monitoring_watch_eval_window_unix(now: Optional[float] = None) -> Tuple[int, int]:
@@ -5607,7 +5650,7 @@ def _grafana_build_screenshot_dashboard_url(
     rt_ov = (relative_to or "").strip()
     force_relative = bool(rf_ov or rt_ov)
     if GRAFANA_SCREENSHOT_RELATIVE_RANGE or force_relative:
-        rf = rf_ov or (GRAFANA_DASHBOARD_FROM or "now-15m").strip()
+        rf = rf_ov or (GRAFANA_DASHBOARD_FROM or "now-1h").strip()
         rt = rt_ov or (GRAFANA_DASHBOARD_TO or "now").strip()
         params.extend([("from", rf), ("to", rt)])
     else:
@@ -5710,7 +5753,7 @@ def _grafana_build_solo_panel_url(
         ("orgId", "1"),
         ("panelId", str(int(panel_id))),
     ]
-    rf = (relative_from or "").strip() or (GRAFANA_DASHBOARD_FROM or "now-15m").strip()
+    rf = (relative_from or "").strip() or (GRAFANA_DASHBOARD_FROM or "now-1h").strip()
     rt = (relative_to or "").strip() or (GRAFANA_DASHBOARD_TO or "now").strip()
     params.extend([("from", rf), ("to", rt)])
     tz = (timezone_param or "").strip()
@@ -6740,7 +6783,7 @@ def _grafana_watchdog_alert_screenshot_time_range(
                 str((su - pad * 60) * 1000),
                 str((eu + pad * 60) * 1000),
             )
-    rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-15m").strip() or "now-15m"
+    rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-1h").strip() or "now-1h"
     rt = _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip() or "now"
     return rf, rt
 
@@ -6849,11 +6892,86 @@ def _grafana_playwright_chart_ymax_approx(page: Any) -> float:
         return 0.0
 
 
+def _panel_payload_for_monitor_kind(payload: Dict[str, Any], kind: str) -> Optional[Dict[str, Any]]:
+    """Primary ``http`` panel uses root payload; others use ``extraPanels``."""
+    if (kind or "").strip() == "http":
+        return payload
+    for ex in payload.get("extraPanels") or []:
+        if not isinstance(ex, dict) or (ex.get("kind") or "").strip() != (kind or "").strip():
+            continue
+        p2 = ex.get("payload")
+        return p2 if isinstance(p2, dict) else None
+    return None
+
+
+def _grafana_panel_legend_labels_for_payload(
+    panel_payload: Dict[str, Any],
+    *,
+    keyword: Optional[str] = None,
+    http_only: bool = False,
+) -> List[str]:
+    """Grafana legend label(s) for rows matching ``keyword`` or HTTP legs."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    kw = (keyword or "").strip()
+    for s in panel_payload.get("series") or []:
+        lg = str(s.get("legendFormat") or "").strip()
+        prom = s.get("prometheus") if isinstance(s.get("prometheus"), dict) else {}
+        pdata = prom.get("data") if isinstance(prom.get("data"), dict) else {}
+        for r in pdata.get("result") or []:
+            md = r.get("metric") if isinstance(r.get("metric"), dict) else {}
+            pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
+            if not pts:
+                continue
+            if http_only:
+                if not _metric_series_is_http_leg(md):
+                    continue
+                lbl = _compact_http_legend(md, lg or "http")
+            elif kw:
+                if not (
+                    _series_row_exact_keyword_id(kw, lg, md)
+                    or _keyword_matches_series_labels(kw, lg, md)
+                ):
+                    continue
+                if lg and "{{" not in lg:
+                    lbl = lg
+                else:
+                    lbl = str(md.get("series") or md.get("name") or "").strip()
+                    if not lbl:
+                        lbl = " ".join(
+                            str(v) for v in md.values() if v is not None and str(v).strip()
+                        ).strip()
+            else:
+                continue
+            lbl = (lbl or "").strip()
+            if lbl and lbl not in seen:
+                seen.add(lbl)
+                out.append(lbl)
+    return out
+
+
+def _grafana_alert_panel_specs() -> List[Tuple[str, str, str, Any, bool]]:
+    """``(kind, panel_title, keyword, analyzer, http_only)`` for alert screenshot isolation."""
+    return [
+        ("http", GRAFANA_PANEL_TITLE, "", _http_analysis_for_payload, True),
+        ("9280_push", GRAFANA_PANEL_TITLE_9280, MONITORING_9280_SERIES_KEYWORD, _analysis_for_9280_payload, False),
+        ("deposit", GRAFANA_PANEL_TITLE_DEPOSIT, MONITORING_DEPOSIT_SERIES_KEYWORD, _analysis_for_deposit_payload, False),
+        ("withdraw", GRAFANA_PANEL_TITLE_WITHDRAW, MONITORING_WITHDRAW_SERIES_KEYWORD, _analysis_for_withdraw_payload, False),
+        ("fpms_nt_login", GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN, MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD, _analysis_for_fpms_nt_login_payload, False),
+        ("provider_jili", GRAFANA_PANEL_TITLE_PROVIDER_JILI, MONITORING_PROVIDER_JILI_SERIES_KEYWORD, _analysis_for_provider_jili_payload, False),
+        ("provider_general", GRAFANA_PANEL_TITLE_PROVIDER_GENERAL, MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD, _analysis_for_provider_general_payload, False),
+        ("provider_inhouse", GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE, MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD, _analysis_for_provider_inhouse_payload, False),
+        ("games_jili", GRAFANA_PANEL_TITLE_GAMES_JILI, MONITORING_GAMES_JILI_SERIES_KEYWORD, _analysis_for_games_jili_payload, False),
+        ("games_general", GRAFANA_PANEL_TITLE_GAMES_GENERAL, MONITORING_GAMES_GENERAL_SERIES_KEYWORD, _analysis_for_games_general_payload, False),
+        ("games_inhouse", GRAFANA_PANEL_TITLE_GAMES_INHOUSE, MONITORING_GAMES_INHOUSE_SERIES_KEYWORD, _analysis_for_games_inhouse_payload, False),
+    ]
+
+
 def _grafana_alert_isolate_series_labels(
     panel_title: str,
     payload: Optional[Dict[str, Any]],
 ) -> List[str]:
-    """Legend label(s) to show alone on alert solo screenshots for ``panel_title``."""
+    """Legend label(s) to Ctrl/Cmd+click before alert solo screenshots."""
     if not GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES or not isinstance(payload, dict):
         return []
     title = (panel_title or "").strip()
@@ -6862,33 +6980,25 @@ def _grafana_alert_isolate_series_labels(
     if title == GRAFANA_PANEL_TITLE_ERROR_REQ:
         return _error_req_spiked_series_labels_from_payload(payload)
     _mute_purge_expired()
-    panel_specs: List[Tuple[str, str, str, Any]] = [
-        ("9280_push", GRAFANA_PANEL_TITLE_9280, MONITORING_9280_SERIES_KEYWORD, _analysis_for_9280_payload),
-        ("deposit", GRAFANA_PANEL_TITLE_DEPOSIT, MONITORING_DEPOSIT_SERIES_KEYWORD, _analysis_for_deposit_payload),
-        ("withdraw", GRAFANA_PANEL_TITLE_WITHDRAW, MONITORING_WITHDRAW_SERIES_KEYWORD, _analysis_for_withdraw_payload),
-        ("fpms_nt_login", GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN, MONITORING_FPMS_NT_LOGIN_SERIES_KEYWORD, _analysis_for_fpms_nt_login_payload),
-        ("provider_jili", GRAFANA_PANEL_TITLE_PROVIDER_JILI, MONITORING_PROVIDER_JILI_SERIES_KEYWORD, _analysis_for_provider_jili_payload),
-        ("provider_general", GRAFANA_PANEL_TITLE_PROVIDER_GENERAL, MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD, _analysis_for_provider_general_payload),
-        ("provider_inhouse", GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE, MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD, _analysis_for_provider_inhouse_payload),
-        ("games_jili", GRAFANA_PANEL_TITLE_GAMES_JILI, MONITORING_GAMES_JILI_SERIES_KEYWORD, _analysis_for_games_jili_payload),
-        ("games_general", GRAFANA_PANEL_TITLE_GAMES_GENERAL, MONITORING_GAMES_GENERAL_SERIES_KEYWORD, _analysis_for_games_general_payload),
-        ("games_inhouse", GRAFANA_PANEL_TITLE_GAMES_INHOUSE, MONITORING_GAMES_INHOUSE_SERIES_KEYWORD, _analysis_for_games_inhouse_payload),
-    ]
-    for kind, g_title, keyword, analyzer in panel_specs:
+    for kind, g_title, keyword, analyzer, http_only in _grafana_alert_panel_specs():
         if title != g_title:
             continue
         if _monitoring_alert_channel_muted(kind):
             return []
-        kw = (keyword or "").strip()
-        if not kw:
+        p2 = _panel_payload_for_monitor_kind(payload, kind)
+        if not isinstance(p2, dict):
             return []
-        for ex in payload.get("extraPanels") or []:
-            if not isinstance(ex, dict) or (ex.get("kind") or "").strip() != kind:
-                continue
-            p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-            if bool(analyzer(p2).get("hit_alert")):
-                return [kw]
-        return []
+        if not bool(analyzer(p2).get("hit_alert")):
+            return []
+        labels = _grafana_panel_legend_labels_for_payload(
+            p2, keyword=keyword or None, http_only=http_only
+        )
+        if labels:
+            return labels
+        kw = (keyword or "").strip()
+        if http_only:
+            return ["http"]
+        return [kw] if kw else []
     return []
 
 
@@ -6903,7 +7013,7 @@ def _grafana_build_alert_screenshot_jobs(
 ) -> List[Dict[str, Any]]:
     """
     Solo alert capture jobs. When ``GRAFANA_SCREENSHOT_ALERT_ISOLATE_SERIES=1``, each alerting
-    panel gets ``isolate_series`` set (error_req: one job per spiked series; others: keyword).
+    panel gets ``isolate_series`` set (error_req: one job per spiked series; others: legend match).
     """
     solo_caps = _grafana_resolve_alert_solo_captures(
         session,
