@@ -84,19 +84,19 @@ _CFG: Dict[str, Any] = {
     ),
     "MONITORING_ERROR_REQ_MIN_BASELINE_VALUE": "0",
     # Spike peak (errors/min) must reach this absolute level to alert — suppresses low-volume noise.
-    "MONITORING_ERROR_REQ_MIN_SPIKE_VALUE": "100",
-    # Per-series min spike overrides: ``pattern=100``; ``|`` = all parts must match legend; ``;`` = next rule.
+    "MONITORING_ERROR_REQ_MIN_SPIKE_VALUE": "150",
+    # Per-series min spike overrides: ``pattern=150``; ``|`` = all parts must match legend; ``;`` = next rule.
     "MONITORING_ERROR_REQ_SERIES_MIN_SPIKE": (
-        "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=100;"
-        "fpms-nt-ali-prod-promotion-rollout|GetRemainingChances=100;"
-        "fpms-nt-ali-prod-promotion-rollout|ClaimPlayerPalayokBlast=100;"
-        "fpms-nt-ali-prod-promotion-rollout|CheckAndCreateMission=100;"
-        "fpms-nt-ali-prod-promotion-rollout|GetRecentMilyonaryoWinners=100;"
-        "fpms-nt-ali-prod-promotion-rollout|AcknowledgeJackpotWin=100;"
-        "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=100;"
-        "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=100;"
-        "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=100;"
-        "igo-prod-ali-igo-sw-internal|POST /fpms/request=100"
+        "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=150;"
+        "fpms-nt-ali-prod-promotion-rollout|GetRemainingChances=150;"
+        "fpms-nt-ali-prod-promotion-rollout|ClaimPlayerPalayokBlast=150;"
+        "fpms-nt-ali-prod-promotion-rollout|CheckAndCreateMission=150;"
+        "fpms-nt-ali-prod-promotion-rollout|GetRecentMilyonaryoWinners=150;"
+        "fpms-nt-ali-prod-promotion-rollout|AcknowledgeJackpotWin=150;"
+        "igo-sw-http-main-apisix-pp-hypergrid|POST /refund=150;"
+        "igo-sw-general-prod-ali-igo-sw-cluster-route|POST /=150;"
+        "igo-sw-jili-prod-ali-igo-sw-cluster-route|POST /=150;"
+        "igo-prod-ali-igo-sw-internal|POST /fpms/request=150"
     ),
     # Per-series continuous spike % overrides (default ``MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT``).
     "MONITORING_ERROR_REQ_SERIES_CONTINUOUS_PCT": (
@@ -587,7 +587,7 @@ MONITORING_ERROR_REQ_MIN_BASELINE_VALUE = max(
     0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_BASELINE_VALUE", 0.0)
 )
 MONITORING_ERROR_REQ_MIN_SPIKE_VALUE = max(
-    0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_SPIKE_VALUE", 100.0)
+    0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_SPIKE_VALUE", 150.0)
 )
 
 
