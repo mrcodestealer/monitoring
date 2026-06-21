@@ -6723,17 +6723,12 @@ def _grafana_playwright_legend_scroll_to_label(page: Any, want_label: str, *, ma
         page.wait_for_timeout(80)
 
 
-def _grafana_playwright_isolate_legend_series_in_page(page: Any, series_label: str) -> bool:
-    """
-    In-page legend isolate for Grafana table legends (Games/Provider panels).
-    Scrolls the legend, double-clicks the target, then hides every other visible row.
-    """
-    want = (series_label or "").strip()
-    if not want:
-        return False
+def _grafana_playwright_legend_rows_scan_all(page: Any, want_label: str) -> Dict[str, Any]:
+    """Read-only full legend scan (scroll entire list). Returns target coords + visible rows."""
+    want = (want_label or "").strip()
     exact_only = _grafana_want_legend_exact_only(want)
     try:
-        result = page.evaluate(
+        raw = page.evaluate(
             """({ want, exactOnly }) => {
               const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
               const wantN = norm(want).toLowerCase();
@@ -6762,22 +6757,17 @@ def _grafana_playwright_isolate_legend_series_in_page(page: Any, series_label: s
               };
               const clickTarget = (el) => (
                 el.querySelector(
-                  'button,[role="button"],td:first-child,[class*="SeriesIcon"],[class*="legend-color"],a'
+                  'button,[role="button"],td:first-child,[class*="SeriesIcon"],[class*="legend-color"],a,span'
                 ) || el
               );
               const isHidden = (el) => {
                 const cls = (el.className || '') + ' ' + ((el.closest('tr') || {}).className || '');
-                if (/inactive|disabled|unchecked|hidden|excluded/i.test(cls)) return true;
+                if (/inactive|disabled|unchecked|hidden|excluded|series-hidden/i.test(cls)) return true;
                 const st = window.getComputedStyle(el);
                 if (parseFloat(st.opacity) < 0.35) return true;
+                const deco = String(st.textDecorationLine || st.textDecoration || '');
+                if (deco.includes('line-through')) return true;
                 return false;
-              };
-              const scroller = () => {
-                const leg = document.querySelector(
-                  '[data-testid="viz-legend"], .viz-legend, section[aria-label="Legend"]'
-                );
-                if (!leg) return null;
-                return leg.querySelector('[class*="scrollbar-view"], [style*="overflow"]') || leg;
               };
               const collectRows = () => {
                 const out = [];
@@ -6794,216 +6784,398 @@ def _grafana_playwright_isolate_legend_series_in_page(page: Any, series_label: s
                     const tgt = clickTarget(el);
                     const r = tgt.getBoundingClientRect();
                     if (r.width < 2 || r.height < 2) return;
-                    out.push({ text, tgt, hidden: isHidden(el) });
+                    out.push({
+                      text,
+                      x: r.left + r.width / 2,
+                      y: r.top + r.height / 2,
+                      hidden: isHidden(el),
+                    });
                   });
                 }
                 return out;
               };
-              const visibleCount = () => collectRows().filter((r) => !r.hidden).length;
-              const findTarget = () => collectRows().find((r) => matches(r.text));
-
-              let sc = scroller();
-              let target = findTarget();
-              if (!target && sc) {
+              const scroller = () => {
+                const leg = document.querySelector(
+                  '[data-testid="viz-legend"], .viz-legend, section[aria-label="Legend"]'
+                );
+                if (!leg) return null;
+                return leg.querySelector('[class*="scrollbar-view"], [style*="overflow"]') || leg;
+              };
+              const byKey = new Map();
+              const snap = () => {
+                collectRows().forEach((r) => {
+                  const k = r.text.toLowerCase();
+                  if (!byKey.has(k)) byKey.set(k, r);
+                });
+              };
+              const sc = scroller();
+              if (sc) sc.scrollTop = 0;
+              snap();
+              if (sc) {
+                for (let i = 0; i < 120; i++) {
+                  sc.scrollTop += 64;
+                  snap();
+                }
                 sc.scrollTop = 0;
-                for (let i = 0; i < 80 && !target; i++) {
-                  target = findTarget();
-                  if (target) break;
+                snap();
+                for (let i = 0; i < 120; i++) {
+                  snap();
                   sc.scrollTop += 64;
                 }
+              } else {
+                snap();
               }
-              if (!target) {
-                return { ok: false, reason: 'not_found', sample: collectRows().slice(0, 12).map((r) => r.text) };
-              }
-              target.tgt.scrollIntoView({ block: 'center', inline: 'nearest' });
-              const fire = (type, extra) => {
-                target.tgt.dispatchEvent(new MouseEvent(type, Object.assign(
-                  { bubbles: true, cancelable: true, view: window }, extra || {}
-                )));
-              };
-              fire('dblclick');
-              if (visibleCount() > 1) {
-                fire('click', { ctrlKey: true, metaKey: true });
-              }
-              if (visibleCount() > 1) {
-                fire('click');
-                fire('click');
-              }
-              for (let pass = 0; pass < 4 && visibleCount() > 1; pass++) {
-                for (const row of collectRows()) {
-                  if (matches(row.text)) {
-                    if (row.hidden) row.tgt.click();
-                    continue;
-                  }
-                  if (!row.hidden) row.tgt.click();
-                }
-                if (visibleCount() <= 1) break;
-                if (!matches(findTarget()?.text || '')) {
-                  const t2 = findTarget();
-                  if (t2) t2.tgt.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));
-                }
-              }
-              const vis = collectRows().filter((r) => !r.hidden);
-              const ok = vis.length === 1 && matches(vis[0].text);
+              const rows = [...byKey.values()];
+              const target = rows.find((r) => matches(r.text)) || null;
+              const visible = rows.filter((r) => !r.hidden);
               return {
-                ok,
-                method: 'in_page',
-                visible: vis.map((r) => r.text),
-                target: target.text,
+                target,
+                visible,
+                rows,
+                allTexts: rows.map((r) => r.text),
               };
             }""",
             {"want": want, "exactOnly": exact_only},
         )
-        if isinstance(result, dict) and result.get("ok"):
-            logger.info(
-                "Grafana screenshot: in-page legend isolate ok want=%r target=%r visible=%s",
-                want[:100],
-                str(result.get("target") or "")[:120],
-                result.get("visible"),
-            )
-            return True
-        if isinstance(result, dict):
-            logger.warning(
-                "Grafana screenshot: in-page legend isolate failed want=%r reason=%s sample=%s visible=%s",
-                want[:100],
-                result.get("reason"),
-                result.get("sample"),
-                result.get("visible"),
-            )
+        return raw if isinstance(raw, dict) else {}
     except Exception as e:
-        logger.warning("Grafana screenshot: in-page legend isolate error want=%r: %s", want[:80], e)
-    return False
+        logger.warning("Grafana screenshot: legend scan failed want=%r: %s", want[:80], e)
+        return {}
 
 
-def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> bool:
+def _grafana_playwright_legend_row_click_coords(
+    page: Any, row_text: str, *, scroll_from_top: bool = True
+) -> Optional[Dict[str, Any]]:
     """
-    Show only ``series_label`` on the solo panel chart.
+    Scroll the legend until ``row_text`` is visible and return **fresh** click coordinates.
 
-    Grafana table legends (Games/Provider panels with many series): **double-click** isolates;
-    single-click only toggles visibility. Scrolls the legend until the target row is found.
+    Coordinates from :func:`_grafana_playwright_legend_rows_scan_all` go stale once the scroller
+    moves — always use this immediately before ``page.mouse.click`` / ``dblclick``.
     """
-    want = (series_label or "").strip()
+    want = (row_text or "").strip()
+    if not want:
+        return None
+    exact_only = _grafana_want_legend_exact_only(want)
+    try:
+        raw = page.evaluate(
+            """({ want, exactOnly, scrollFromTop }) => {
+              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
+              const wantN = norm(want).toLowerCase();
+              const matches = (text) => {
+                const tn = norm(text);
+                if (!tn) return false;
+                if (exactOnly) return tn.toLowerCase() === wantN;
+                if (tn.toLowerCase() === wantN) return true;
+                if (/^\\d+$/.test(want)) {
+                  const re = new RegExp('(^|[^0-9])' + want.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + '([^0-9]|$)');
+                  return re.test(tn);
+                }
+                return false;
+              };
+              const legendTextOf = (el) => {
+                const dt = el.getAttribute('data-testid') || '';
+                const m = dt.match(/VizLegend series\\s*(.*)$/i);
+                if (m && m[1]) return norm(m[1]);
+                const row = el.closest('tr');
+                if (row) {
+                  const cells = row.querySelectorAll('td');
+                  if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
+                  return norm(row.textContent || '');
+                }
+                return norm(el.textContent || el.getAttribute('title') || '');
+              };
+              const clickTarget = (el) => (
+                el.querySelector(
+                  'button,[role="button"],td:first-child,[class*="SeriesIcon"],[class*="legend-color"],a,span'
+                ) || el
+              );
+              const collectRows = () => {
+                const out = [];
+                const sels = [
+                  '[data-testid*="VizLegend series"]',
+                  'table.viz-legend tbody tr',
+                  '[data-testid="viz-legend"] tbody tr',
+                  '[data-testid="viz-legend"] [role="button"]',
+                ];
+                for (const sel of sels) {
+                  document.querySelectorAll(sel).forEach((el) => {
+                    const text = legendTextOf(el);
+                    if (!text || text === '-') return;
+                    const tgt = clickTarget(el);
+                    const r = tgt.getBoundingClientRect();
+                    if (r.width < 2 || r.height < 2) return;
+                    out.push({ text, x: r.left + r.width / 2, y: r.top + r.height / 2, el: tgt });
+                  });
+                }
+                return out;
+              };
+              const scroller = () => {
+                const leg = document.querySelector(
+                  '[data-testid="viz-legend"], .viz-legend, section[aria-label="Legend"]'
+                );
+                if (!leg) return null;
+                return leg.querySelector('[class*="scrollbar-view"], [style*="overflow"]') || leg;
+              };
+              const sc = scroller();
+              if (sc && scrollFromTop) sc.scrollTop = 0;
+              const maxSteps = sc ? 150 : 1;
+              for (let i = 0; i < maxSteps; i++) {
+                for (const row of collectRows()) {
+                  if (!matches(row.text)) continue;
+                  try { row.el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
+                  const r = row.el.getBoundingClientRect();
+                  if (r.width < 2 || r.height < 2) continue;
+                  return {
+                    text: row.text,
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2,
+                  };
+                }
+                if (!sc) break;
+                sc.scrollTop += 64;
+              }
+              return null;
+            }""",
+            {"want": want, "exactOnly": exact_only, "scrollFromTop": scroll_from_top},
+        )
+        if isinstance(raw, dict) and raw.get("x") is not None:
+            return raw
+    except Exception as e:
+        logger.warning(
+            "Grafana screenshot: legend row coords failed want=%r: %s", want[:80], e
+        )
+    return None
+
+
+def _grafana_playwright_legend_click_row_by_text(
+    page: Any, row_text: str, *, double: bool = False
+) -> bool:
+    """Scroll to ``row_text`` and click / double-click with fresh coordinates."""
+    coords = _grafana_playwright_legend_row_click_coords(page, row_text)
+    if not coords:
+        return False
+    x, y = float(coords["x"]), float(coords["y"])
+    if double:
+        page.mouse.dblclick(x, y)
+    else:
+        page.mouse.click(x, y)
+    _grafana_clear_text_selection(page)
+    return True
+
+
+def _grafana_playwright_legend_hide_all_except(
+    page: Any, want_label: str, all_texts: List[str]
+) -> bool:
+    """Single-click every other **visible** legend series (full list) to hide them."""
+    want = (want_label or "").strip()
     if not want:
         return False
     exact_only = _grafana_want_legend_exact_only(want)
-
-    def _after_isolate_wait() -> None:
-        page.wait_for_timeout(700)
-        _grafana_wait_loading_like_gone(page, min(3000, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)))
 
     def _legend_matches(text: str) -> bool:
         if exact_only:
             return _grafana_legend_labels_exact_equal(want, text)
         return _grafana_legend_text_matches_series(want, text)
 
-    target_txt = want
-    try:
-        if _grafana_playwright_isolate_legend_series_in_page(page, want):
-            _after_isolate_wait()
-            return True
+    scan = _grafana_playwright_legend_rows_scan_all(page, want)
+    rows = scan.get("rows") if isinstance(scan.get("rows"), list) else []
+    hidden_by_text: Dict[str, bool] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        txt = str(row.get("text") or "").strip()
+        if txt:
+            hidden_by_text[txt.casefold()] = bool(row.get("hidden"))
+    visible_now = {
+        v.casefold() for v in _grafana_playwright_legend_visible_labels(page) if str(v).strip()
+    }
 
-        _grafana_playwright_legend_scroll_to_label(page, want)
+    clicked = 0
+    for txt in all_texts:
+        label = str(txt or "").strip()
+        if not label or _legend_matches(label):
+            continue
+        key = label.casefold()
+        if hidden_by_text.get(key):
+            continue
+        if visible_now and key not in visible_now:
+            continue
+        if _grafana_playwright_legend_click_row_by_text(page, label, double=False):
+            clicked += 1
+            page.wait_for_timeout(60)
+    return clicked > 0
 
-        # Primary: double-click exact legend item (Grafana isolate on multi-series panels).
-        if _grafana_playwright_legend_click_exact(page, want, double=True):
-            _grafana_clear_text_selection(page)
-            _after_isolate_wait()
-            if _grafana_playwright_legend_isolate_verified(page, want):
-                logger.info(
-                    "Grafana screenshot: legend double-click isolate want=%r",
-                    want[:100],
-                )
-                return True
 
-        rows = _grafana_playwright_legend_rows_all(page)
-        if not rows:
-            logger.warning("Grafana screenshot: no legend rows for isolate %r", want[:100])
-            return False
-        targets = [r for r in rows if _legend_matches(str(r.get("text") or ""))]
-        if not targets:
-            _grafana_playwright_legend_scroll_to_label(page, want, max_rounds=60)
-            rows = _grafana_playwright_legend_rows_all(page)
-            targets = [r for r in rows if _legend_matches(str(r.get("text") or ""))]
-        if not targets:
-            logger.warning(
-                "Grafana screenshot: target legend not found want=%r legends=%s",
-                want[:100],
-                [str(r.get("text") or "")[:60] for r in rows[:15]],
+def _grafana_playwright_try_isolate_legend_series(
+    page: Any, candidates: List[str]
+) -> bool:
+    """Try each legend label candidate until one isolates successfully."""
+    seen: Set[str] = set()
+    for cand in candidates:
+        label = (cand or "").strip()
+        if not label:
+            continue
+        key = label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if _grafana_playwright_isolate_legend_via_mouse(page, label):
+            logger.info(
+                "Grafana screenshot: legend isolate ok candidate=%r", label[:100]
             )
-            return False
-        targets.sort(
-            key=lambda r: _grafana_legend_match_score(want, str(r.get("text") or "")),
-            reverse=True,
+            return True
+        logger.info(
+            "Grafana screenshot: legend isolate miss candidate=%r", label[:100]
         )
-        target = targets[0]
-        target_txt = str(target.get("text") or "")
+    return False
 
-        # Fallback 1: coordinate double-click on the matched legend row.
-        page.mouse.dblclick(float(target["x"]), float(target["y"]))
-        _grafana_clear_text_selection(page)
-        _after_isolate_wait()
+
+def _grafana_playwright_isolate_legend_via_mouse(page: Any, series_label: str) -> bool:
+    """
+    Isolate one legend series using **real** Playwright mouse / locator clicks (React-safe).
+    Falls back to hiding every other visible legend row one-by-one.
+    """
+    want = (series_label or "").strip()
+    if not want:
+        return False
+    exact_only = _grafana_want_legend_exact_only(want)
+
+    def _legend_matches(text: str) -> bool:
+        if exact_only:
+            return _grafana_legend_labels_exact_equal(want, text)
+        return _grafana_legend_text_matches_series(want, text)
+
+    def _after_isolate_wait() -> None:
+        page.wait_for_timeout(700)
+        _grafana_wait_loading_like_gone(page, min(3000, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)))
+
+    def _verified() -> bool:
         if _grafana_playwright_legend_isolate_verified(page, want):
-            logger.info(
-                "Grafana screenshot: legend isolate ok method=dblclick want=%r target=%r",
-                want[:100],
-                target_txt[:120],
-            )
             return True
+        vis = _grafana_playwright_legend_visible_labels(page)
+        matched = [v for v in vis if _legend_matches(v)]
+        return len(vis) == 1 and len(matched) == 1
 
-        # Fallback 2: single-click isolate (some Grafana builds).
-        page.mouse.click(float(target["x"]), float(target["y"]))
-        _grafana_clear_text_selection(page)
-        _after_isolate_wait()
-        if _grafana_playwright_legend_isolate_verified(page, want):
-            logger.info(
-                "Grafana screenshot: legend isolate ok method=click want=%r target=%r",
-                want[:100],
-                target_txt[:120],
-            )
-            return True
+    try:
+        _grafana_playwright_legend_scroll_to_label(page, want, max_rounds=100)
 
-        # Fallback 3: hide every other visible legend row, then show target only.
-        for _pass in range(3):
-            visible = _grafana_playwright_legend_visible_labels(page)
-            if len(visible) <= 1 and any(_legend_matches(v) for v in visible):
+        # 0) Fresh-coords dblclick (scan coords go stale after scrolling).
+        if _grafana_playwright_legend_click_row_by_text(page, want, double=True):
+            _after_isolate_wait()
+            if _verified():
                 logger.info(
-                    "Grafana screenshot: legend isolate ok method=hide-others want=%r",
-                    want[:100],
+                    "Grafana screenshot: fresh-coords dblclick isolate want=%r", want[:100]
                 )
                 return True
-            for row in _grafana_playwright_legend_rows_all(page):
-                txt = str(row.get("text") or "")
-                if not txt or _legend_matches(txt):
+
+        legend_root = page.locator(
+            '[data-testid="viz-legend"], .viz-legend, section[aria-label="Legend"]'
+        )
+
+        # 1) Playwright locators scoped to legend (real clicks — React-safe).
+        esc = re.escape(want)
+        locator_candidates = [
+            legend_root.locator(f'[data-testid="VizLegend series {want}"]'),
+            legend_root.locator('[data-testid*="VizLegend series"]').filter(
+                has_text=re.compile(rf"^{esc}$", re.I)
+            ),
+            legend_root.locator("table.viz-legend tbody tr").filter(
+                has_text=re.compile(rf"^{esc}$", re.I)
+            ),
+            legend_root.get_by_text(want, exact=True),
+        ]
+        for loc in locator_candidates:
+            try:
+                if loc.count() == 0:
                     continue
-                page.mouse.click(float(row["x"]), float(row["y"]))
-                page.wait_for_timeout(120)
-            _after_isolate_wait()
-            if _grafana_playwright_legend_isolate_verified(page, want):
-                logger.info(
-                    "Grafana screenshot: legend isolate ok method=hide-others-pass want=%r",
-                    want[:100],
-                )
-                return True
-            page.mouse.dblclick(float(target["x"]), float(target["y"]))
-            _grafana_clear_text_selection(page)
-            _after_isolate_wait()
-            if _grafana_playwright_legend_isolate_verified(page, want):
-                logger.info(
-                    "Grafana screenshot: legend isolate ok method=hide-others+dblclick want=%r",
-                    want[:100],
-                )
-                return True
+                el = loc.first
+                el.scroll_into_view_if_needed(timeout=8000)
+                el.dblclick(timeout=8000)
+                _grafana_clear_text_selection(page)
+                _after_isolate_wait()
+                if _verified():
+                    logger.info("Grafana screenshot: locator dblclick isolate want=%r", want[:100])
+                    return True
+                el.click(timeout=8000, modifiers=["Control"])
+                _grafana_clear_text_selection(page)
+                _after_isolate_wait()
+                if _verified():
+                    logger.info("Grafana screenshot: locator ctrl-click isolate want=%r", want[:100])
+                    return True
+            except Exception:
+                continue
 
-        visible = _grafana_playwright_legend_visible_labels(page)
+        # 2) Full legend scan — hide every other series, then dblclick target with fresh coords.
+        scan = _grafana_playwright_legend_rows_scan_all(page, want)
+        all_texts = scan.get("allTexts") if isinstance(scan.get("allTexts"), list) else []
+        target_txt = want
+        if isinstance(scan.get("target"), dict):
+            target_txt = str(scan.get("target", {}).get("text") or want)
+
+        if not all_texts:
+            logger.warning(
+                "Grafana screenshot: legend scan empty want=%r",
+                want[:100],
+            )
+        else:
+            if len(all_texts) > 1:
+                _grafana_playwright_legend_hide_all_except(page, want, all_texts)
+                _after_isolate_wait()
+            if _grafana_playwright_legend_click_row_by_text(page, want, double=True):
+                _after_isolate_wait()
+                if _verified():
+                    logger.info(
+                        "Grafana screenshot: hide-all+fresh-dblclick isolate want=%r target=%r",
+                        want[:100],
+                        target_txt[:120],
+                    )
+                    return True
+
+        # 3) Retry hide passes on whatever is still visible (virtualized legend safety net).
+        for hide_pass in range(4):
+            vis_labels = _grafana_playwright_legend_visible_labels(page)
+            if len(vis_labels) == 1 and any(_legend_matches(v) for v in vis_labels):
+                logger.info(
+                    "Grafana screenshot: hide-others isolate ok want=%r pass=%s",
+                    want[:100],
+                    hide_pass,
+                )
+                return True
+            scan2 = _grafana_playwright_legend_rows_scan_all(page, want)
+            texts2 = scan2.get("allTexts") if isinstance(scan2.get("allTexts"), list) else vis_labels
+            if not _grafana_playwright_legend_hide_all_except(page, want, texts2):
+                break
+            _after_isolate_wait()
+            if _grafana_playwright_legend_click_row_by_text(page, want, double=True):
+                _after_isolate_wait()
+                if _verified():
+                    logger.info(
+                        "Grafana screenshot: hide-others+dblclick isolate want=%r pass=%s",
+                        want[:100],
+                        hide_pass,
+                    )
+                    return True
+
         logger.warning(
-            "Grafana screenshot: legend isolate verify failed want=%r target=%r visible=%s",
+            "Grafana screenshot: mouse isolate failed want=%r target=%r visible=%s legend_count=%s",
             want[:100],
             target_txt[:120],
-            [v[:60] for v in visible[:12]],
+            _grafana_playwright_legend_visible_labels(page)[:12],
+            len(all_texts),
         )
     except Exception as e:
-        logger.warning("Grafana screenshot: legend isolate failed series=%r: %s", want[:80], e)
+        logger.warning("Grafana screenshot: mouse isolate error want=%r: %s", want[:80], e)
     return False
+
+
+def _grafana_playwright_isolate_legend_series_in_page(page: Any, series_label: str) -> bool:
+    """Deprecated synthetic DOM events — delegate to mouse-based isolate."""
+    return _grafana_playwright_isolate_legend_via_mouse(page, series_label)
+
+
+def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> bool:
+    """Show only ``series_label`` on the solo panel chart (delegates to mouse-based isolate)."""
+    return _grafana_playwright_isolate_legend_via_mouse(page, series_label)
 
 
 def _grafana_playwright_collect_legend_click_targets(page: Any) -> List[Dict[str, Any]]:
@@ -7280,6 +7452,8 @@ def _grafana_panel_legend_labels_for_payload(
             if lbl and lbl not in seen:
                 seen.add(lbl)
                 out.append(lbl)
+    if kw and kw not in seen:
+        out.append(kw)
     return out
 
 
@@ -7361,18 +7535,17 @@ def _grafana_build_alert_screenshot_jobs(
     for url, solo_title, panel_id in solo_caps:
         isolate_labels = _grafana_alert_isolate_series_labels(solo_title, payload)
         if isolate_labels:
-            for lbl in isolate_labels:
-                jobs.append({
-                    "url": url,
-                    "solo_title": solo_title,
-                    "panel_id": panel_id,
-                    "isolate_series": lbl,
-                })
+            jobs.append({
+                "url": url,
+                "solo_title": solo_title,
+                "panel_id": panel_id,
+                "isolate_series": isolate_labels[0],
+                "isolate_series_candidates": isolate_labels,
+            })
             logger.info(
-                "Grafana alert screenshot: %r isolate %s series → %s solo PNG job(s)",
+                "Grafana alert screenshot: %r isolate candidates=%s → 1 solo PNG job",
                 solo_title,
                 isolate_labels,
-                len(isolate_labels),
             )
         else:
             jobs.append({
@@ -7391,10 +7564,11 @@ def _grafana_playwright_render_solo_panel_and_png(
     *,
     highlight_panel_title: Optional[str] = None,
     isolate_series_label: Optional[str] = None,
+    isolate_series_candidates: Optional[List[str]] = None,
 ) -> bytes:
     """
     Navigate to ``/d-solo/…?panelId=`` and capture a single focused chart (alert path).
-    When ``isolate_series_label`` is set, double-click that legend row first (one series only).
+    When isolate labels are set, double-click that legend row first (one series only).
     """
     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     try:
@@ -7416,14 +7590,26 @@ def _grafana_playwright_render_solo_panel_and_png(
     if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
         page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
     _grafana_close_open_menus(page)
-    if (isolate_series_label or "").strip():
-        iso = str(isolate_series_label).strip()
-        isolated = _grafana_playwright_isolate_legend_series(page, iso)
+    iso_candidates: List[str] = []
+    seen_iso: Set[str] = set()
+    for raw in list(isolate_series_candidates or []) + (
+        [isolate_series_label] if isolate_series_label else []
+    ):
+        label = (raw or "").strip()
+        if not label:
+            continue
+        key = label.casefold()
+        if key in seen_iso:
+            continue
+        seen_iso.add(key)
+        iso_candidates.append(label)
+    if iso_candidates:
+        isolated = _grafana_playwright_try_isolate_legend_series(page, iso_candidates)
         page.wait_for_timeout(300)
         if not isolated:
             logger.warning(
-                "Grafana screenshot: legend isolate failed — PNG may show wrong series want=%r",
-                iso[:120],
+                "Grafana screenshot: legend isolate failed — PNG may show wrong series candidates=%s",
+                [c[:80] for c in iso_candidates[:6]],
             )
         elif GRAFANA_SCREENSHOT_SETTLE_MS > 0:
             page.wait_for_timeout(min(400, int(GRAFANA_SCREENSHOT_SETTLE_MS)))
@@ -7446,6 +7632,7 @@ def _grafana_playwright_render_page_and_png(
     highlight_panel_titles: Optional[List[str]] = None,
     solo_primary_title: Optional[str] = None,
     isolate_series_label: Optional[str] = None,
+    isolate_series_candidates: Optional[List[str]] = None,
 ) -> bytes:
     if "/d-solo/" in (url or ""):
         return _grafana_playwright_render_solo_panel_and_png(
@@ -7455,6 +7642,7 @@ def _grafana_playwright_render_page_and_png(
             highlight_panel_title=solo_primary_title
             or ((highlight_panel_titles or [None])[0] if highlight_panel_titles else None),
             isolate_series_label=isolate_series_label,
+            isolate_series_candidates=isolate_series_candidates,
         )
     return _grafana_playwright_render_dashboard_and_png(
         page,
@@ -7494,6 +7682,7 @@ class GrafanaPlaywrightKeeper:
         highlight_panel_titles: Optional[List[str]] = None,
         solo_primary_title: Optional[str] = None,
         isolate_series_label: Optional[str] = None,
+        isolate_series_candidates: Optional[List[str]] = None,
     ) -> bytes:
         warm_wait = max(120.0, float(timeout_ms) / 1000.0 + 45.0)
         if not self._ready.wait(timeout=warm_wait):
@@ -7511,6 +7700,7 @@ class GrafanaPlaywrightKeeper:
                 "highlight_panel_titles": list(highlight_panel_titles or []),
                 "solo_primary_title": (solo_primary_title or "").strip() or None,
                 "isolate_series_label": (isolate_series_label or "").strip() or None,
+                "isolate_series_candidates": list(isolate_series_candidates or []),
                 "ev": ev,
                 "box": box,
             }
@@ -7647,6 +7837,7 @@ class GrafanaPlaywrightKeeper:
                         highlight_panel_titles=job.get("highlight_panel_titles") or None,
                         solo_primary_title=job.get("solo_primary_title"),
                         isolate_series_label=job.get("isolate_series_label"),
+                        isolate_series_candidates=job.get("isolate_series_candidates"),
                     )
                 except Exception as ex:
                     box["err"] = ex
@@ -7701,6 +7892,7 @@ def _grafana_headless_screenshot_png_at_url(
     highlight_panel_titles: Optional[List[str]] = None,
     solo_primary_title: Optional[str] = None,
     isolate_series_label: Optional[str] = None,
+    isolate_series_candidates: Optional[List[str]] = None,
 ) -> bytes:
     """Single Playwright capture for one dashboard or d-solo URL."""
     try:
@@ -7722,6 +7914,7 @@ def _grafana_headless_screenshot_png_at_url(
                 highlight_panel_titles=highlight_panel_titles,
                 solo_primary_title=solo_primary_title,
                 isolate_series_label=isolate_series_label,
+                isolate_series_candidates=isolate_series_candidates,
             )
         except Exception as e:
             logger.warning(
@@ -7736,6 +7929,7 @@ def _grafana_headless_screenshot_png_at_url(
         highlight_panel_titles=highlight_panel_titles,
         solo_primary_title=solo_primary_title,
         isolate_series_label=isolate_series_label,
+        isolate_series_candidates=isolate_series_candidates,
     )
 
 
@@ -7779,16 +7973,20 @@ def _grafana_headless_screenshot_png_list(
             solo_title = str(job.get("solo_title") or "")
             panel_id = int(job.get("panel_id") or 0)
             isolate_series = (job.get("isolate_series") or "").strip() or None
+            isolate_candidates = job.get("isolate_series_candidates")
+            if not isinstance(isolate_candidates, list):
+                isolate_candidates = [isolate_series] if isolate_series else []
             highlight_for_render = (
                 [solo_title] if solo_title and GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT else None
             )
             logger.info(
                 "Grafana screenshot: relative_range=%s alert solo panelId=%s title=%r "
-                "isolate_series=%r url=%s",
+                "isolate_series=%r candidates=%s url=%s",
                 rel_eff,
                 panel_id,
                 solo_title,
                 (isolate_series or "")[:100] or None,
+                [str(c)[:40] for c in isolate_candidates[:6]],
                 url[:300] + ("…" if len(url) > 300 else ""),
             )
             pngs.append(
@@ -7798,6 +7996,7 @@ def _grafana_headless_screenshot_png_list(
                     highlight_panel_titles=highlight_for_render,
                     solo_primary_title=solo_title,
                     isolate_series_label=isolate_series,
+                    isolate_series_candidates=isolate_candidates,
                 )
             )
         return pngs
@@ -7860,6 +8059,7 @@ def _grafana_ephemeral_playwright_screenshot_png(
     highlight_panel_titles: Optional[List[str]] = None,
     solo_primary_title: Optional[str] = None,
     isolate_series_label: Optional[str] = None,
+    isolate_series_candidates: Optional[List[str]] = None,
 ) -> bytes:
     """One-shot Chromium launch (no keeper reuse). Used as fallback when keeper fails or returns blank."""
     from playwright.sync_api import sync_playwright
@@ -7909,6 +8109,7 @@ def _grafana_ephemeral_playwright_screenshot_png(
                 highlight_panel_titles=highlight_panel_titles,
                 solo_primary_title=solo_primary_title,
                 isolate_series_label=isolate_series_label,
+                isolate_series_candidates=isolate_series_candidates,
             )
         finally:
             browser.close()
