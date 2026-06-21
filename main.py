@@ -6546,7 +6546,11 @@ def _grafana_playwright_legend_visible_labels(page: Any) -> List[str]:
                 const m = dt.match(/VizLegend series\\s*(.*)$/i);
                 if (m && m[1]) return norm(m[1]);
                 const row = el.closest('tr');
-                if (row) return norm(row.textContent || '');
+                if (row) {
+                  const cells = row.querySelectorAll('td');
+                  if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
+                  return norm(row.textContent || '');
+                }
                 return norm(el.textContent || '');
               };
               const isHidden = (el) => {
@@ -6620,7 +6624,11 @@ def _grafana_playwright_legend_isolate_verified(page: Any, want_label: str) -> b
                 const m = dt.match(/VizLegend series\\s*(.*)$/i);
                 if (m && m[1]) return norm(m[1]);
                 const row = el.closest('tr');
-                if (row) return norm(row.textContent || '');
+                if (row) {
+                  const cells = row.querySelectorAll('td');
+                  if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
+                  return norm(row.textContent || '');
+                }
                 return norm(el.textContent || '');
               };
               const isHidden = (el) => {
@@ -6715,6 +6723,158 @@ def _grafana_playwright_legend_scroll_to_label(page: Any, want_label: str, *, ma
         page.wait_for_timeout(80)
 
 
+def _grafana_playwright_isolate_legend_series_in_page(page: Any, series_label: str) -> bool:
+    """
+    In-page legend isolate for Grafana table legends (Games/Provider panels).
+    Scrolls the legend, double-clicks the target, then hides every other visible row.
+    """
+    want = (series_label or "").strip()
+    if not want:
+        return False
+    exact_only = _grafana_want_legend_exact_only(want)
+    try:
+        result = page.evaluate(
+            """({ want, exactOnly }) => {
+              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
+              const wantN = norm(want).toLowerCase();
+              const matches = (text) => {
+                const tn = norm(text);
+                if (!tn) return false;
+                if (exactOnly) return tn.toLowerCase() === wantN;
+                if (tn.toLowerCase() === wantN) return true;
+                if (/^\\d+$/.test(want)) {
+                  const re = new RegExp('(^|[^0-9])' + want.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + '([^0-9]|$)');
+                  return re.test(tn);
+                }
+                return false;
+              };
+              const legendTextOf = (el) => {
+                const dt = el.getAttribute('data-testid') || '';
+                const m = dt.match(/VizLegend series\\s*(.*)$/i);
+                if (m && m[1]) return norm(m[1]);
+                const row = el.closest('tr');
+                if (row) {
+                  const cells = row.querySelectorAll('td');
+                  if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
+                  return norm(row.textContent || '');
+                }
+                return norm(el.textContent || el.getAttribute('title') || '');
+              };
+              const clickTarget = (el) => (
+                el.querySelector(
+                  'button,[role="button"],td:first-child,[class*="SeriesIcon"],[class*="legend-color"],a'
+                ) || el
+              );
+              const isHidden = (el) => {
+                const cls = (el.className || '') + ' ' + ((el.closest('tr') || {}).className || '');
+                if (/inactive|disabled|unchecked|hidden|excluded/i.test(cls)) return true;
+                const st = window.getComputedStyle(el);
+                if (parseFloat(st.opacity) < 0.35) return true;
+                return false;
+              };
+              const scroller = () => {
+                const leg = document.querySelector(
+                  '[data-testid="viz-legend"], .viz-legend, section[aria-label="Legend"]'
+                );
+                if (!leg) return null;
+                return leg.querySelector('[class*="scrollbar-view"], [style*="overflow"]') || leg;
+              };
+              const collectRows = () => {
+                const out = [];
+                const sels = [
+                  '[data-testid*="VizLegend series"]',
+                  'table.viz-legend tbody tr',
+                  '[data-testid="viz-legend"] tbody tr',
+                  '[data-testid="viz-legend"] [role="button"]',
+                ];
+                for (const sel of sels) {
+                  document.querySelectorAll(sel).forEach((el) => {
+                    const text = legendTextOf(el);
+                    if (!text || text === '-') return;
+                    const tgt = clickTarget(el);
+                    const r = tgt.getBoundingClientRect();
+                    if (r.width < 2 || r.height < 2) return;
+                    out.push({ text, tgt, hidden: isHidden(el) });
+                  });
+                }
+                return out;
+              };
+              const visibleCount = () => collectRows().filter((r) => !r.hidden).length;
+              const findTarget = () => collectRows().find((r) => matches(r.text));
+
+              let sc = scroller();
+              let target = findTarget();
+              if (!target && sc) {
+                sc.scrollTop = 0;
+                for (let i = 0; i < 80 && !target; i++) {
+                  target = findTarget();
+                  if (target) break;
+                  sc.scrollTop += 64;
+                }
+              }
+              if (!target) {
+                return { ok: false, reason: 'not_found', sample: collectRows().slice(0, 12).map((r) => r.text) };
+              }
+              target.tgt.scrollIntoView({ block: 'center', inline: 'nearest' });
+              const fire = (type, extra) => {
+                target.tgt.dispatchEvent(new MouseEvent(type, Object.assign(
+                  { bubbles: true, cancelable: true, view: window }, extra || {}
+                )));
+              };
+              fire('dblclick');
+              if (visibleCount() > 1) {
+                fire('click', { ctrlKey: true, metaKey: true });
+              }
+              if (visibleCount() > 1) {
+                fire('click');
+                fire('click');
+              }
+              for (let pass = 0; pass < 4 && visibleCount() > 1; pass++) {
+                for (const row of collectRows()) {
+                  if (matches(row.text)) {
+                    if (row.hidden) row.tgt.click();
+                    continue;
+                  }
+                  if (!row.hidden) row.tgt.click();
+                }
+                if (visibleCount() <= 1) break;
+                if (!matches(findTarget()?.text || '')) {
+                  const t2 = findTarget();
+                  if (t2) t2.tgt.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));
+                }
+              }
+              const vis = collectRows().filter((r) => !r.hidden);
+              const ok = vis.length === 1 && matches(vis[0].text);
+              return {
+                ok,
+                method: 'in_page',
+                visible: vis.map((r) => r.text),
+                target: target.text,
+              };
+            }""",
+            {"want": want, "exactOnly": exact_only},
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            logger.info(
+                "Grafana screenshot: in-page legend isolate ok want=%r target=%r visible=%s",
+                want[:100],
+                str(result.get("target") or "")[:120],
+                result.get("visible"),
+            )
+            return True
+        if isinstance(result, dict):
+            logger.warning(
+                "Grafana screenshot: in-page legend isolate failed want=%r reason=%s sample=%s visible=%s",
+                want[:100],
+                result.get("reason"),
+                result.get("sample"),
+                result.get("visible"),
+            )
+    except Exception as e:
+        logger.warning("Grafana screenshot: in-page legend isolate error want=%r: %s", want[:80], e)
+    return False
+
+
 def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> bool:
     """
     Show only ``series_label`` on the solo panel chart.
@@ -6738,6 +6898,10 @@ def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> b
 
     target_txt = want
     try:
+        if _grafana_playwright_isolate_legend_series_in_page(page, want):
+            _after_isolate_wait()
+            return True
+
         _grafana_playwright_legend_scroll_to_label(page, want)
 
         # Primary: double-click exact legend item (Grafana isolate on multi-series panels).
@@ -6931,7 +7095,13 @@ def _grafana_playwright_legend_rows_for_isolate(page: Any) -> List[Dict[str, Any
             const title = el.getAttribute('title') || el.getAttribute('aria-label') || '';
             if (title) return norm(title);
             const row = el.closest('tr');
-            if (row) return norm(row.textContent || '');
+            if (row) {
+              const cells = row.querySelectorAll('td');
+              if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
+              const nameEl = row.querySelector('[class*="label"], [class*="name"], th + td');
+              if (nameEl) return norm(nameEl.textContent || '');
+              return norm(row.textContent || '');
+            }
             return norm(el.textContent || '');
           };
           const clickTarget = (el) => {
@@ -7035,6 +7205,45 @@ def _panel_payload_for_monitor_kind(payload: Dict[str, Any], kind: str) -> Optio
     return None
 
 
+def _grafana_resolve_series_legend_label(legend_format: str, metric: Dict[str, Any]) -> str:
+    """Resolve Grafana ``{{field}}`` legend templates to the text shown in the UI."""
+    lg = str(legend_format or "").strip()
+    md = metric if isinstance(metric, dict) else {}
+    if lg and "{{" not in lg:
+        return lg
+    if lg and "{{" in lg:
+        out = lg
+        for k, v in md.items():
+            if k == "__name__":
+                continue
+            repl = "" if v is None else str(v)
+            out = out.replace("{{" + k + "}}", repl)
+        out = re.sub(r"\{\{[^}]+\}\}", "", out).strip()
+        if out:
+            return out
+    for mk in (
+        "series",
+        "name",
+        "game",
+        "gameid",
+        "game_id",
+        "provider",
+        "providerid",
+        "provider_id",
+        "label",
+    ):
+        v = md.get(mk)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    bits = [str(v) for v in md.values() if v is not None and str(v).strip() and str(v) != md.get("__name__")]
+    return " ".join(bits).strip()
+
+
+def _grafana_legend_label_from_row(legend_format: str, metric: Dict[str, Any], *, keyword: str = "") -> str:
+    lbl = _grafana_resolve_series_legend_label(legend_format, metric)
+    if lbl:
+        return lbl
+    return (keyword or "").strip()
 def _grafana_panel_legend_labels_for_payload(
     panel_payload: Dict[str, Any],
     *,
@@ -7064,14 +7273,7 @@ def _grafana_panel_legend_labels_for_payload(
                     or _keyword_matches_series_labels(kw, lg, md)
                 ):
                     continue
-                if lg and "{{" not in lg:
-                    lbl = lg
-                else:
-                    lbl = str(md.get("series") or md.get("name") or "").strip()
-                    if not lbl:
-                        lbl = " ".join(
-                            str(v) for v in md.values() if v is not None and str(v).strip()
-                        ).strip()
+                lbl = _grafana_legend_label_from_row(lg, md, keyword=kw)
             else:
                 continue
             lbl = (lbl or "").strip()
@@ -7108,7 +7310,9 @@ def _grafana_alert_isolate_series_labels(
     title = (panel_title or "").strip()
     if not title:
         return []
-    if title == GRAFANA_PANEL_TITLE_ERROR_REQ:
+    if title == GRAFANA_PANEL_TITLE_ERROR_REQ or _grafana_panel_titles_equivalent(
+        title, GRAFANA_PANEL_TITLE_ERROR_REQ
+    ):
         return _error_req_spiked_series_labels_from_payload(payload)
     _mute_purge_expired()
     for kind, g_title, keyword, analyzer, http_only in _grafana_alert_panel_specs():
@@ -7118,8 +7322,6 @@ def _grafana_alert_isolate_series_labels(
             return []
         p2 = _panel_payload_for_monitor_kind(payload, kind)
         if not isinstance(p2, dict):
-            return []
-        if not bool(analyzer(p2).get("hit_alert")):
             return []
         labels = _grafana_panel_legend_labels_for_payload(
             p2, keyword=keyword or None, http_only=http_only
