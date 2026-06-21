@@ -7007,7 +7007,7 @@ def _grafana_playwright_legend_hide_all_except(
 
 
 def _grafana_playwright_try_isolate_legend_series(
-    page: Any, candidates: List[str]
+    page: Any, candidates: List[str], *, dense_legend: bool = False
 ) -> bool:
     """Try each legend label candidate until one isolates successfully."""
     seen: Set[str] = set()
@@ -7019,7 +7019,9 @@ def _grafana_playwright_try_isolate_legend_series(
         if key in seen:
             continue
         seen.add(key)
-        if _grafana_playwright_isolate_legend_via_mouse(page, label):
+        if _grafana_playwright_isolate_legend_via_mouse(
+            page, label, dense_legend=dense_legend
+        ):
             logger.info(
                 "Grafana screenshot: legend isolate ok candidate=%r", label[:100]
             )
@@ -7030,7 +7032,24 @@ def _grafana_playwright_try_isolate_legend_series(
     return False
 
 
-def _grafana_playwright_isolate_legend_via_mouse(page: Any, series_label: str) -> bool:
+def _grafana_panel_uses_dense_legend_isolate(panel_title: str) -> bool:
+    """
+    Games/Provider panels carry 100+ numeric-id legend rows — use scroll + hide-all fallback.
+    Error-req and HTTP panels use the lighter dblclick/locator path only.
+    """
+    if _grafana_panel_titles_equivalent(panel_title, GRAFANA_PANEL_TITLE_ERROR_REQ):
+        return False
+    if _grafana_panel_titles_equivalent(panel_title, GRAFANA_PANEL_TITLE):
+        return False
+    for _kind, g_title, keyword, _analyzer, _http_only in _grafana_alert_panel_specs():
+        if keyword and _grafana_panel_titles_equivalent(panel_title, g_title):
+            return True
+    return False
+
+
+def _grafana_playwright_isolate_legend_via_mouse(
+    page: Any, series_label: str, *, dense_legend: bool = False
+) -> bool:
     """
     Isolate one legend series using **real** Playwright mouse / locator clicks (React-safe).
     Falls back to hiding every other visible legend row one-by-one.
@@ -7105,13 +7124,62 @@ def _grafana_playwright_isolate_legend_via_mouse(page: Any, series_label: str) -
             except Exception:
                 continue
 
-        # 2) Full legend scan — hide every other series, then dblclick target with fresh coords.
+        if _grafana_playwright_legend_click_exact(page, want, double=True):
+            _grafana_clear_text_selection(page)
+            _after_isolate_wait()
+            if _verified():
+                logger.info(
+                    "Grafana screenshot: testid dblclick isolate want=%r", want[:100]
+                )
+                return True
+
         scan = _grafana_playwright_legend_rows_scan_all(page, want)
         all_texts = scan.get("allTexts") if isinstance(scan.get("allTexts"), list) else []
         target_txt = want
         if isinstance(scan.get("target"), dict):
             target_txt = str(scan.get("target", {}).get("text") or want)
 
+        if _grafana_playwright_legend_click_row_by_text(page, want, double=True):
+            _after_isolate_wait()
+            if _verified():
+                logger.info(
+                    "Grafana screenshot: fresh-dblclick isolate want=%r target=%r",
+                    want[:100],
+                    target_txt[:120],
+                )
+                return True
+
+        if not dense_legend:
+            rows = _grafana_playwright_legend_rows_all(page)
+            targets = [
+                r for r in rows if _legend_matches(str(r.get("text") or ""))
+            ]
+            if targets:
+                targets.sort(
+                    key=lambda r: _grafana_legend_match_score(
+                        want, str(r.get("text") or "")
+                    ),
+                    reverse=True,
+                )
+                target = targets[0]
+                page.mouse.dblclick(float(target["x"]), float(target["y"]))
+                _grafana_clear_text_selection(page)
+                _after_isolate_wait()
+                if _verified():
+                    logger.info(
+                        "Grafana screenshot: row dblclick isolate want=%r target=%r",
+                        want[:100],
+                        str(target.get("text") or "")[:120],
+                    )
+                    return True
+            logger.warning(
+                "Grafana screenshot: light isolate failed want=%r visible=%s",
+                want[:100],
+                _grafana_playwright_legend_visible_labels(page)[:8],
+            )
+            return False
+
+        # Dense legend (Games/Provider): hide every other series, then dblclick target.
         if not all_texts:
             logger.warning(
                 "Grafana screenshot: legend scan empty want=%r",
@@ -7168,14 +7236,22 @@ def _grafana_playwright_isolate_legend_via_mouse(page: Any, series_label: str) -
     return False
 
 
-def _grafana_playwright_isolate_legend_series_in_page(page: Any, series_label: str) -> bool:
+def _grafana_playwright_isolate_legend_series_in_page(
+    page: Any, series_label: str, *, dense_legend: bool = False
+) -> bool:
     """Deprecated synthetic DOM events — delegate to mouse-based isolate."""
-    return _grafana_playwright_isolate_legend_via_mouse(page, series_label)
+    return _grafana_playwright_isolate_legend_via_mouse(
+        page, series_label, dense_legend=dense_legend
+    )
 
 
-def _grafana_playwright_isolate_legend_series(page: Any, series_label: str) -> bool:
-    """Show only ``series_label`` on the solo panel chart (delegates to mouse-based isolate)."""
-    return _grafana_playwright_isolate_legend_via_mouse(page, series_label)
+def _grafana_playwright_isolate_legend_series(
+    page: Any, series_label: str, *, dense_legend: bool = False
+) -> bool:
+    """Show only ``series_label`` on the solo panel chart."""
+    return _grafana_playwright_isolate_legend_via_mouse(
+        page, series_label, dense_legend=dense_legend
+    )
 
 
 def _grafana_playwright_collect_legend_click_targets(page: Any) -> List[Dict[str, Any]]:
@@ -7534,19 +7610,42 @@ def _grafana_build_alert_screenshot_jobs(
     jobs: List[Dict[str, Any]] = []
     for url, solo_title, panel_id in solo_caps:
         isolate_labels = _grafana_alert_isolate_series_labels(solo_title, payload)
+        dense = _grafana_panel_uses_dense_legend_isolate(solo_title)
+        is_error_req = _grafana_panel_titles_equivalent(
+            solo_title, GRAFANA_PANEL_TITLE_ERROR_REQ
+        )
         if isolate_labels:
-            jobs.append({
-                "url": url,
-                "solo_title": solo_title,
-                "panel_id": panel_id,
-                "isolate_series": isolate_labels[0],
-                "isolate_series_candidates": isolate_labels,
-            })
-            logger.info(
-                "Grafana alert screenshot: %r isolate candidates=%s → 1 solo PNG job",
-                solo_title,
-                isolate_labels,
-            )
+            if is_error_req:
+                for lbl in isolate_labels:
+                    jobs.append({
+                        "url": url,
+                        "solo_title": solo_title,
+                        "panel_id": panel_id,
+                        "isolate_series": lbl,
+                        "isolate_series_candidates": [lbl],
+                        "dense_legend_isolate": False,
+                    })
+                logger.info(
+                    "Grafana alert screenshot: %r isolate %s series → %s solo PNG job(s)",
+                    solo_title,
+                    isolate_labels,
+                    len(isolate_labels),
+                )
+            else:
+                jobs.append({
+                    "url": url,
+                    "solo_title": solo_title,
+                    "panel_id": panel_id,
+                    "isolate_series": isolate_labels[0],
+                    "isolate_series_candidates": isolate_labels,
+                    "dense_legend_isolate": dense,
+                })
+                logger.info(
+                    "Grafana alert screenshot: %r isolate candidates=%s dense=%s → 1 solo PNG job",
+                    solo_title,
+                    isolate_labels,
+                    dense,
+                )
         else:
             jobs.append({
                 "url": url,
@@ -7565,6 +7664,7 @@ def _grafana_playwright_render_solo_panel_and_png(
     highlight_panel_title: Optional[str] = None,
     isolate_series_label: Optional[str] = None,
     isolate_series_candidates: Optional[List[str]] = None,
+    dense_legend_isolate: bool = False,
 ) -> bytes:
     """
     Navigate to ``/d-solo/…?panelId=`` and capture a single focused chart (alert path).
@@ -7604,7 +7704,16 @@ def _grafana_playwright_render_solo_panel_and_png(
         seen_iso.add(key)
         iso_candidates.append(label)
     if iso_candidates:
-        isolated = _grafana_playwright_try_isolate_legend_series(page, iso_candidates)
+        if len(iso_candidates) == 1:
+            isolated = _grafana_playwright_isolate_legend_via_mouse(
+                page,
+                iso_candidates[0],
+                dense_legend=dense_legend_isolate,
+            )
+        else:
+            isolated = _grafana_playwright_try_isolate_legend_series(
+                page, iso_candidates, dense_legend=dense_legend_isolate
+            )
         page.wait_for_timeout(300)
         if not isolated:
             logger.warning(
@@ -7633,6 +7742,7 @@ def _grafana_playwright_render_page_and_png(
     solo_primary_title: Optional[str] = None,
     isolate_series_label: Optional[str] = None,
     isolate_series_candidates: Optional[List[str]] = None,
+    dense_legend_isolate: bool = False,
 ) -> bytes:
     if "/d-solo/" in (url or ""):
         return _grafana_playwright_render_solo_panel_and_png(
@@ -7643,6 +7753,7 @@ def _grafana_playwright_render_page_and_png(
             or ((highlight_panel_titles or [None])[0] if highlight_panel_titles else None),
             isolate_series_label=isolate_series_label,
             isolate_series_candidates=isolate_series_candidates,
+            dense_legend_isolate=dense_legend_isolate,
         )
     return _grafana_playwright_render_dashboard_and_png(
         page,
@@ -7683,6 +7794,7 @@ class GrafanaPlaywrightKeeper:
         solo_primary_title: Optional[str] = None,
         isolate_series_label: Optional[str] = None,
         isolate_series_candidates: Optional[List[str]] = None,
+        dense_legend_isolate: bool = False,
     ) -> bytes:
         warm_wait = max(120.0, float(timeout_ms) / 1000.0 + 45.0)
         if not self._ready.wait(timeout=warm_wait):
@@ -7701,6 +7813,7 @@ class GrafanaPlaywrightKeeper:
                 "solo_primary_title": (solo_primary_title or "").strip() or None,
                 "isolate_series_label": (isolate_series_label or "").strip() or None,
                 "isolate_series_candidates": list(isolate_series_candidates or []),
+                "dense_legend_isolate": bool(dense_legend_isolate),
                 "ev": ev,
                 "box": box,
             }
@@ -7838,6 +7951,7 @@ class GrafanaPlaywrightKeeper:
                         solo_primary_title=job.get("solo_primary_title"),
                         isolate_series_label=job.get("isolate_series_label"),
                         isolate_series_candidates=job.get("isolate_series_candidates"),
+                        dense_legend_isolate=bool(job.get("dense_legend_isolate")),
                     )
                 except Exception as ex:
                     box["err"] = ex
@@ -7893,6 +8007,7 @@ def _grafana_headless_screenshot_png_at_url(
     solo_primary_title: Optional[str] = None,
     isolate_series_label: Optional[str] = None,
     isolate_series_candidates: Optional[List[str]] = None,
+    dense_legend_isolate: bool = False,
 ) -> bytes:
     """Single Playwright capture for one dashboard or d-solo URL."""
     try:
@@ -7915,6 +8030,7 @@ def _grafana_headless_screenshot_png_at_url(
                 solo_primary_title=solo_primary_title,
                 isolate_series_label=isolate_series_label,
                 isolate_series_candidates=isolate_series_candidates,
+                dense_legend_isolate=dense_legend_isolate,
             )
         except Exception as e:
             logger.warning(
@@ -7930,6 +8046,7 @@ def _grafana_headless_screenshot_png_at_url(
         solo_primary_title=solo_primary_title,
         isolate_series_label=isolate_series_label,
         isolate_series_candidates=isolate_series_candidates,
+        dense_legend_isolate=dense_legend_isolate,
     )
 
 
@@ -7976,17 +8093,19 @@ def _grafana_headless_screenshot_png_list(
             isolate_candidates = job.get("isolate_series_candidates")
             if not isinstance(isolate_candidates, list):
                 isolate_candidates = [isolate_series] if isolate_series else []
+            dense_isolate = bool(job.get("dense_legend_isolate"))
             highlight_for_render = (
                 [solo_title] if solo_title and GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT else None
             )
             logger.info(
                 "Grafana screenshot: relative_range=%s alert solo panelId=%s title=%r "
-                "isolate_series=%r candidates=%s url=%s",
+                "isolate_series=%r candidates=%s dense=%s url=%s",
                 rel_eff,
                 panel_id,
                 solo_title,
                 (isolate_series or "")[:100] or None,
                 [str(c)[:40] for c in isolate_candidates[:6]],
+                dense_isolate,
                 url[:300] + ("…" if len(url) > 300 else ""),
             )
             pngs.append(
@@ -7997,6 +8116,7 @@ def _grafana_headless_screenshot_png_list(
                     solo_primary_title=solo_title,
                     isolate_series_label=isolate_series,
                     isolate_series_candidates=isolate_candidates,
+                    dense_legend_isolate=dense_isolate,
                 )
             )
         return pngs
@@ -8060,6 +8180,7 @@ def _grafana_ephemeral_playwright_screenshot_png(
     solo_primary_title: Optional[str] = None,
     isolate_series_label: Optional[str] = None,
     isolate_series_candidates: Optional[List[str]] = None,
+    dense_legend_isolate: bool = False,
 ) -> bytes:
     """One-shot Chromium launch (no keeper reuse). Used as fallback when keeper fails or returns blank."""
     from playwright.sync_api import sync_playwright
@@ -8110,6 +8231,7 @@ def _grafana_ephemeral_playwright_screenshot_png(
                 solo_primary_title=solo_primary_title,
                 isolate_series_label=isolate_series_label,
                 isolate_series_candidates=isolate_series_candidates,
+                dense_legend_isolate=dense_legend_isolate,
             )
         finally:
             browser.close()
