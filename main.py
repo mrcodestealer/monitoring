@@ -6997,7 +6997,15 @@ def _grafana_playwright_legend_hide_all_except(
 def _grafana_playwright_try_isolate_legend_series(
     page: Any, candidates: List[str], *, dense_legend: bool = False
 ) -> bool:
-    """Try each legend label candidate until one isolates successfully."""
+    """
+    Try each legend label candidate until one isolates successfully.
+
+    Candidates often come from the **same** matched series (different metric fields, e.g. game_id
+    vs game name); only one is the text the legend actually renders. A read-only scan first picks
+    the candidate that exists as a legend row so a non-existent label can't disturb the legend
+    (hide-all clicks) before the real one runs.
+    """
+    uniq: List[str] = []
     seen: Set[str] = set()
     for cand in candidates:
         label = (cand or "").strip()
@@ -7007,6 +7015,35 @@ def _grafana_playwright_try_isolate_legend_series(
         if key in seen:
             continue
         seen.add(key)
+        uniq.append(label)
+    if not uniq:
+        return False
+
+    present: List[str] = []
+    present_keys: Set[str] = set()
+    for label in uniq:
+        try:
+            scan = _grafana_playwright_legend_rows_scan_all(page, label)
+        except Exception:
+            scan = {}
+        if isinstance(scan, dict) and isinstance(scan.get("target"), dict):
+            if label.casefold() not in present_keys:
+                present_keys.add(label.casefold())
+                present.append(label)
+    ordered = present + [c for c in uniq if c.casefold() not in present_keys]
+    if present:
+        logger.info(
+            "Grafana screenshot: legend candidates present-in-panel=%s (of %s)",
+            [c[:60] for c in present[:6]],
+            len(uniq),
+        )
+    else:
+        logger.warning(
+            "Grafana screenshot: no candidate found in legend; will still try all=%s",
+            [c[:40] for c in uniq[:8]],
+        )
+
+    for label in ordered:
         if _grafana_playwright_isolate_legend_via_mouse(
             page, label, dense_legend=dense_legend
         ):
@@ -7070,8 +7107,48 @@ def _grafana_playwright_isolate_legend_via_mouse(
             '[data-testid="viz-legend"], .viz-legend, section[aria-label="Legend"]'
         )
 
-        # Table legend: dblclick the label button (series name), not Max/Last stat cells.
         esc = re.escape(want)
+
+        # Most robust for long/scrollable legends: page-level exact-text button → scroll → dblclick.
+        # Grafana legend label is a <button> whose textContent == series name (no aria-label match),
+        # so target by exact visible text and let Playwright auto-scroll it into view.
+        page_level_candidates = [
+            page.get_by_role("button", name=want, exact=True),
+            page.locator("button[type='button']").filter(
+                has_text=re.compile(rf"^{esc}$", re.I)
+            ),
+            page.get_by_text(want, exact=True),
+        ]
+        for loc in page_level_candidates:
+            try:
+                n = loc.count()
+            except Exception:
+                n = 0
+            for i in range(min(n, 6)):
+                try:
+                    el = loc.nth(i)
+                    el.scroll_into_view_if_needed(timeout=6000)
+                    el.dblclick(timeout=6000)
+                    _grafana_clear_text_selection(page)
+                    _after_isolate_wait()
+                    if _verified():
+                        logger.info(
+                            "Grafana screenshot: page-text dblclick isolate want=%r", want[:100]
+                        )
+                        return True
+                    # Some Grafana builds isolate on a single click instead.
+                    el.click(timeout=6000)
+                    _grafana_clear_text_selection(page)
+                    _after_isolate_wait()
+                    if _verified():
+                        logger.info(
+                            "Grafana screenshot: page-text click isolate want=%r", want[:100]
+                        )
+                        return True
+                except Exception:
+                    continue
+
+        # Table legend: dblclick the label button (series name), not Max/Last stat cells.
         try:
             label_btn = legend_root.locator("button[type='button']").filter(
                 has_text=re.compile(rf"^{esc}$", re.I)
@@ -7476,6 +7553,44 @@ def _grafana_legend_label_from_row(legend_format: str, metric: Dict[str, Any], *
     if lbl:
         return lbl
     return (keyword or "").strip()
+
+
+def _grafana_legend_label_candidates_from_row(
+    legend_format: str, metric: Dict[str, Any], *, keyword: str = ""
+) -> List[str]:
+    """
+    All plausible legend display names for one matched series row.
+
+    The Grafana legend often shows a **different** metric field than the alert ``keyword``
+    (e.g. keyword=``1492288`` is ``game_id`` but the legend renders the game name). Since the
+    real displayed field is unknown, return every distinct label value of this same series so the
+    isolation step can try each — they all identify the **same** row, so trying them is safe.
+    """
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(val: Any) -> None:
+        s = str(val).strip() if val is not None else ""
+        if s and s.casefold() not in seen:
+            seen.add(s.casefold())
+            out.append(s)
+
+    _add(_grafana_resolve_series_legend_label(legend_format, metric))
+    md = metric if isinstance(metric, dict) else {}
+    # Prefer human-name-ish fields first, then ids, then everything else.
+    for mk in (
+        "game_name", "gamename", "name", "series", "label", "displayName", "display_name",
+        "provider", "provider_name",
+        "game", "gameid", "game_id", "providerid", "provider_id", "__series_id__",
+    ):
+        if mk in md:
+            _add(md.get(mk))
+    for k, v in md.items():
+        if k == "__name__":
+            continue
+        _add(v)
+    _add(keyword)
+    return out
 def _grafana_panel_legend_labels_for_payload(
     panel_payload: Dict[str, Any],
     *,
@@ -7505,14 +7620,18 @@ def _grafana_panel_legend_labels_for_payload(
                     or _keyword_matches_series_labels(kw, lg, md)
                 ):
                     continue
-                lbl = _grafana_legend_label_from_row(lg, md, keyword=kw)
+                for cand in _grafana_legend_label_candidates_from_row(lg, md, keyword=kw):
+                    if cand and cand.casefold() not in seen:
+                        seen.add(cand.casefold())
+                        out.append(cand)
+                continue
             else:
                 continue
             lbl = (lbl or "").strip()
-            if lbl and lbl not in seen:
-                seen.add(lbl)
+            if lbl and lbl.casefold() not in seen:
+                seen.add(lbl.casefold())
                 out.append(lbl)
-    if kw and kw not in seen:
+    if kw and kw.casefold() not in seen:
         out.append(kw)
     return out
 
@@ -7688,16 +7807,9 @@ def _grafana_playwright_render_solo_panel_and_png(
         seen_iso.add(key)
         iso_candidates.append(label)
     if iso_candidates:
-        if len(iso_candidates) == 1:
-            isolated = _grafana_playwright_isolate_legend_via_mouse(
-                page,
-                iso_candidates[0],
-                dense_legend=dense_legend_isolate,
-            )
-        else:
-            isolated = _grafana_playwright_try_isolate_legend_series(
-                page, iso_candidates, dense_legend=dense_legend_isolate
-            )
+        isolated = _grafana_playwright_try_isolate_legend_series(
+            page, iso_candidates, dense_legend=dense_legend_isolate
+        )
         page.wait_for_timeout(300)
         if not isolated:
             logger.warning(
