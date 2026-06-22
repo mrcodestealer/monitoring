@@ -6477,6 +6477,71 @@ def _grafana_legend_normalize_label(label: str) -> str:
     return re.sub(r"\s+", " ", (label or "").replace("\n", " ")).strip()
 
 
+# Shared in-page helpers for Grafana VizLegend (table + list). Table legends put the
+# series **name** in the first column / label ``button`` — not the last ``td`` (Max/Last).
+_GRAFANA_PLAYWRIGHT_LEGEND_DOM_HELPERS = r"""
+  const norm = (s) => (s || '').replace(/[\u2013\u2014]/g, '-').replace(/\s+/g, ' ').trim();
+  const rowOf = (el) => {
+    if (!el || !el.closest) return el;
+    return el.closest('tr')
+      || el.closest('[data-testid*="VizLegend"]')
+      || el.closest('[class*="LegendItem"]')
+      || el;
+  };
+  const legendTextOf = (el) => {
+    if (!el) return '';
+    const dt = el.getAttribute('data-testid') || '';
+    let m = dt.match(/VizLegend series\s*(.*)$/i);
+    if (m && m[1]) return norm(m[1]);
+    m = dt.match(/seriesName\s*(.*)$/i);
+    if (m && m[1]) return norm(m[1]);
+    const row = rowOf(el);
+    if (row) {
+      const named = row.querySelector('[data-testid*="VizLegend series"], [data-testid*="seriesName"]');
+      if (named) {
+        const dt2 = named.getAttribute('data-testid') || '';
+        const m2 = dt2.match(/(?:VizLegend series|seriesName)\s*(.*)$/i);
+        if (m2 && m2[1]) return norm(m2[1]);
+      }
+      const labelBtn = row.querySelector('button[type="button"]:not([aria-haspopup="menu"])');
+      if (labelBtn) {
+        const t = norm(labelBtn.textContent || '');
+        if (t) return t;
+      }
+      const cells = row.querySelectorAll('td');
+      if (cells.length >= 1) {
+        const first = norm(cells[0].textContent || '');
+        if (first && !/^name$/i.test(first)) return first;
+      }
+      const blob = norm(row.textContent || '');
+      if (blob) return blob.split(/\s+/)[0];
+    }
+    const labelBtn = el.querySelector && el.querySelector('button[type="button"]:not([aria-haspopup="menu"])');
+    if (labelBtn) return norm(labelBtn.textContent || '');
+    const title = el.getAttribute('title') || el.getAttribute('aria-label') || '';
+    if (title) return norm(title);
+    return norm(el.textContent || el.getAttribute('title') || '');
+  };
+  const clickTarget = (el) => {
+    const row = rowOf(el);
+    const labelBtn = row.querySelector('button[type="button"]:not([aria-haspopup="menu"])');
+    if (labelBtn) return labelBtn;
+    const named = row.querySelector('[data-testid*="VizLegend series"], [data-testid*="seriesName"]');
+    if (named) return named;
+    return row.querySelector('[class*="SeriesIcon"], td:first-child, button, [role="button"]') || row;
+  };
+  const isHidden = (el) => {
+    const cls = (el.className || '') + ' ' + ((el.closest('tr') || {}).className || '');
+    if (/inactive|disabled|unchecked|hidden|excluded|series-hidden/i.test(cls)) return true;
+    const st = window.getComputedStyle(el);
+    if (parseFloat(st.opacity) < 0.35) return true;
+    const deco = String(st.textDecorationLine || st.textDecoration || '');
+    if (deco.includes('line-through')) return true;
+    return false;
+  };
+"""
+
+
 def _grafana_legend_labels_exact_equal(want_label: str, legend_text: str) -> bool:
     """Case-insensitive full-string equality (``9280 + Push`` ≠ ``9280 + Push - 7Days``)."""
     a = _grafana_legend_normalize_label(want_label).casefold()
@@ -6539,29 +6604,13 @@ def _grafana_want_legend_exact_only(want_label: str) -> bool:
 def _grafana_playwright_legend_visible_labels(page: Any) -> List[str]:
     try:
         raw = page.evaluate(
-            """() => {
-              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
-              const legendTextOf = (el) => {
-                const dt = el.getAttribute('data-testid') || '';
-                const m = dt.match(/VizLegend series\\s*(.*)$/i);
-                if (m && m[1]) return norm(m[1]);
-                const row = el.closest('tr');
-                if (row) {
-                  const cells = row.querySelectorAll('td');
-                  if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
-                  return norm(row.textContent || '');
-                }
-                return norm(el.textContent || '');
-              };
-              const isHidden = (el) => {
-                const cls = (el.className || '') + ' ' + ((el.closest('tr') || {}).className || '');
-                if (/inactive|disabled|unchecked|hidden/i.test(cls)) return true;
-                const st = window.getComputedStyle(el);
-                if (parseFloat(st.opacity) < 0.35) return true;
-                return false;
-              };
+            "() => {\n"
+            + _GRAFANA_PLAYWRIGHT_LEGEND_DOM_HELPERS
+            + """
               const visible = [];
-              document.querySelectorAll('[data-testid*="VizLegend series"], table.viz-legend tbody tr').forEach((el) => {
+              document.querySelectorAll(
+                '[data-testid*="VizLegend series"], table.viz-legend tbody tr, [data-testid="viz-legend"] tbody tr'
+              ).forEach((el) => {
                 if (isHidden(el)) return;
                 const text = legendTextOf(el);
                 if (text && text !== '-') visible.push(text);
@@ -6584,8 +6633,9 @@ def _grafana_playwright_legend_isolate_verified(page: Any, want_label: str) -> b
     exact_only = _grafana_want_legend_exact_only(want)
     try:
         ok = page.evaluate(
-            """({ want, exactOnly }) => {
-              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
+            "({ want, exactOnly }) => {\n"
+            + _GRAFANA_PLAYWRIGHT_LEGEND_DOM_HELPERS
+            + """
               const wantN = norm(want).toLowerCase();
               const parts = (label) => {
                 const raw = norm(label);
@@ -6598,7 +6648,7 @@ def _grafana_playwright_legend_isolate_verified(page: Any, want_label: str) -> b
                 const tn = norm(legendText);
                 if (!wn || !tn) return false;
                 if (exactOnly) return wn.toLowerCase() === tn.toLowerCase();
-                const wantDash = wn.replace(/[\\u2013\\u2014]/g, '-');
+                const wantDash = wn.replace(/[\u2013\u2014]/g, '-');
                 if (!wantDash.includes(' - ')) {
                   if (wn.toLowerCase() === tn.toLowerCase()) return true;
                   if (tn.toLowerCase().startsWith(wn.toLowerCase())) return false;
@@ -6619,27 +6669,10 @@ def _grafana_playwright_legend_isolate_verified(page: Any, want_label: str) -> b
                 if (!w.rpc || !t.rpc) return true;
                 return w.rpc === t.rpc;
               };
-              const legendTextOf = (el) => {
-                const dt = el.getAttribute('data-testid') || '';
-                const m = dt.match(/VizLegend series\\s*(.*)$/i);
-                if (m && m[1]) return norm(m[1]);
-                const row = el.closest('tr');
-                if (row) {
-                  const cells = row.querySelectorAll('td');
-                  if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
-                  return norm(row.textContent || '');
-                }
-                return norm(el.textContent || '');
-              };
-              const isHidden = (el) => {
-                const cls = (el.className || '') + ' ' + ((el.closest('tr') || {}).className || '');
-                if (/inactive|disabled|unchecked|hidden/i.test(cls)) return true;
-                const st = window.getComputedStyle(el);
-                if (parseFloat(st.opacity) < 0.35) return true;
-                return false;
-              };
               const visible = [];
-              document.querySelectorAll('[data-testid*="VizLegend series"], table.viz-legend tbody tr').forEach((el) => {
+              document.querySelectorAll(
+                '[data-testid*="VizLegend series"], table.viz-legend tbody tr, [data-testid="viz-legend"] tbody tr'
+              ).forEach((el) => {
                 if (isHidden(el)) return;
                 const text = legendTextOf(el);
                 if (text && text !== '-') visible.push(text);
@@ -6729,8 +6762,9 @@ def _grafana_playwright_legend_rows_scan_all(page: Any, want_label: str) -> Dict
     exact_only = _grafana_want_legend_exact_only(want)
     try:
         raw = page.evaluate(
-            """({ want, exactOnly }) => {
-              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
+            "({ want, exactOnly }) => {\n"
+            + _GRAFANA_PLAYWRIGHT_LEGEND_DOM_HELPERS
+            + """
               const wantN = norm(want).toLowerCase();
               const matches = (text) => {
                 const tn = norm(text);
@@ -6743,39 +6777,12 @@ def _grafana_playwright_legend_rows_scan_all(page: Any, want_label: str) -> Dict
                 }
                 return false;
               };
-              const legendTextOf = (el) => {
-                const dt = el.getAttribute('data-testid') || '';
-                const m = dt.match(/VizLegend series\\s*(.*)$/i);
-                if (m && m[1]) return norm(m[1]);
-                const row = el.closest('tr');
-                if (row) {
-                  const cells = row.querySelectorAll('td');
-                  if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
-                  return norm(row.textContent || '');
-                }
-                return norm(el.textContent || el.getAttribute('title') || '');
-              };
-              const clickTarget = (el) => (
-                el.querySelector(
-                  'button,[role="button"],td:first-child,[class*="SeriesIcon"],[class*="legend-color"],a,span'
-                ) || el
-              );
-              const isHidden = (el) => {
-                const cls = (el.className || '') + ' ' + ((el.closest('tr') || {}).className || '');
-                if (/inactive|disabled|unchecked|hidden|excluded|series-hidden/i.test(cls)) return true;
-                const st = window.getComputedStyle(el);
-                if (parseFloat(st.opacity) < 0.35) return true;
-                const deco = String(st.textDecorationLine || st.textDecoration || '');
-                if (deco.includes('line-through')) return true;
-                return false;
-              };
               const collectRows = () => {
                 const out = [];
                 const sels = [
                   '[data-testid*="VizLegend series"]',
                   'table.viz-legend tbody tr',
                   '[data-testid="viz-legend"] tbody tr',
-                  '[data-testid="viz-legend"] [role="button"]',
                 ];
                 for (const sel of sels) {
                   document.querySelectorAll(sel).forEach((el) => {
@@ -6858,8 +6865,9 @@ def _grafana_playwright_legend_row_click_coords(
     exact_only = _grafana_want_legend_exact_only(want)
     try:
         raw = page.evaluate(
-            """({ want, exactOnly, scrollFromTop }) => {
-              const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
+            "({ want, exactOnly, scrollFromTop }) => {\n"
+            + _GRAFANA_PLAYWRIGHT_LEGEND_DOM_HELPERS
+            + """
               const wantN = norm(want).toLowerCase();
               const matches = (text) => {
                 const tn = norm(text);
@@ -6872,30 +6880,12 @@ def _grafana_playwright_legend_row_click_coords(
                 }
                 return false;
               };
-              const legendTextOf = (el) => {
-                const dt = el.getAttribute('data-testid') || '';
-                const m = dt.match(/VizLegend series\\s*(.*)$/i);
-                if (m && m[1]) return norm(m[1]);
-                const row = el.closest('tr');
-                if (row) {
-                  const cells = row.querySelectorAll('td');
-                  if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
-                  return norm(row.textContent || '');
-                }
-                return norm(el.textContent || el.getAttribute('title') || '');
-              };
-              const clickTarget = (el) => (
-                el.querySelector(
-                  'button,[role="button"],td:first-child,[class*="SeriesIcon"],[class*="legend-color"],a,span'
-                ) || el
-              );
               const collectRows = () => {
                 const out = [];
                 const sels = [
                   '[data-testid*="VizLegend series"]',
                   'table.viz-legend tbody tr',
                   '[data-testid="viz-legend"] tbody tr',
-                  '[data-testid="viz-legend"] [role="button"]',
                 ];
                 for (const sel of sels) {
                   document.querySelectorAll(sel).forEach((el) => {
@@ -6986,9 +6976,6 @@ def _grafana_playwright_legend_hide_all_except(
         txt = str(row.get("text") or "").strip()
         if txt:
             hidden_by_text[txt.casefold()] = bool(row.get("hidden"))
-    visible_now = {
-        v.casefold() for v in _grafana_playwright_legend_visible_labels(page) if str(v).strip()
-    }
 
     clicked = 0
     for txt in all_texts:
@@ -6998,7 +6985,8 @@ def _grafana_playwright_legend_hide_all_except(
         key = label.casefold()
         if hidden_by_text.get(key):
             continue
-        if visible_now and key not in visible_now:
+        vis_now = _grafana_playwright_legend_visible_labels(page)
+        if not any(_grafana_legend_labels_exact_equal(label, v) for v in vis_now):
             continue
         if _grafana_playwright_legend_click_row_by_text(page, label, double=False):
             clicked += 1
@@ -7078,7 +7066,30 @@ def _grafana_playwright_isolate_legend_via_mouse(
     try:
         _grafana_playwright_legend_scroll_to_label(page, want, max_rounds=100)
 
-        # 0) Fresh-coords dblclick (scan coords go stale after scrolling).
+        legend_root = page.locator(
+            '[data-testid="viz-legend"], .viz-legend, section[aria-label="Legend"]'
+        )
+
+        # Table legend: dblclick the label button (series name), not Max/Last stat cells.
+        esc = re.escape(want)
+        try:
+            label_btn = legend_root.locator("button[type='button']").filter(
+                has_text=re.compile(rf"^{esc}$", re.I)
+            )
+            if label_btn.count() > 0:
+                label_btn.first.scroll_into_view_if_needed(timeout=8000)
+                label_btn.first.dblclick(timeout=8000)
+                _grafana_clear_text_selection(page)
+                _after_isolate_wait()
+                if _verified():
+                    logger.info(
+                        "Grafana screenshot: label-button dblclick isolate want=%r", want[:100]
+                    )
+                    return True
+        except Exception:
+            pass
+
+        # Fresh-coords dblclick on label button (scan coords go stale after scrolling).
         if _grafana_playwright_legend_click_row_by_text(page, want, double=True):
             _after_isolate_wait()
             if _verified():
@@ -7087,12 +7098,7 @@ def _grafana_playwright_isolate_legend_via_mouse(
                 )
                 return True
 
-        legend_root = page.locator(
-            '[data-testid="viz-legend"], .viz-legend, section[aria-label="Legend"]'
-        )
-
-        # 1) Playwright locators scoped to legend (real clicks — React-safe).
-        esc = re.escape(want)
+        # Playwright locators scoped to legend (real clicks — React-safe).
         locator_candidates = [
             legend_root.locator(f'[data-testid="VizLegend series {want}"]'),
             legend_root.locator('[data-testid*="VizLegend series"]').filter(
@@ -7334,36 +7340,14 @@ def _grafana_watchdog_alert_screenshot_time_range(
 def _grafana_playwright_legend_rows_for_isolate(page: Any) -> List[Dict[str, Any]]:
     """Deduped legend rows: ``{text, x, y}`` click centers (color cell / button preferred)."""
     raw = page.evaluate(
-        """() => {
-          const norm = (s) => (s || '').replace(/[\\u2013\\u2014]/g, '-').replace(/\\s+/g, ' ').trim();
-          const legendTextOf = (el) => {
-            const dt = el.getAttribute('data-testid') || '';
-            const m = dt.match(/VizLegend series\\s*(.*)$/i);
-            if (m && m[1]) return norm(m[1]);
-            const title = el.getAttribute('title') || el.getAttribute('aria-label') || '';
-            if (title) return norm(title);
-            const row = el.closest('tr');
-            if (row) {
-              const cells = row.querySelectorAll('td');
-              if (cells.length >= 2) return norm(cells[cells.length - 1].textContent || '');
-              const nameEl = row.querySelector('[class*="label"], [class*="name"], th + td');
-              if (nameEl) return norm(nameEl.textContent || '');
-              return norm(row.textContent || '');
-            }
-            return norm(el.textContent || '');
-          };
-          const clickTarget = (el) => {
-            return (
-              el.querySelector(
-                'button,[role="button"],td:first-child,[class*="SeriesIcon"],[class*="legend-color"]'
-              ) || el
-            );
-          };
+        "() => {\n"
+        + _GRAFANA_PLAYWRIGHT_LEGEND_DOM_HELPERS
+        + """
           const byText = new Map();
           const sels = [
             '[data-testid*="VizLegend series"]',
             'table.viz-legend tbody tr',
-            '[data-testid="viz-legend"] button',
+            '[data-testid="viz-legend"] tbody tr',
           ];
           for (const sel of sels) {
             document.querySelectorAll(sel).forEach((el) => {
