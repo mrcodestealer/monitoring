@@ -356,7 +356,7 @@ _CFG: Dict[str, Any] = {
     # 告警 / 超阈值 /mo 文末仅 @ 此人时追加的说明（空=只 @ 不追加句子）
     "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
     # In which group
-    "MONITORING_ALERT_CHAT_ID": "oc_9de3d63fc589df6feeb9b0bee9c45b72",
+    "MONITORING_ALERT_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
 }
 
 
