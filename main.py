@@ -220,7 +220,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_CANCELMUTE_TRIGGER": "/c",
     # @bot + "git pull and restart service" — git pull in repo then systemd restart (admin only)
     "MONITORING_DEPLOY_ENABLE": "1",
-    "MONITORING_DEPLOY_ALLOWED_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
+    "MONITORING_DEPLOY_ALLOWED_OPEN_ID": "ou_039809aab3d6df17028dfe4bdfc568cd",
     "MONITORING_DEPLOY_REPO_DIR": "",
     "MONITORING_DEPLOY_RESTART_CMD": "systemctl restart grafanaplatformbot",
     # 1=仅 @ 机器人且无其它正文也触发（与 MONITORING_TRIGGER 默认 /mo 同）；1+ANY=1 时 @ 且任意正文也跑监控（非命令且带字会先收到命令说明）
@@ -945,7 +945,7 @@ MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").
 MONITORING_DEPLOY_ENABLE = _lark_env_truthy_or_default("MONITORING_DEPLOY_ENABLE", default=True)
 MONITORING_DEPLOY_ALLOWED_OPEN_ID = _cfg_str(
     "MONITORING_DEPLOY_ALLOWED_OPEN_ID",
-    "ou_d7bc33724e2d6ced4050c944c2ca5650",
+    "ou_039809aab3d6df17028dfe4bdfc568cd",
 ).strip()
 MONITORING_DEPLOY_REPO_DIR = _cfg_str("MONITORING_DEPLOY_REPO_DIR", "").strip()
 MONITORING_DEPLOY_RESTART_CMD = _cfg_str(
