@@ -220,7 +220,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_CANCELMUTE_TRIGGER": "/c",
     # @bot + "git pull and restart service" — git pull in repo then systemd restart (admin only)
     "MONITORING_DEPLOY_ENABLE": "1",
-    "MONITORING_DEPLOY_ALLOWED_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
+    "MONITORING_DEPLOY_ALLOWED_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
     "MONITORING_DEPLOY_REPO_DIR": "",
     "MONITORING_DEPLOY_RESTART_CMD": "systemctl restart grafanaplatformbot",
     # 1=仅 @ 机器人且无其它正文也触发（与 MONITORING_TRIGGER 默认 /mo 同）；1+ANY=1 时 @ 且任意正文也跑监控（非命令且带字会先收到命令说明）
@@ -945,7 +945,7 @@ MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").
 MONITORING_DEPLOY_ENABLE = _lark_env_truthy_or_default("MONITORING_DEPLOY_ENABLE", default=True)
 MONITORING_DEPLOY_ALLOWED_OPEN_ID = _cfg_str(
     "MONITORING_DEPLOY_ALLOWED_OPEN_ID",
-    "ou_5f660c0fb0769d184aca635d02209272",
+    "ou_d7bc33724e2d6ced4050c944c2ca5650",
 ).strip()
 MONITORING_DEPLOY_REPO_DIR = _cfg_str("MONITORING_DEPLOY_REPO_DIR", "").strip()
 MONITORING_DEPLOY_RESTART_CMD = _cfg_str(
@@ -4675,11 +4675,16 @@ def _monitoring_deploy_send_ack(chat_id: str, open_id: str, text: str) -> None:
     _lark_send_text(rt, rv, text)
 
 
+def _monitoring_deploy_allowed_open_ids() -> Set[str]:
+    raw = (MONITORING_DEPLOY_ALLOWED_OPEN_ID or "").strip()
+    return {x.strip() for x in re.split(r"[\s,;]+", raw) if x.strip()}
+
+
 def _monitoring_deploy_open_id_allowed(open_id: str) -> bool:
-    allowed = (MONITORING_DEPLOY_ALLOWED_OPEN_ID or "").strip()
+    allowed = _monitoring_deploy_allowed_open_ids()
     if not allowed:
         return False
-    return (open_id or "").strip() == allowed
+    return (open_id or "").strip() in allowed
 
 
 def _monitoring_deploy_repo_dir() -> str:
@@ -11886,46 +11891,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     if _monitoring_im_is_deploy_command(raw_text or "", clean or ""):
         rt_d, rv_d = _monitoring_deploy_im_receive_target(chat_id, open_id)
-        deploy_addressed_ok = True
-        if MONITORING_TRIGGER_REQUIRES_AT_BOT:
-            deploy_addressed_ok = (
-                _lark_im_bot_addressed_in_mentions_or_body(mentions, content_at_entity_ids)
-                or _monitoring_at_bot_requirement_satisfied(
-                    raw_text,
-                    mentions,
-                    content_at_entity_ids=content_at_entity_ids,
-                    msg=msg,
-                    chat_type=im_chat_type,
-                )
-            )
-        if not deploy_addressed_ok:
-            logger.info(
-                "deploy skip — not addressed to this bot raw=%r clean=%r",
-                (raw_text or "")[:160],
-                (clean or "")[:160],
-            )
-            if rv_d:
-                try:
-                    _monitoring_deploy_send_ack(
-                        chat_id,
-                        open_id,
-                        "Deploy: please @ **this** Platform bot, then send "
-                        "`git pull and restart service` again.",
-                    )
-                except Exception:
-                    logger.exception("deploy @-hint send failed")
-            return
-        if not _monitoring_deploy_open_id_allowed(open_id):
-            logger.info(
-                "deploy rejected — open_id=%r not in MONITORING_DEPLOY_ALLOWED_OPEN_ID",
-                (open_id or "")[:24],
-            )
-            if rv_d:
-                try:
-                    _monitoring_deploy_send_ack(chat_id, open_id, "Deploy command: not authorized.")
-                except Exception:
-                    logger.exception("deploy unauthorized send failed")
-            return
         processed_d = _monitoring_processed_stick(
             mid, im_event_id, chat_id or "", sender_debounce, msg_time
         )
@@ -11953,6 +11918,24 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
                     _processed_lark_im_event_ids.clear()
                     _processed_lark_im_event_ids.add(im_event_id)
+        if not _monitoring_deploy_open_id_allowed(open_id):
+            logger.info(
+                "deploy rejected — open_id=%r allowed=%s",
+                open_id or None,
+                sorted(_monitoring_deploy_allowed_open_ids()),
+            )
+            if rv_d:
+                try:
+                    _monitoring_deploy_send_ack(
+                        chat_id,
+                        open_id,
+                        f"Deploy command: not authorized (your open_id={(open_id or 'unknown')}).",
+                    )
+                except Exception:
+                    logger.exception("deploy unauthorized send failed")
+            with _monitoring_reply_dispatch_lock:
+                _monitoring_inflight_keys.discard(debounce_key_d)
+            return
         logger.info("deploy command accepted chat=%r open_id_prefix=%r", bool(chat_id), (open_id or "")[:12])
         if rv_d:
             try:
