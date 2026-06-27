@@ -271,27 +271,27 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_SDK_DEBUG": "0",
     "LARK_WEBHOOK_WSGI_LOG": "0",
     "LARK_WEBHOOK_TIMING_LOG": "0",
-    "MONITORING_HTTP_DROP_ALERT_PCT": 10,
-    "MONITORING_HTTP_CONTINUOUS_ALERT_PCT": 20,
+    "MONITORING_HTTP_DROP_ALERT_PCT": 25,
+    "MONITORING_HTTP_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_9280_ENABLE": "1",
-    "MONITORING_9280_ALERT_PCT": 15,
+    "MONITORING_9280_ALERT_PCT": 25,
     "MONITORING_9280_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_DEPOSIT_ENABLE": "1",
-    "MONITORING_DEPOSIT_ALERT_PCT": 80,
-    "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT": 120,
+    "MONITORING_DEPOSIT_ALERT_PCT": 25,
+    "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_WITHDRAW_ENABLE": "1",
-    "MONITORING_WITHDRAW_ALERT_PCT": 80,
-    "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 120,
+    "MONITORING_WITHDRAW_ALERT_PCT": 25,
+    "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 25,
     # Withdraw only: spike/drop vs **median baseline** of eval window (not bucket-to-bucket %).
-    # 例 median=200、80% → spike 需 >360；median=30 时 40 仅 +33% vs baseline，20→40 不告警。
+    # 例 median=200、25% → spike 需 >250；median=30 时 40 仅 +33% vs baseline，不告警。
     "MONITORING_WITHDRAW_MIN_BASELINE_VALUE": "0",
     "MONITORING_FPMS_NT_LOGIN_ENABLE": "1",
-    # Authenticate logins: spike/drop vs eval-window **median baseline** (>50% fast or continuous).
-    "MONITORING_FPMS_NT_LOGIN_ALERT_PCT": 50,
-    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT": 50,
+    # Authenticate logins: spike/drop vs eval-window **median baseline**.
+    "MONITORING_FPMS_NT_LOGIN_ALERT_PCT": 25,
+    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_ERROR_REQ_ENABLE": "1",
-    "MONITORING_ERROR_REQ_ALERT_PCT": 50,
-    "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 80,
+    "MONITORING_ERROR_REQ_ALERT_PCT": 25,
+    "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_PROVIDER_JILI_ENABLE": "1",
     "MONITORING_PROVIDER_JILI_ALERT_PCT": 25,
     "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 25,
@@ -305,12 +305,14 @@ _CFG: Dict[str, Any] = {
     "MONITORING_GAMES_JILI_ALERT_PCT": 25,
     "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_GAMES_GENERAL_ENABLE": "1",
-    "MONITORING_GAMES_GENERAL_ALERT_PCT": 40,
-    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT": 40,
+    "MONITORING_GAMES_GENERAL_ALERT_PCT": 25,
+    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_GAMES_INHOUSE_ENABLE": "1",
     # Games panels: spike/drop vs **median baseline** in eval window (not bucket-to-bucket %).
     "MONITORING_GAMES_INHOUSE_ALERT_PCT": 25,
     "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT": 25,
+    # 全 graph 统一：判窗 median baseline 偏离 >= 该 % 即触发（取代 Fast/Continuous 双阈值）
+    "MONITORING_MEDIAN_ALERT_PCT": 25,
     "MONITORING_ALERT_WINDOW_SECONDS": 120,
     # 1=alert text skips Fast/Continuous SPIKE/DROP lines; only a short time/value tail (Grafana-like).
     "MONITORING_SIMPLE_ALERT_TEXT": "0",
@@ -347,6 +349,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_AI_TIMEOUT_SECONDS": "120",
     # AI 不可达 / 无法判定时：1=照常发送（不漏报），0=抑制不发
     "MONITORING_AI_GATE_FAIL_OPEN": "1",
+    # fail-open 时在正文末尾追加的说明（空=不追加）
+    "MONITORING_AI_FAIL_OPEN_NOTE": "🤖 AI review unavailable — alert sent without AI explanation.",
     # 自定义判定提示词（留空用内置默认；可用 {alert} 占位符插入告警正文）
     "MONITORING_AI_PROMPT": "",
     # 每日静默：该时段内不拉数、不判警（本地机器时间；可配两段）
@@ -939,48 +943,69 @@ MONITORING_ALERT_AT_USER_NOTE = _cfg_str(
     "MONITORING_ALERT_AT_USER_NOTE",
     "It might be event started or false alert kindly check",
 ).strip()
-MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
-MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 15.0)
-MONITORING_HTTP_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_HTTP_CONTINUOUS_ALERT_PCT", 20.0)
-MONITORING_9280_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_9280_CONTINUOUS_ALERT_PCT", 25.0)
-MONITORING_DEPOSIT_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_ALERT_PCT", 60.0)
-MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT", 80.0)
-MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", 60.0)
-MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", 80.0)
+MONITORING_MEDIAN_ALERT_PCT = _cfg_float("MONITORING_MEDIAN_ALERT_PCT", 25.0)
+MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT)
+MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT)
+MONITORING_HTTP_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_HTTP_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
+MONITORING_9280_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_9280_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
+MONITORING_DEPOSIT_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT)
+MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
+MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT)
+MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float(
+    "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
 MONITORING_WITHDRAW_MIN_BASELINE_VALUE = max(
     0.0, _cfg_float("MONITORING_WITHDRAW_MIN_BASELINE_VALUE", 0.0)
 )
-MONITORING_FPMS_NT_LOGIN_ALERT_PCT = _cfg_float("MONITORING_FPMS_NT_LOGIN_ALERT_PCT", 50.0)
+MONITORING_FPMS_NT_LOGIN_ALERT_PCT = _cfg_float(
+    "MONITORING_FPMS_NT_LOGIN_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
 MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT", 50.0
+    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
 )
-MONITORING_ERROR_REQ_ALERT_PCT = _cfg_float("MONITORING_ERROR_REQ_ALERT_PCT", 50.0)
+MONITORING_ERROR_REQ_ALERT_PCT = _cfg_float("MONITORING_ERROR_REQ_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT)
 MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT", 80.0
+    "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
 )
-MONITORING_PROVIDER_JILI_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_JILI_ALERT_PCT", 25.0)
+MONITORING_PROVIDER_JILI_ALERT_PCT = _cfg_float(
+    "MONITORING_PROVIDER_JILI_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
 MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT", 25.0
+    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
 )
-MONITORING_PROVIDER_GENERAL_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_GENERAL_ALERT_PCT", 25.0)
+MONITORING_PROVIDER_GENERAL_ALERT_PCT = _cfg_float(
+    "MONITORING_PROVIDER_GENERAL_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
 MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT", 25.0
+    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
 )
-MONITORING_PROVIDER_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_INHOUSE_ALERT_PCT", 25.0)
+MONITORING_PROVIDER_INHOUSE_ALERT_PCT = _cfg_float(
+    "MONITORING_PROVIDER_INHOUSE_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
 MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT", 25.0
+    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
 )
-MONITORING_GAMES_JILI_ALERT_PCT = _cfg_float("MONITORING_GAMES_JILI_ALERT_PCT", 25.0)
+MONITORING_GAMES_JILI_ALERT_PCT = _cfg_float("MONITORING_GAMES_JILI_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT)
 MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT", 25.0
+    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
 )
-MONITORING_GAMES_GENERAL_ALERT_PCT = _cfg_float("MONITORING_GAMES_GENERAL_ALERT_PCT", 40.0)
+MONITORING_GAMES_GENERAL_ALERT_PCT = _cfg_float(
+    "MONITORING_GAMES_GENERAL_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
 MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT", 40.0
+    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
 )
-MONITORING_GAMES_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_GAMES_INHOUSE_ALERT_PCT", 25.0)
+MONITORING_GAMES_INHOUSE_ALERT_PCT = _cfg_float(
+    "MONITORING_GAMES_INHOUSE_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+)
 MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT", 25.0
+    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
 )
 MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 120))
 MONITORING_DROP_LAST_MERGED_MINUTES = max(
@@ -9234,38 +9259,36 @@ def _http_drop_spike_analysis(
     return out
 
 
-def _withdraw_baseline_drop_spike_analysis(
+def _median_baseline_alert_analysis(
     points: List[Tuple[float, float]],
-    fast_threshold_pct: float,
-    continuous_threshold_pct: float,
-    window_seconds: int = 120,
+    threshold_pct: float,
     *,
     min_baseline_value: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Withdraw-only: compare peaks/troughs to the **median baseline** of the eval window.
-    Ignores low-volume bucket-to-bucket % noise (e.g. 20→40 is +100% between buckets but only
-    +33% vs median≈30, below an 80% threshold).
+    Unified alert rule for all graphs: any bucket deviating from the eval-window
+    **median baseline** by >= ``threshold_pct`` triggers immediately (SPIKE or DROP).
     """
+    thr = float(threshold_pct)
     out: Dict[str, Any] = {
         "pointCount": len(points),
         "hit_alert": False,
         "alert_rule": "baseline_median",
-        "fast_threshold_pct": fast_threshold_pct,
-        "continuous_threshold_pct": continuous_threshold_pct,
-        "window_seconds": int(window_seconds),
+        "threshold_pct": thr,
+        "fast_threshold_pct": thr,
+        "continuous_threshold_pct": thr,
+        "window_seconds": int(MONITORING_ALERT_WINDOW_SECONDS),
         "baseline_median": None,
         "consecutive_max_drop": None,
         "consecutive_max_spike": None,
         "window_max_drop": None,
         "window_max_spike": None,
     }
-    if len(points) < 2:
+    if len(points) < 1:
         return out
 
-    vals = [p[1] for p in points]
-    ts = [p[0] for p in points]
-    L = len(points)
+    vals = [float(p[1]) for p in points]
+    ts = [float(p[0]) for p in points]
     baseline = _median_finite(vals)
     out["baseline_median"] = round(baseline, 2) if baseline > 0 else None
     if baseline <= 0:
@@ -9273,30 +9296,51 @@ def _withdraw_baseline_drop_spike_analysis(
     if float(min_baseline_value) > 0 and baseline < float(min_baseline_value):
         return out
 
-    if L >= 2:
-        diffs = [max(1.0, ts[i + 1] - ts[i]) for i in range(L - 1)]
-        diffs.sort()
-        step_sec = diffs[len(diffs) // 2]
-    else:
-        step_sec = 60.0
-    span = max(1, int(round(float(window_seconds) / float(step_sec))))
-    out["window_span_buckets"] = span + 1
-
-    fast_spike_level = baseline * (1.0 + float(fast_threshold_pct) / 100.0)
-    fast_drop_level = baseline * (1.0 - float(fast_threshold_pct) / 100.0)
-    cont_spike_level = baseline * (1.0 + float(continuous_threshold_pct) / 100.0)
-    cont_drop_level = baseline * max(0.0, 1.0 - float(continuous_threshold_pct) / 100.0)
-
-    def _pct_above_baseline(val: float) -> float:
+    def _pct_above(val: float) -> float:
         return round((float(val) - baseline) / baseline * 100.0, 2)
 
-    def _pct_below_baseline(val: float) -> float:
+    def _pct_below(val: float) -> float:
         return round((baseline - float(val)) / baseline * 100.0, 2)
 
-    drop_run = _best_consecutive_drop_run(vals, ts)
+    best_spike: Optional[Dict[str, Any]] = None
+    best_drop: Optional[Dict[str, Any]] = None
+
+    for j, (t, v) in enumerate(zip(ts, vals)):
+        if v > baseline:
+            pct = _pct_above(v)
+            if pct >= thr:
+                out["hit_alert"] = True
+                from_t, from_v = (ts[j - 1], vals[j - 1]) if j > 0 else (t, baseline)
+                cand = {
+                    "pct": pct,
+                    "from_ts": from_t,
+                    "to_ts": t,
+                    "from_val": from_v,
+                    "to_val": v,
+                    "baseline_median": baseline,
+                }
+                if best_spike is None or float(cand["pct"]) > float(best_spike["pct"]):
+                    best_spike = cand
+        elif v < baseline:
+            pct = _pct_below(v)
+            if pct >= thr:
+                out["hit_alert"] = True
+                from_t, from_v = (ts[j - 1], vals[j - 1]) if j > 0 else (t, baseline)
+                cand = {
+                    "pct": pct,
+                    "from_ts": from_t,
+                    "to_ts": t,
+                    "from_val": from_v,
+                    "to_val": v,
+                    "baseline_median": baseline,
+                }
+                if best_drop is None or float(cand["pct"]) > float(best_drop["pct"]):
+                    best_drop = cand
+
+    drop_run = _best_consecutive_drop_run(vals, ts) if len(points) >= 2 else None
     if drop_run is not None:
         end_val = float(drop_run.get("to_val") or 0.0)
-        pct_b = _pct_below_baseline(end_val)
+        pct_b = _pct_below(end_val)
         out["consecutive_max_drop"] = {
             "pct": pct_b,
             "from_ts": drop_run["from_ts"],
@@ -9306,13 +9350,15 @@ def _withdraw_baseline_drop_spike_analysis(
             "buckets": drop_run["buckets"],
             "baseline_median": baseline,
         }
-        if end_val < cont_drop_level and pct_b >= min(float(continuous_threshold_pct), 100.0):
+        if pct_b >= thr:
             out["hit_alert"] = True
+            if best_drop is None or pct_b > float(best_drop.get("pct") or 0.0):
+                best_drop = out["consecutive_max_drop"]
 
-    spike_run = _best_consecutive_spike_run(vals, ts)
+    spike_run = _best_consecutive_spike_run(vals, ts) if len(points) >= 2 else None
     if spike_run is not None:
         end_val = float(spike_run.get("to_val") or 0.0)
-        pct_b = _pct_above_baseline(end_val)
+        pct_b = _pct_above(end_val)
         out["consecutive_max_spike"] = {
             "pct": pct_b,
             "from_ts": spike_run["from_ts"],
@@ -9322,64 +9368,38 @@ def _withdraw_baseline_drop_spike_analysis(
             "buckets": spike_run["buckets"],
             "baseline_median": baseline,
         }
-        if end_val > cont_spike_level and pct_b >= float(continuous_threshold_pct):
+        if pct_b >= thr:
             out["hit_alert"] = True
+            if best_spike is None or pct_b > float(best_spike.get("pct") or 0.0):
+                best_spike = out["consecutive_max_spike"]
 
-    best_w_drop: Optional[Dict[str, Any]] = None
-    best_w_spike: Optional[Dict[str, Any]] = None
-    for i in range(0, L - span):
-        j = i + span
-        end_val = float(vals[j])
-        # Require real movement across the window: a DROP must actually fall and a
-        # SPIKE must actually rise. Otherwise a flat region sitting above/below the
-        # median baseline (e.g. flat 30 while baseline is dragged down by a later
-        # drop to 9) would mislabel "30 → 30" as a spike.
-        if end_val < fast_drop_level and float(vals[j]) < float(vals[i]):
-            pct_b = _pct_below_baseline(end_val)
-            cand_d = {
-                "pct": pct_b,
-                "from_ts": ts[i],
-                "to_ts": ts[j],
-                "from_val": vals[i],
-                "to_val": vals[j],
-                "window_seconds": int(round(ts[j] - ts[i])),
-                "baseline_median": baseline,
-            }
-            if best_w_drop is None or float(cand_d["pct"]) > float(best_w_drop["pct"]):
-                best_w_drop = cand_d
-        if end_val > fast_spike_level and float(vals[j]) > float(vals[i]):
-            pct_b = _pct_above_baseline(end_val)
-            cand_s = {
-                "pct": pct_b,
-                "from_ts": ts[i],
-                "to_ts": ts[j],
-                "from_val": vals[i],
-                "to_val": vals[j],
-                "window_seconds": int(round(ts[j] - ts[i])),
-                "baseline_median": baseline,
-            }
-            if best_w_spike is None or float(cand_s["pct"]) > float(best_w_spike["pct"]):
-                best_w_spike = cand_s
-
-    out["window_max_drop"] = best_w_drop
-    out["window_max_spike"] = best_w_spike
-    if best_w_drop is not None and float(best_w_drop.get("pct") or 0.0) >= float(fast_threshold_pct):
-        out["hit_alert"] = True
-    if best_w_spike is not None and float(best_w_spike.get("pct") or 0.0) >= float(fast_threshold_pct):
-        out["hit_alert"] = True
+    out["window_max_drop"] = best_drop
+    out["window_max_spike"] = best_spike
     return out
+
+
+def _withdraw_baseline_drop_spike_analysis(
+    points: List[Tuple[float, float]],
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    window_seconds: int = 120,
+    *,
+    min_baseline_value: float = 0.0,
+) -> Dict[str, Any]:
+    """Backward-compatible wrapper — uses unified median baseline rule."""
+    del continuous_threshold_pct, window_seconds
+    return _median_baseline_alert_analysis(
+        points,
+        fast_threshold_pct,
+        min_baseline_value=min_baseline_value,
+    )
 
 
 def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_http_timeseries_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
-    a = _http_drop_spike_analysis(
-        pts,
-        MONITORING_HTTP_DROP_ALERT_PCT,
-        MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
-    )
+    a = _median_baseline_alert_analysis(pts, MONITORING_MEDIAN_ALERT_PCT)
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
     return a
@@ -9389,12 +9409,7 @@ def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_9280_push_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="max")
     pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
-    a = _http_drop_spike_analysis(
-        pts,
-        MONITORING_9280_ALERT_PCT,
-        MONITORING_9280_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
-    )
+    a = _median_baseline_alert_analysis(pts, MONITORING_MEDIAN_ALERT_PCT)
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
     return a
@@ -9404,12 +9419,7 @@ def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_deposit_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
-    a = _http_drop_spike_analysis(
-        pts,
-        MONITORING_DEPOSIT_ALERT_PCT,
-        MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
-    )
+    a = _median_baseline_alert_analysis(pts, MONITORING_MEDIAN_ALERT_PCT)
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
     return a
@@ -9419,11 +9429,9 @@ def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_withdraw_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
-    a = _withdraw_baseline_drop_spike_analysis(
+    a = _median_baseline_alert_analysis(
         pts,
-        MONITORING_WITHDRAW_ALERT_PCT,
-        MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
+        MONITORING_MEDIAN_ALERT_PCT,
         min_baseline_value=MONITORING_WITHDRAW_MIN_BASELINE_VALUE,
     )
     a["point_count"] = len(pts)
@@ -9443,13 +9451,7 @@ def _analysis_for_fpms_nt_login_payload(payload: Dict[str, Any]) -> Dict[str, An
         )
     pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="sum")
     pts_filtered = _trim_trailing_minute_buckets(pts_filtered, _analysis_drop_n())
-    a = _withdraw_baseline_drop_spike_analysis(
-        pts_filtered,
-        MONITORING_FPMS_NT_LOGIN_ALERT_PCT,
-        MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
-        min_baseline_value=0.0,
-    )
+    a = _median_baseline_alert_analysis(pts_filtered, MONITORING_MEDIAN_ALERT_PCT)
     a["point_count"] = len(pts_filtered)
     a["merged_points"] = [[t, v] for t, v in pts_filtered]
     return a
@@ -9570,48 +9572,25 @@ def _error_req_analysis_has_spike(
     fast_threshold_pct: Optional[float] = None,
     continuous_threshold_pct: Optional[float] = None,
 ) -> bool:
-    """Absolute min-peak spike by default; baseline continuous % for configured series."""
-    lbl = str(analysis.get("label") or "")
-    if _error_req_uses_baseline_continuous_rules(lbl):
-        _, cont_thr, _ = _error_req_thresholds_for_label(lbl)
-        if continuous_threshold_pct is not None:
-            cont_thr = float(continuous_threshold_pct)
-        min_peak = _error_req_min_spike_for_label(lbl)
-        cs = analysis.get("consecutive_max_spike")
-        if (
-            isinstance(cs, dict)
-            and float(cs.get("pct") or 0.0) >= float(cont_thr)
-            and _error_req_spike_peak_value(cs) >= min_peak
-        ):
-            return True
-        return False
+    """True when series deviates from eval-window median by >= threshold."""
     del fast_threshold_pct, continuous_threshold_pct
-    min_peak = _error_req_min_spike_for_label(lbl)
-    return bool(_error_req_qualifying_spike_events(analysis, min_peak))
+    return bool(analysis.get("hit_alert"))
 
 
 def _analysis_for_error_req_points(
     pts: List[Tuple[float, float]], *, label: str = ""
 ) -> Dict[str, Any]:
-    if _error_req_uses_baseline_continuous_rules(label):
-        pts_work = _snap_series_to_monitoring_minutes(pts, how="sum")
-        pts_work = _trim_trailing_minute_buckets(pts_work, _analysis_drop_n())
-        cont_thr = _error_req_continuous_pct_for_label(label)
-        a = _withdraw_baseline_drop_spike_analysis(
-            pts_work,
-            MONITORING_ERROR_REQ_ALERT_PCT,
-            cont_thr,
-            MONITORING_ALERT_WINDOW_SECONDS,
-            min_baseline_value=MONITORING_ERROR_REQ_MIN_BASELINE_VALUE,
-        )
-        a["point_count"] = len(pts_work)
-        a["merged_points"] = [[t, v] for t, v in pts_work]
-        a["label"] = label
-        a["alert_rule"] = "baseline_continuous_only"
-        a["hit_alert"] = False
-        return a
-    min_peak = _error_req_min_spike_for_label(label)
-    return _error_req_absolute_spike_analysis(pts, label=label, min_peak=min_peak)
+    pts_work = _snap_series_to_monitoring_minutes(pts, how="sum")
+    pts_work = _trim_trailing_minute_buckets(pts_work, _analysis_drop_n())
+    a = _median_baseline_alert_analysis(
+        pts_work,
+        MONITORING_MEDIAN_ALERT_PCT,
+        min_baseline_value=MONITORING_ERROR_REQ_MIN_BASELINE_VALUE,
+    )
+    a["point_count"] = len(pts_work)
+    a["merged_points"] = [[t, v] for t, v in pts_work]
+    a["label"] = label
+    return a
 
 
 def _analysis_for_error_req_series(
@@ -9664,10 +9643,11 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "hit_alert": any(bool(e.get("spiked")) for e in entries),
         "dual_spike_required": False,
-        "alert_rule": "absolute_peak_any_series",
+        "alert_rule": "baseline_median_any_series",
         "series_entries": entries,
-        "fast_threshold_pct": MONITORING_ERROR_REQ_ALERT_PCT,
-        "continuous_threshold_pct": MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT,
+        "threshold_pct": MONITORING_MEDIAN_ALERT_PCT,
+        "fast_threshold_pct": MONITORING_MEDIAN_ALERT_PCT,
+        "continuous_threshold_pct": MONITORING_MEDIAN_ALERT_PCT,
         "window_seconds": MONITORING_ALERT_WINDOW_SECONDS,
         "point_count": total_pts,
         "merged_points": merged_all,
@@ -9779,48 +9759,36 @@ def _format_error_req_trigger_lines(
     continuous_threshold_pct: float,
     window_seconds: int,
 ) -> List[str]:
-    del fast_threshold_pct, continuous_threshold_pct, window_seconds
+    del window_seconds
     if not bool(analysis.get("hit_alert")):
         return []
-    spiked = [
-        e for e in (analysis.get("series_entries") or [])
-        if isinstance(e, dict) and e.get("spiked")
-    ]
-    if not spiked:
-        return []
+    thr = float(
+        analysis.get("threshold_pct")
+        or analysis.get("fast_threshold_pct")
+        or fast_threshold_pct
+        or MONITORING_MEDIAN_ALERT_PCT
+    )
     blocks: List[str] = []
-    for ent in spiked:
+    for ent in (analysis.get("series_entries") or []):
+        if not isinstance(ent, dict) or not ent.get("spiked"):
+            continue
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         lbl = str(ent.get("label") or sub.get("label") or "series")
-        cont_only = bool(ent.get("continuous_only") or _error_req_continuous_only_for_label(lbl))
-        if cont_only:
-            cont_thr = float(ent.get("continuous_pct") or _error_req_continuous_pct_for_label(lbl))
-            picked_evt = _pick_alert_spike_drop_event(
-                sub, 999.0, cont_thr, spike_only=True
-            )
-            if picked_evt:
-                direction, from_val, to_val, from_ts, to_ts = picked_evt
-                blocks.append(
-                    _format_spike_drop_alert_block(
-                        GRAFANA_PANEL_TITLE_ERROR_REQ,
-                        lbl,
-                        direction,
-                        from_val,
-                        to_val,
-                        from_ts,
-                        to_ts,
-                    )
-                )
+        picked = _pick_alert_spike_drop_event(sub, thr, thr)
+        if not picked:
             continue
-        min_peak = float(ent.get("min_spike") or _error_req_min_spike_for_label(lbl))
-        picked = _pick_error_req_spike_event(sub, min_peak)
-        if picked:
-            peak_ts, peak_val = picked
-            blocks.append(
-                _format_error_req_spike_alert_block(
-                    GRAFANA_PANEL_TITLE_ERROR_REQ, lbl, peak_ts, peak_val
-                )
+        direction, from_val, to_val, from_ts, to_ts = picked
+        blocks.append(
+            _format_spike_drop_alert_block(
+                GRAFANA_PANEL_TITLE_ERROR_REQ,
+                lbl,
+                direction,
+                from_val,
+                to_val,
+                from_ts,
+                to_ts,
             )
+        )
     return blocks
 
 
@@ -9832,9 +9800,8 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
     ]
     lines: List[str] = [
         "",
-        f"[Error req] alert when any series **increases** to its per-series min peak "
-        f"(default {MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min); "
-        f"decreases and sub-threshold spikes are ignored; "
+        f"[Error req] alert when any series deviates from eval-window median baseline by "
+        f">={MONITORING_MEDIAN_ALERT_PCT:g}% (SPIKE or DROP); "
         f"excludes {_error_req_exclude_summary()}",
     ]
     if _error_req_all_series_mode() and entries:
@@ -9847,36 +9814,26 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
         lbl = str(ent.get("label") or "series")
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         spiked = bool(ent.get("spiked"))
-        min_spike = float(ent.get("min_spike") or _error_req_min_spike_for_label(lbl))
-        cont_thr = float(ent.get("continuous_pct") or _error_req_continuous_pct_for_label(lbl))
         cont_only = bool(ent.get("continuous_only") or _error_req_continuous_only_for_label(lbl))
-        meta: List[str] = []
+        meta: List[str] = [f"median {MONITORING_MEDIAN_ALERT_PCT:g}%"]
         if cont_only:
-            meta.append(f"continuous {cont_thr:g}%")
-            meta.append("continuous-only")
-        else:
-            meta.append(f"min peak {min_spike:g}")
+            meta.append("continuous-only legacy flag")
         lines.append(
             f"  {lbl}: spike={'yes' if spiked else 'no'}"
             + (f" ({', '.join(meta)})" if meta else "")
         )
-        peak_ev = sub.get("peak_spike") if isinstance(sub.get("peak_spike"), dict) else {}
-        if peak_ev:
+        ws = sub.get("window_max_spike")
+        wd = sub.get("window_max_drop")
+        if isinstance(ws, dict):
             lines.append(
-                f"    last qualifying rise: {_fmt_ts_short(peak_ev.get('from_ts'))} "
-                f"{_fmt_num(peak_ev.get('from_val'))} → {_fmt_ts_short(peak_ev.get('to_ts'))} "
-                f"{_fmt_num(peak_ev.get('to_val'))}"
+                f"    max spike vs median: +{(ws or {}).get('pct', 'n/a')}%"
             )
-        elif cont_only:
-            cs = sub.get("consecutive_max_spike")
-            if isinstance(cs, dict):
-                lines.append(
-                    f"    continuous vs baseline: +{(cs or {}).get('pct', 'n/a')}%"
-                )
-            elif not spiked:
-                lines.append("    (no continuous spike to threshold in window)")
+        elif isinstance(wd, dict):
+            lines.append(
+                f"    max drop vs median: -{(wd or {}).get('pct', 'n/a')}%"
+            )
         elif not spiked:
-            lines.append("    (no upward rise to min peak in window)")
+            lines.append("    (no deviation >= threshold in window)")
     return lines
 
 
@@ -9895,12 +9852,7 @@ def _analysis_for_keyword_payload(
         )
     pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="max")
     pts_filtered = _trim_trailing_minute_buckets(pts_filtered, _analysis_drop_n())
-    a = _http_drop_spike_analysis(
-        pts_filtered,
-        fast_threshold_pct,
-        continuous_threshold_pct,
-        MONITORING_ALERT_WINDOW_SECONDS,
-    )
+    a = _median_baseline_alert_analysis(pts_filtered, MONITORING_MEDIAN_ALERT_PCT)
     a["point_count"] = len(pts_filtered)
     a["merged_points"] = [[t, v] for t, v in pts_filtered]
     if not pts:
@@ -9974,11 +9926,9 @@ def _analysis_for_keyword_baseline_payload(
         )
     pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="max")
     pts_filtered = _trim_trailing_minute_buckets(pts_filtered, _analysis_drop_n())
-    a = _withdraw_baseline_drop_spike_analysis(
+    a = _median_baseline_alert_analysis(
         pts_filtered,
-        fast_threshold_pct,
-        continuous_threshold_pct,
-        MONITORING_ALERT_WINDOW_SECONDS,
+        MONITORING_MEDIAN_ALERT_PCT,
         min_baseline_value=min_baseline_value,
     )
     a["point_count"] = len(pts_filtered)
@@ -10037,31 +9987,29 @@ def _analysis_for_games_inhouse_payload(payload: Dict[str, Any]) -> Dict[str, An
 def _format_extra_analysis_lines(section_label: str, analysis: Dict[str, Any]) -> List[str]:
     if MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS:
         return []
-    fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_9280_ALERT_PCT)
-    cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_9280_CONTINUOUS_ALERT_PCT)
-    win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
+    fast_thr = float(analysis.get("threshold_pct") or analysis.get("fast_threshold_pct") or MONITORING_MEDIAN_ALERT_PCT)
     baseline = analysis.get("baseline_median")
     if analysis.get("alert_rule") == "baseline_median" and baseline is not None:
         lines = [
             "",
-            f"[{section_label}] alert when value exceeds median baseline {_fmt_num(baseline)} by "
-            f">{fast_thr:g}% (fast {win_sec//60}m) or >{cont_thr:g}% (continuous)",
+            f"[{section_label}] alert when value deviates from eval-window median baseline "
+            f"{_fmt_num(baseline)} by >={fast_thr:g}%",
         ]
     else:
         lines = [
             "",
-            f"[{section_label}] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
-            f"or continuous drop/spike > {cont_thr:g}%",
+            f"[{section_label}] alert when value deviates from eval-window median baseline by "
+            f">={fast_thr:g}%",
         ]
     wd = analysis.get("window_max_drop")
     ws = analysis.get("window_max_spike")
     cd = analysis.get("consecutive_max_drop")
     cs = analysis.get("consecutive_max_spike")
     lines.append(
-        f"within {win_sec//60}m drop/spike: -{(wd or {}).get('pct', 'n/a')}% / +{(ws or {}).get('pct', 'n/a')}%"
+        f"max drop/spike vs median: -{(wd or {}).get('pct', 'n/a')}% / +{(ws or {}).get('pct', 'n/a')}%"
     )
     lines.append(
-        f"continuous drop/spike : -{(cd or {}).get('pct', 'n/a')}% / +{(cs or {}).get('pct', 'n/a')}%"
+        f"consecutive vs median     : -{(cd or {}).get('pct', 'n/a')}% / +{(cs or {}).get('pct', 'n/a')}%"
     )
     return lines
 
@@ -10403,13 +10351,12 @@ def _format_http_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
     Compact footer: max drop/spike from best consecutive monotonic run (first→last bucket %).
     Threshold line matches product copy; @mention is still driven by ``hit_alert`` (mean windows).
     """
-    fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_HTTP_DROP_ALERT_PCT)
-    cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_HTTP_CONTINUOUS_ALERT_PCT)
-    win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
+    fast_thr = float(analysis.get("threshold_pct") or analysis.get("fast_threshold_pct") or MONITORING_MEDIAN_ALERT_PCT)
+    baseline = analysis.get("baseline_median")
     lines: List[str] = [
         "",
-        f"[HTTP] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
-        f"or continuous drop/spike > {cont_thr:g}%",
+        f"[HTTP] alert when value deviates from eval-window median baseline "
+        f"{_fmt_num(baseline) if baseline is not None else 'n/a'} by >={fast_thr:g}%",
     ]
 
     wd = analysis.get("window_max_drop")
@@ -10417,10 +10364,10 @@ def _format_http_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
     cd = analysis.get("consecutive_max_drop")
     cs = analysis.get("consecutive_max_spike")
     lines.append(
-        f"within {win_sec//60}m drop/spike: -{(wd or {}).get('pct', 'n/a')}% / +{(ws or {}).get('pct', 'n/a')}%"
+        f"max drop/spike vs median: -{(wd or {}).get('pct', 'n/a')}% / +{(ws or {}).get('pct', 'n/a')}%"
     )
     lines.append(
-        f"continuous drop/spike : -{(cd or {}).get('pct', 'n/a')}% / +{(cs or {}).get('pct', 'n/a')}%"
+        f"consecutive vs median     : -{(cd or {}).get('pct', 'n/a')}% / +{(cs or {}).get('pct', 'n/a')}%"
     )
 
     return lines
@@ -10733,6 +10680,82 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
     ).start()
 
 
+def _monitoring_ai_extract_ollama_text(data: Any) -> str:
+    """Collect assistant text from Ollama ``/api/chat`` (content + thinking fallbacks)."""
+    chunks: List[str] = []
+    if isinstance(data, dict):
+        msg = data.get("message")
+        if isinstance(msg, dict):
+            for key in ("content", "thinking"):
+                part = str(msg.get(key) or "").strip()
+                if part:
+                    chunks.append(part)
+        resp = str(data.get("response") or "").strip()
+        if resp:
+            chunks.append(resp)
+    return "\n\n".join(chunks).strip()
+
+
+def _monitoring_ai_strip_model_reasoning(text: str) -> str:
+    """Remove hidden reasoning blocks; keep the user-visible verdict + explanation."""
+    out = (text or "").strip()
+    for pat in (
+        r"(?is)``.*?``",
+        r"(?is)<think>.*?</think>",
+        r"(?is)<thinking>.*?</thinking>",
+    ):
+        out = re.sub(pat, "", out)
+    return out.strip()
+
+
+def _monitoring_ai_parse_verdict(raw: str) -> Tuple[Optional[bool], str]:
+    """
+    Parse ``ABNORMAL`` / ``NORMAL`` and return ``(verdict, explanation_body)``.
+    Explanation excludes the verdict line itself.
+    """
+    cleaned = _monitoring_ai_strip_model_reasoning(raw)
+    if not cleaned:
+        return None, ""
+
+    lines = cleaned.splitlines()
+    verdict: Optional[bool] = None
+    verdict_idx = -1
+    for i, line in enumerate(lines):
+        u = line.strip().upper()
+        if u == "ABNORMAL" or u.startswith("ABNORMAL"):
+            verdict = True
+            verdict_idx = i
+            break
+        if u == "NORMAL" or u.startswith("NORMAL"):
+            verdict = False
+            verdict_idx = i
+            break
+
+    if verdict is None:
+        upper = cleaned.upper()
+        if "ABNORMAL" in upper:
+            verdict = True
+        elif "NORMAL" in upper:
+            verdict = False
+        else:
+            return None, cleaned
+
+    explain_lines: List[str] = []
+    if verdict_idx >= 0:
+        for line in lines[verdict_idx + 1 :]:
+            st = line.strip()
+            if not st:
+                continue
+            if st.upper() in ("ABNORMAL", "NORMAL"):
+                continue
+            explain_lines.append(line.rstrip())
+    explanation = "\n".join(explain_lines).strip()
+    if verdict and not explanation:
+        # Model returned only the verdict token — still show a visible AI block.
+        explanation = "🤖 AI Assessment: ABNORMAL\n(模型未返回详细说明 / model returned no detail.)"
+    return verdict, explanation
+
+
 def _monitoring_ai_abnormal_verdict(
     png_bytes: bytes, alert_text: str
 ) -> Tuple[Optional[bool], str]:
@@ -10744,7 +10767,6 @@ def _monitoring_ai_abnormal_verdict(
     could not be reached / its answer could not be parsed (caller decides fail-open).
     """
     import base64
-    import re as _re
 
     url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
     model = _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
@@ -10764,12 +10786,15 @@ def _monitoring_ai_abnormal_verdict(
     )
     prompt = prompt.replace("{alert}", alert_text or "")
     b64 = base64.b64encode(png_bytes).decode("ascii")
-    body = {
+    body: Dict[str, Any] = {
         "model": model,
         "stream": False,
         "messages": [{"role": "user", "content": prompt, "images": [b64]}],
         "options": {"temperature": 0},
     }
+    # Qwen3 reasoning models: prefer direct answer in ``content`` (not only ``thinking``).
+    if "qwen3" in model.casefold():
+        body["think"] = False
     try:
         r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
         r.raise_for_status()
@@ -10780,31 +10805,31 @@ def _monitoring_ai_abnormal_verdict(
         )
         return None, ""
 
-    content = ""
-    if isinstance(data, dict):
-        msg = data.get("message")
-        if isinstance(msg, dict):
-            content = str(msg.get("content") or "").strip()
-        if not content:
-            content = str(data.get("response") or "").strip()
-    if not content:
-        logger.warning("monitoring AI gate: empty response from model=%s", model)
+    raw = _monitoring_ai_extract_ollama_text(data)
+    if not raw:
+        logger.warning("monitoring AI gate: empty response from model=%s payload=%r", model, data)
         return None, ""
 
-    # Drop any <think>...</think> reasoning block some models emit.
-    cleaned = _re.sub(r"(?is)<think>.*?</think>", "", content).strip()
-    upper = cleaned.upper()
-    first_line = upper.split("\n", 1)[0]
-    if "ABNORMAL" in first_line:
-        return True, cleaned
-    if "NORMAL" in first_line:
-        return False, cleaned
-    if "ABNORMAL" in upper:
-        return True, cleaned
-    if "NORMAL" in upper:
-        return False, cleaned
-    logger.warning("monitoring AI gate: could not parse verdict from response=%r", cleaned[:200])
-    return None, cleaned
+    verdict, explanation = _monitoring_ai_parse_verdict(raw)
+    if verdict is None:
+        logger.warning(
+            "monitoring AI gate: could not parse verdict from response=%r",
+            raw[:300],
+        )
+    else:
+        logger.info(
+            "monitoring AI gate: parsed verdict=%s explanation_len=%s",
+            "ABNORMAL" if verdict else "NORMAL",
+            len(explanation or ""),
+        )
+    return verdict, explanation
+
+
+def _monitoring_ai_fail_open_note() -> str:
+    return _cfg_str(
+        "MONITORING_AI_FAIL_OPEN_NOTE",
+        "🤖 AI review unavailable — alert sent without AI explanation.",
+    ).strip()
 
 
 def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[bool, str]:
@@ -10816,11 +10841,14 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
     if not _lark_env_truthy_or_default("MONITORING_AI_GATE_ENABLE", default=True):
         return True, reply
     fail_open = _lark_env_truthy_or_default("MONITORING_AI_GATE_FAIL_OPEN", default=True)
+    fail_note = _monitoring_ai_fail_open_note()
     if not alert_pngs:
         logger.warning(
             "monitoring AI gate: no screenshot available — %s",
             "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
         )
+        if fail_open and fail_note:
+            reply = f"{reply}\n\n{fail_note}"
         return fail_open, reply
     verdict, explanation = _monitoring_ai_abnormal_verdict(alert_pngs[0], reply)
     if verdict is None:
@@ -10828,6 +10856,8 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
             "monitoring AI gate: undecided verdict — %s",
             "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
         )
+        if fail_open and fail_note:
+            reply = f"{reply}\n\n{fail_note}"
         return fail_open, reply
     if not verdict:
         logger.info(
