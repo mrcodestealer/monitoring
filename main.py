@@ -86,6 +86,10 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ERROR_REQ_MIN_BASELINE_VALUE": "0",
     # Spike peak (errors/min) must reach this absolute level to alert — suppresses low-volume noise.
     "MONITORING_ERROR_REQ_MIN_SPIKE_VALUE": "150",
+    # DROP: ``from`` bucket must be at least this many errors/min (suppresses 2→1, 10→8 noise).
+    "MONITORING_ERROR_REQ_MIN_DROP_VALUE": "15",
+    # Max series lines in one alert message (sorted by severity).
+    "MONITORING_ERROR_REQ_ALERT_MAX_SERIES": "5",
     # Per-series min spike overrides: ``pattern=150``; ``|`` = all parts must match legend; ``;`` = next rule.
     "MONITORING_ERROR_REQ_SERIES_MIN_SPIKE": (
         "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=150;"
@@ -606,6 +610,77 @@ MONITORING_ERROR_REQ_MIN_BASELINE_VALUE = max(
 MONITORING_ERROR_REQ_MIN_SPIKE_VALUE = max(
     0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_SPIKE_VALUE", 150.0)
 )
+MONITORING_ERROR_REQ_MIN_DROP_VALUE = max(
+    0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_DROP_VALUE", 15.0)
+)
+MONITORING_ERROR_REQ_ALERT_MAX_SERIES = max(
+    1, min(50, _cfg_int("MONITORING_ERROR_REQ_ALERT_MAX_SERIES", 5))
+)
+
+
+def _error_req_min_drop_for_label(label: str) -> float:
+    del label
+    return float(MONITORING_ERROR_REQ_MIN_DROP_VALUE)
+
+
+def _error_req_event_direction(ev: Dict[str, Any]) -> str:
+    try:
+        fv = float(ev.get("from_val") or 0.0)
+        tv = float(ev.get("to_val") or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if tv > fv:
+        return "SPIKE"
+    if tv < fv:
+        return "DROP"
+    return ""
+
+
+def _error_req_qualifying_events(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for key in (
+        "window_max_spike",
+        "window_max_drop",
+        "consecutive_max_spike",
+        "consecutive_max_drop",
+    ):
+        ev = analysis.get(key)
+        if isinstance(ev, dict):
+            out.append(ev)
+    return out
+
+
+def _error_req_event_meets_absolute_floor(ev: Dict[str, Any], label: str) -> bool:
+    """Median % alone is too noisy on error series — require meaningful absolute levels."""
+    direction = _error_req_event_direction(ev)
+    try:
+        fv = float(ev.get("from_val") or 0.0)
+        tv = float(ev.get("to_val") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if direction == "SPIKE":
+        return tv >= _error_req_min_spike_for_label(label)
+    if direction == "DROP":
+        return fv >= _error_req_min_drop_for_label(label)
+    return max(fv, tv) >= max(
+        _error_req_min_spike_for_label(label), _error_req_min_drop_for_label(label)
+    )
+
+
+def _error_req_apply_absolute_floor(analysis: Dict[str, Any], label: str) -> Dict[str, Any]:
+    if not bool(analysis.get("hit_alert")):
+        return analysis
+    thr = float(analysis.get("threshold_pct") or MONITORING_MEDIAN_ALERT_PCT)
+    ok = False
+    for ev in _error_req_qualifying_events(analysis):
+        if float(ev.get("pct") or 0.0) >= thr and _error_req_event_meets_absolute_floor(ev, label):
+            ok = True
+            break
+    if ok:
+        return analysis
+    out = dict(analysis)
+    out["hit_alert"] = False
+    return out
 
 
 def _error_req_series_pct_overrides(cfg_key: str) -> List[Tuple[List[str], float]]:
@@ -9587,6 +9662,7 @@ def _analysis_for_error_req_points(
         MONITORING_MEDIAN_ALERT_PCT,
         min_baseline_value=MONITORING_ERROR_REQ_MIN_BASELINE_VALUE,
     )
+    a = _error_req_apply_absolute_floor(a, label)
     a["point_count"] = len(pts_work)
     a["merged_points"] = [[t, v] for t, v in pts_work]
     a["label"] = label
@@ -9604,9 +9680,8 @@ def _analysis_for_error_req_series(
 
 def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    ``错误请求数/1m``: alert when **any** series rises minute-to-minute to its
-    per-series absolute min peak (e.g. 40→45). Default: all panel series except
-    ``MONITORING_ERROR_REQ_EXCLUDE`` (AND match on pipe-parts).
+    ``错误请求数/1m``: per-series median baseline ±``MONITORING_MEDIAN_ALERT_PCT`` **and**
+    absolute floor (SPIKE peak ≥ min spike, DROP from ≥ min drop).
     """
     entries: List[Dict[str, Any]] = []
     total_pts = 0
@@ -9735,9 +9810,20 @@ def _format_spike_drop_alert_block(
         if to_ts is not None
         else f"value of {_fmt_num(to_val)}"
     )
+    if (
+        from_ts is not None
+        and to_ts is not None
+        and _fmt_ts_short(from_ts) == _fmt_ts_short(to_ts)
+        and from_val is not None
+        and to_val is not None
+        and _fmt_num(from_val) != _fmt_num(to_val)
+    ):
+        body = f"{_fmt_ts_short(to_ts)} value of {_fmt_num(from_val)} {verb} to {_fmt_num(to_val)}"
+    else:
+        body = f"{from_part} {verb} to {to_part}"
     return (
         f"{emoji} {graph_label} — {series_label} {direction}\n"
-        f"{from_part} {verb} to {to_part}"
+        f"{body}"
     )
 
 
@@ -9768,7 +9854,7 @@ def _format_error_req_trigger_lines(
         or fast_threshold_pct
         or MONITORING_MEDIAN_ALERT_PCT
     )
-    blocks: List[str] = []
+    ranked: List[Tuple[float, str, Tuple[Any, ...]]] = []
     for ent in (analysis.get("series_entries") or []):
         if not isinstance(ent, dict) or not ent.get("spiked"):
             continue
@@ -9778,16 +9864,29 @@ def _format_error_req_trigger_lines(
         if not picked:
             continue
         direction, from_val, to_val, from_ts, to_ts = picked
+        try:
+            fv = float(from_val or 0.0)
+            tv = float(to_val or 0.0)
+        except (TypeError, ValueError):
+            fv, tv = 0.0, 0.0
+        severity = abs(tv - fv) * max(abs(fv), abs(tv), 1.0)
+        block = _format_spike_drop_alert_block(
+            GRAFANA_PANEL_TITLE_ERROR_REQ,
+            lbl,
+            direction,
+            from_val,
+            to_val,
+            from_ts,
+            to_ts,
+        )
+        ranked.append((severity, lbl, (direction, from_val, to_val, from_ts, to_ts, block)))
+    ranked.sort(key=lambda t: t[0], reverse=True)
+    max_n = MONITORING_ERROR_REQ_ALERT_MAX_SERIES
+    blocks = [t[2][5] for t in ranked[:max_n]]
+    if len(ranked) > max_n:
         blocks.append(
-            _format_spike_drop_alert_block(
-                GRAFANA_PANEL_TITLE_ERROR_REQ,
-                lbl,
-                direction,
-                from_val,
-                to_val,
-                from_ts,
-                to_ts,
-            )
+            f"… and {len(ranked) - max_n} more error series suppressed in this message "
+            f"(MONITORING_ERROR_REQ_ALERT_MAX_SERIES={max_n})"
         )
     return blocks
 
@@ -9801,7 +9900,9 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
     lines: List[str] = [
         "",
         f"[Error req] alert when any series deviates from eval-window median baseline by "
-        f">={MONITORING_MEDIAN_ALERT_PCT:g}% (SPIKE or DROP); "
+        f">={MONITORING_MEDIAN_ALERT_PCT:g}% **and** meets absolute floor "
+        f"(SPIKE peak ≥ {MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g}/min, "
+        f"DROP from ≥ {MONITORING_ERROR_REQ_MIN_DROP_VALUE:g}/min); "
         f"excludes {_error_req_exclude_summary()}",
     ]
     if _error_req_all_series_mode() and entries:
@@ -10777,10 +10878,15 @@ def _monitoring_ai_abnormal_verdict(
         "-----\n"
         "{alert}\n"
         "-----\n"
-        "Look at the chart(s) in the screenshot and decide whether this is a GENUINE "
-        "abnormal incident that the on-call group should be paged about, or a NORMAL / "
-        "expected fluctuation (e.g. routine daily dip, an event starting/ending, a "
-        "scheduled job, or a tiny blip that quickly recovered).\n"
+        "IMPORTANT rules:\n"
+        "1) Base your decision ONLY on the alert lines above — do NOT invent numbers or "
+        "times that are not in that text.\n"
+        "2) If the listed changes are tiny (mostly single-digit or low-teens errors/min, "
+        "e.g. 10→11, 2→1, 14→10), respond NORMAL — that is routine noise.\n"
+        "3) Respond ABNORMAL only for a genuine incident worth paging on-call (large spike, "
+        "sustained outage, or clearly abnormal pattern in the alert lines).\n"
+        "4) Your explanation must reference the specific series and values from the alert "
+        "text, not unrelated peaks elsewhere on the chart.\n"
         "Reply with the FIRST line being exactly 'ABNORMAL' or 'NORMAL', then on the "
         "following lines a short explanation (1-3 sentences) in 中文 and English."
     )
