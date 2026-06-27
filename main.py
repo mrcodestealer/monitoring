@@ -86,10 +86,6 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ERROR_REQ_MIN_BASELINE_VALUE": "0",
     # Spike peak (errors/min) must reach this absolute level to alert — suppresses low-volume noise.
     "MONITORING_ERROR_REQ_MIN_SPIKE_VALUE": "150",
-    # DROP: ``from`` bucket must be at least this many errors/min (suppresses 2→1, 10→8 noise).
-    "MONITORING_ERROR_REQ_MIN_DROP_VALUE": "15",
-    # Max series lines in one alert message (sorted by severity).
-    "MONITORING_ERROR_REQ_ALERT_MAX_SERIES": "5",
     # Per-series min spike overrides: ``pattern=150``; ``|`` = all parts must match legend; ``;`` = next rule.
     "MONITORING_ERROR_REQ_SERIES_MIN_SPIKE": (
         "fpms-nt-ali-prod-promotion-rollout|GetPromoCode=150;"
@@ -294,8 +290,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_FPMS_NT_LOGIN_ALERT_PCT": 25,
     "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_ERROR_REQ_ENABLE": "1",
-    "MONITORING_ERROR_REQ_ALERT_PCT": 25,
-    "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 25,
+    "MONITORING_ERROR_REQ_ALERT_PCT": 50,
+    "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 80,
     "MONITORING_PROVIDER_JILI_ENABLE": "1",
     "MONITORING_PROVIDER_JILI_ALERT_PCT": 25,
     "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 25,
@@ -610,77 +606,6 @@ MONITORING_ERROR_REQ_MIN_BASELINE_VALUE = max(
 MONITORING_ERROR_REQ_MIN_SPIKE_VALUE = max(
     0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_SPIKE_VALUE", 150.0)
 )
-MONITORING_ERROR_REQ_MIN_DROP_VALUE = max(
-    0.0, _cfg_float("MONITORING_ERROR_REQ_MIN_DROP_VALUE", 15.0)
-)
-MONITORING_ERROR_REQ_ALERT_MAX_SERIES = max(
-    1, min(50, _cfg_int("MONITORING_ERROR_REQ_ALERT_MAX_SERIES", 5))
-)
-
-
-def _error_req_min_drop_for_label(label: str) -> float:
-    del label
-    return float(MONITORING_ERROR_REQ_MIN_DROP_VALUE)
-
-
-def _error_req_event_direction(ev: Dict[str, Any]) -> str:
-    try:
-        fv = float(ev.get("from_val") or 0.0)
-        tv = float(ev.get("to_val") or 0.0)
-    except (TypeError, ValueError):
-        return ""
-    if tv > fv:
-        return "SPIKE"
-    if tv < fv:
-        return "DROP"
-    return ""
-
-
-def _error_req_qualifying_events(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for key in (
-        "window_max_spike",
-        "window_max_drop",
-        "consecutive_max_spike",
-        "consecutive_max_drop",
-    ):
-        ev = analysis.get(key)
-        if isinstance(ev, dict):
-            out.append(ev)
-    return out
-
-
-def _error_req_event_meets_absolute_floor(ev: Dict[str, Any], label: str) -> bool:
-    """Median % alone is too noisy on error series — require meaningful absolute levels."""
-    direction = _error_req_event_direction(ev)
-    try:
-        fv = float(ev.get("from_val") or 0.0)
-        tv = float(ev.get("to_val") or 0.0)
-    except (TypeError, ValueError):
-        return False
-    if direction == "SPIKE":
-        return tv >= _error_req_min_spike_for_label(label)
-    if direction == "DROP":
-        return fv >= _error_req_min_drop_for_label(label)
-    return max(fv, tv) >= max(
-        _error_req_min_spike_for_label(label), _error_req_min_drop_for_label(label)
-    )
-
-
-def _error_req_apply_absolute_floor(analysis: Dict[str, Any], label: str) -> Dict[str, Any]:
-    if not bool(analysis.get("hit_alert")):
-        return analysis
-    thr = float(analysis.get("threshold_pct") or MONITORING_MEDIAN_ALERT_PCT)
-    ok = False
-    for ev in _error_req_qualifying_events(analysis):
-        if float(ev.get("pct") or 0.0) >= thr and _error_req_event_meets_absolute_floor(ev, label):
-            ok = True
-            break
-    if ok:
-        return analysis
-    out = dict(analysis)
-    out["hit_alert"] = False
-    return out
 
 
 def _error_req_series_pct_overrides(cfg_key: str) -> List[Tuple[List[str], float]]:
@@ -9647,26 +9572,47 @@ def _error_req_analysis_has_spike(
     fast_threshold_pct: Optional[float] = None,
     continuous_threshold_pct: Optional[float] = None,
 ) -> bool:
-    """True when series deviates from eval-window median by >= threshold."""
+    """Absolute min-peak SPIKE by default; baseline continuous % for configured series."""
+    lbl = str(analysis.get("label") or "")
+    if _error_req_uses_baseline_continuous_rules(lbl):
+        _, cont_thr, _ = _error_req_thresholds_for_label(lbl)
+        if continuous_threshold_pct is not None:
+            cont_thr = float(continuous_threshold_pct)
+        min_peak = _error_req_min_spike_for_label(lbl)
+        cs = analysis.get("consecutive_max_spike")
+        if (
+            isinstance(cs, dict)
+            and float(cs.get("pct") or 0.0) >= float(cont_thr)
+            and _error_req_spike_peak_value(cs) >= min_peak
+        ):
+            return True
+        return False
     del fast_threshold_pct, continuous_threshold_pct
-    return bool(analysis.get("hit_alert"))
+    min_peak = _error_req_min_spike_for_label(lbl)
+    return bool(_error_req_qualifying_spike_events(analysis, min_peak))
 
 
 def _analysis_for_error_req_points(
     pts: List[Tuple[float, float]], *, label: str = ""
 ) -> Dict[str, Any]:
-    pts_work = _snap_series_to_monitoring_minutes(pts, how="sum")
-    pts_work = _trim_trailing_minute_buckets(pts_work, _analysis_drop_n())
-    a = _median_baseline_alert_analysis(
-        pts_work,
-        MONITORING_MEDIAN_ALERT_PCT,
-        min_baseline_value=MONITORING_ERROR_REQ_MIN_BASELINE_VALUE,
-    )
-    a = _error_req_apply_absolute_floor(a, label)
-    a["point_count"] = len(pts_work)
-    a["merged_points"] = [[t, v] for t, v in pts_work]
-    a["label"] = label
-    return a
+    if _error_req_uses_baseline_continuous_rules(label):
+        pts_work = _snap_series_to_monitoring_minutes(pts, how="sum")
+        pts_work = _trim_trailing_minute_buckets(pts_work, _analysis_drop_n())
+        cont_thr = _error_req_continuous_pct_for_label(label)
+        a = _median_baseline_alert_analysis(
+            pts_work,
+            cont_thr,
+            min_baseline_value=MONITORING_ERROR_REQ_MIN_BASELINE_VALUE,
+        )
+        a["point_count"] = len(pts_work)
+        a["merged_points"] = [[t, v] for t, v in pts_work]
+        a["label"] = label
+        a["alert_rule"] = "baseline_continuous_only"
+        a["continuous_threshold_pct"] = cont_thr
+        a["hit_alert"] = False
+        return a
+    min_peak = _error_req_min_spike_for_label(label)
+    return _error_req_absolute_spike_analysis(pts, label=label, min_peak=min_peak)
 
 
 def _analysis_for_error_req_series(
@@ -9680,8 +9626,9 @@ def _analysis_for_error_req_series(
 
 def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    ``错误请求数/1m``: per-series median baseline ±``MONITORING_MEDIAN_ALERT_PCT`` **and**
-    absolute floor (SPIKE peak ≥ min spike, DROP from ≥ min drop).
+    ``错误请求数/1m``: alert when **any** series **rises** minute-to-minute to its
+    per-series absolute min peak (default 150 errors/min). DROP is ignored except for
+    ``MONITORING_ERROR_REQ_SERIES_CONTINUOUS_ONLY`` series (baseline continuous SPIKE).
     """
     entries: List[Dict[str, Any]] = []
     total_pts = 0
@@ -9718,11 +9665,10 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "hit_alert": any(bool(e.get("spiked")) for e in entries),
         "dual_spike_required": False,
-        "alert_rule": "baseline_median_any_series",
+        "alert_rule": "absolute_peak_any_series",
         "series_entries": entries,
-        "threshold_pct": MONITORING_MEDIAN_ALERT_PCT,
-        "fast_threshold_pct": MONITORING_MEDIAN_ALERT_PCT,
-        "continuous_threshold_pct": MONITORING_MEDIAN_ALERT_PCT,
+        "fast_threshold_pct": MONITORING_ERROR_REQ_ALERT_PCT,
+        "continuous_threshold_pct": MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT,
         "window_seconds": MONITORING_ALERT_WINDOW_SECONDS,
         "point_count": total_pts,
         "merged_points": merged_all,
@@ -9845,49 +9791,48 @@ def _format_error_req_trigger_lines(
     continuous_threshold_pct: float,
     window_seconds: int,
 ) -> List[str]:
-    del window_seconds
+    del fast_threshold_pct, continuous_threshold_pct, window_seconds
     if not bool(analysis.get("hit_alert")):
         return []
-    thr = float(
-        analysis.get("threshold_pct")
-        or analysis.get("fast_threshold_pct")
-        or fast_threshold_pct
-        or MONITORING_MEDIAN_ALERT_PCT
-    )
-    ranked: List[Tuple[float, str, Tuple[Any, ...]]] = []
-    for ent in (analysis.get("series_entries") or []):
-        if not isinstance(ent, dict) or not ent.get("spiked"):
-            continue
+    spiked = [
+        e for e in (analysis.get("series_entries") or [])
+        if isinstance(e, dict) and e.get("spiked")
+    ]
+    if not spiked:
+        return []
+    blocks: List[str] = []
+    for ent in spiked:
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         lbl = str(ent.get("label") or sub.get("label") or "series")
-        picked = _pick_alert_spike_drop_event(sub, thr, thr)
-        if not picked:
+        cont_only = bool(ent.get("continuous_only") or _error_req_continuous_only_for_label(lbl))
+        if cont_only:
+            cont_thr = float(ent.get("continuous_pct") or _error_req_continuous_pct_for_label(lbl))
+            picked_evt = _pick_alert_spike_drop_event(
+                sub, 999.0, cont_thr, spike_only=True
+            )
+            if picked_evt:
+                direction, from_val, to_val, from_ts, to_ts = picked_evt
+                blocks.append(
+                    _format_spike_drop_alert_block(
+                        GRAFANA_PANEL_TITLE_ERROR_REQ,
+                        lbl,
+                        direction,
+                        from_val,
+                        to_val,
+                        from_ts,
+                        to_ts,
+                    )
+                )
             continue
-        direction, from_val, to_val, from_ts, to_ts = picked
-        try:
-            fv = float(from_val or 0.0)
-            tv = float(to_val or 0.0)
-        except (TypeError, ValueError):
-            fv, tv = 0.0, 0.0
-        severity = abs(tv - fv) * max(abs(fv), abs(tv), 1.0)
-        block = _format_spike_drop_alert_block(
-            GRAFANA_PANEL_TITLE_ERROR_REQ,
-            lbl,
-            direction,
-            from_val,
-            to_val,
-            from_ts,
-            to_ts,
-        )
-        ranked.append((severity, lbl, (direction, from_val, to_val, from_ts, to_ts, block)))
-    ranked.sort(key=lambda t: t[0], reverse=True)
-    max_n = MONITORING_ERROR_REQ_ALERT_MAX_SERIES
-    blocks = [t[2][5] for t in ranked[:max_n]]
-    if len(ranked) > max_n:
-        blocks.append(
-            f"… and {len(ranked) - max_n} more error series suppressed in this message "
-            f"(MONITORING_ERROR_REQ_ALERT_MAX_SERIES={max_n})"
-        )
+        min_peak = float(ent.get("min_spike") or _error_req_min_spike_for_label(lbl))
+        picked = _pick_error_req_spike_event(sub, min_peak)
+        if picked:
+            peak_ts, peak_val = picked
+            blocks.append(
+                _format_error_req_spike_alert_block(
+                    GRAFANA_PANEL_TITLE_ERROR_REQ, lbl, peak_ts, peak_val
+                )
+            )
     return blocks
 
 
@@ -9899,10 +9844,9 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
     ]
     lines: List[str] = [
         "",
-        f"[Error req] alert when any series deviates from eval-window median baseline by "
-        f">={MONITORING_MEDIAN_ALERT_PCT:g}% **and** meets absolute floor "
-        f"(SPIKE peak ≥ {MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g}/min, "
-        f"DROP from ≥ {MONITORING_ERROR_REQ_MIN_DROP_VALUE:g}/min); "
+        f"[Error req] alert when any series **increases** to its per-series min peak "
+        f"(default {MONITORING_ERROR_REQ_MIN_SPIKE_VALUE:g} errors/min); "
+        f"decreases and sub-threshold spikes are ignored; "
         f"excludes {_error_req_exclude_summary()}",
     ]
     if _error_req_all_series_mode() and entries:
@@ -9915,26 +9859,36 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
         lbl = str(ent.get("label") or "series")
         sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
         spiked = bool(ent.get("spiked"))
+        min_spike = float(ent.get("min_spike") or _error_req_min_spike_for_label(lbl))
+        cont_thr = float(ent.get("continuous_pct") or _error_req_continuous_pct_for_label(lbl))
         cont_only = bool(ent.get("continuous_only") or _error_req_continuous_only_for_label(lbl))
-        meta: List[str] = [f"median {MONITORING_MEDIAN_ALERT_PCT:g}%"]
+        meta: List[str] = []
         if cont_only:
-            meta.append("continuous-only legacy flag")
+            meta.append(f"continuous {cont_thr:g}%")
+            meta.append("continuous-only")
+        else:
+            meta.append(f"min peak {min_spike:g}")
         lines.append(
             f"  {lbl}: spike={'yes' if spiked else 'no'}"
             + (f" ({', '.join(meta)})" if meta else "")
         )
-        ws = sub.get("window_max_spike")
-        wd = sub.get("window_max_drop")
-        if isinstance(ws, dict):
+        peak_ev = sub.get("peak_spike") if isinstance(sub.get("peak_spike"), dict) else {}
+        if peak_ev:
             lines.append(
-                f"    max spike vs median: +{(ws or {}).get('pct', 'n/a')}%"
+                f"    last qualifying rise: {_fmt_ts_short(peak_ev.get('from_ts'))} "
+                f"{_fmt_num(peak_ev.get('from_val'))} → {_fmt_ts_short(peak_ev.get('to_ts'))} "
+                f"{_fmt_num(peak_ev.get('to_val'))}"
             )
-        elif isinstance(wd, dict):
-            lines.append(
-                f"    max drop vs median: -{(wd or {}).get('pct', 'n/a')}%"
-            )
+        elif cont_only:
+            cs = sub.get("consecutive_max_spike")
+            if isinstance(cs, dict):
+                lines.append(
+                    f"    continuous vs baseline: +{(cs or {}).get('pct', 'n/a')}%"
+                )
+            elif not spiked:
+                lines.append("    (no continuous spike to threshold in window)")
         elif not spiked:
-            lines.append("    (no deviation >= threshold in window)")
+            lines.append("    (no upward rise to min peak in window)")
     return lines
 
 
