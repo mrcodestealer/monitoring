@@ -43,6 +43,7 @@ import queue
 from urllib.parse import urlencode
 from datetime import datetime
 import re
+import subprocess
 import threading
 import time
 import warnings
@@ -217,6 +218,11 @@ _CFG: Dict[str, Any] = {
     "MONITORING_TRIGGER": "/mo",
     "MONITORING_MUTE_TRIGGER": "/m",
     "MONITORING_CANCELMUTE_TRIGGER": "/c",
+    # @bot + "git pull and restart service" — git pull in repo then systemd restart (admin only)
+    "MONITORING_DEPLOY_ENABLE": "1",
+    "MONITORING_DEPLOY_ALLOWED_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
+    "MONITORING_DEPLOY_REPO_DIR": "",
+    "MONITORING_DEPLOY_RESTART_CMD": "systemctl restart grafanaplatformbot",
     # 1=仅 @ 机器人且无其它正文也触发（与 MONITORING_TRIGGER 默认 /mo 同）；1+ANY=1 时 @ 且任意正文也跑监控（非命令且带字会先收到命令说明）
     "MONITORING_AT_MENTION_ENABLE": "0",
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
@@ -936,6 +942,16 @@ LARK_HOST = _cfg_str("LARK_HOST", "https://open.feishu.cn").rstrip("/")
 MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/mo")
 MONITORING_MUTE_TRIGGER = _cfg_str("MONITORING_MUTE_TRIGGER", "/m").strip()
 MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").strip()
+MONITORING_DEPLOY_ENABLE = _lark_env_truthy_or_default("MONITORING_DEPLOY_ENABLE", default=True)
+MONITORING_DEPLOY_ALLOWED_OPEN_ID = _cfg_str(
+    "MONITORING_DEPLOY_ALLOWED_OPEN_ID",
+    "ou_5f660c0fb0769d184aca635d02209272",
+).strip()
+MONITORING_DEPLOY_REPO_DIR = _cfg_str("MONITORING_DEPLOY_REPO_DIR", "").strip()
+MONITORING_DEPLOY_RESTART_CMD = _cfg_str(
+    "MONITORING_DEPLOY_RESTART_CMD",
+    "systemctl restart grafanaplatformbot",
+).strip()
 TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
 MONITORING_ALERT_AT_USER_ENABLE = _lark_env_truthy_or_default(
     "MONITORING_ALERT_AT_USER_ENABLE",
@@ -4620,6 +4636,106 @@ def _cancelmute_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
         )
     except Exception:
         logger.exception("cancelmute failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _monitoring_im_matches_deploy_command(clean: str) -> bool:
+    if not MONITORING_DEPLOY_ENABLE:
+        return False
+    cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
+    if not cn:
+        return False
+    if cn == "git pull and restart service":
+        return True
+    return "git pull" in cn and "restart" in cn and "service" in cn
+
+
+def _monitoring_deploy_open_id_allowed(open_id: str) -> bool:
+    allowed = (MONITORING_DEPLOY_ALLOWED_OPEN_ID or "").strip()
+    if not allowed:
+        return False
+    return (open_id or "").strip() == allowed
+
+
+def _monitoring_deploy_repo_dir() -> str:
+    raw = (MONITORING_DEPLOY_REPO_DIR or "").strip()
+    if raw:
+        return os.path.abspath(raw)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _monitoring_deploy_delayed_restart(cmd: str) -> None:
+    try:
+        time.sleep(2.5)
+        logger.info("deploy: running restart cmd=%r", cmd[:120])
+        r = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if r.returncode != 0:
+            logger.error(
+                "deploy restart failed exit=%s stderr=%r stdout=%r",
+                r.returncode,
+                (r.stderr or "")[:500],
+                (r.stdout or "")[:500],
+            )
+    except Exception:
+        logger.exception("deploy delayed restart failed")
+
+
+def _monitoring_deploy_run_git_pull_and_restart() -> Tuple[bool, str]:
+    repo = _monitoring_deploy_repo_dir()
+    if not os.path.isdir(repo):
+        return False, f"Repo directory not found: {repo}"
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return False, f"Not a git repo: {repo}"
+    try:
+        r = subprocess.run(
+            ["git", "pull"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "git pull timed out after 120s"
+    except OSError as e:
+        return False, f"git pull failed to start: {e}"
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode != 0:
+        tail = out[-1800:] if len(out) > 1800 else out
+        return False, f"git pull failed (exit {r.returncode}):\n{tail or '(no output)'}"
+    restart_cmd = (MONITORING_DEPLOY_RESTART_CMD or "").strip()
+    if restart_cmd:
+        threading.Thread(
+            target=_monitoring_deploy_delayed_restart,
+            args=(restart_cmd,),
+            daemon=False,
+            name="deploy-restart",
+        ).start()
+        restart_note = f"\n\nService restart scheduled ({restart_cmd})."
+    else:
+        restart_note = "\n\nNo restart command configured (MONITORING_DEPLOY_RESTART_CMD empty)."
+    tail = out[-1500:] if len(out) > 1500 else out
+    return True, f"git pull OK in {repo}:\n{tail or '(no output)'}{restart_note}"
+
+
+def _monitoring_deploy_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
+    try:
+        rt = "chat_id" if (chat_id or "").strip() else "open_id"
+        rv = (chat_id or open_id or "").strip()
+        if not rv:
+            return
+        ok, msg = _monitoring_deploy_run_git_pull_and_restart()
+        prefix = "**Deploy OK**" if ok else "**Deploy failed**"
+        _lark_send_text(rt, rv, f"{prefix}\n{msg}")
+    except Exception:
+        logger.exception("deploy worker failed")
     finally:
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
@@ -11742,6 +11858,60 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             ).start()
         return
 
+    if _monitoring_im_matches_deploy_command(clean or ""):
+        deploy_addressed_ok = True
+        if MONITORING_TRIGGER_REQUIRES_AT_BOT:
+            deploy_addressed_ok = _monitoring_at_bot_requirement_satisfied(
+                raw_text,
+                mentions,
+                content_at_entity_ids=content_at_entity_ids,
+                msg=msg,
+                chat_type=im_chat_type,
+            )
+        if not deploy_addressed_ok:
+            logger.info("deploy skip — not addressed to this bot")
+            return
+        if not _monitoring_deploy_open_id_allowed(open_id):
+            logger.info(
+                "deploy rejected — open_id=%r not in MONITORING_DEPLOY_ALLOWED_OPEN_ID",
+                (open_id or "")[:24],
+            )
+            rt_d = "chat_id" if (chat_id or "").strip() else "open_id"
+            rv_d = (chat_id or open_id or "").strip()
+            if rv_d:
+                _lark_send_text(rt_d, rv_d, "Deploy command: not authorized.")
+            return
+        processed_d = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        debounce_key_d = f"{(chat_id or '').strip()}\n__deploy_git_pull__"
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                logger.info("duplicate IM event_id=%s — skip (deploy)", im_event_id)
+                return
+            if processed_d and processed_d in _processed_lark_message_ids:
+                logger.info("duplicate deploy stick=%r — skip", processed_d[:96])
+                return
+            if debounce_key_d in _monitoring_inflight_keys:
+                logger.info("deploy skip — already in flight")
+                return
+            _monitoring_inflight_keys.add(debounce_key_d)
+            if processed_d:
+                _processed_lark_message_ids.add(processed_d)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                    _processed_lark_im_event_ids.clear()
+                    _processed_lark_im_event_ids.add(im_event_id)
+        logger.info("deploy command accepted chat=%r open_id_prefix=%r", bool(chat_id), (open_id or "")[:12])
+        threading.Thread(
+            target=_monitoring_deploy_worker,
+            args=(chat_id, open_id, debounce_key_d),
+            daemon=True,
+            name="deploy-git-pull",
+        ).start()
+        return
+
     cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
     if (
         _lark_effective_bot_open_id()
@@ -11750,6 +11920,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _im_command_matches(clean or "", MONITORING_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER)
+        and not _monitoring_im_matches_deploy_command(clean or "")
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
