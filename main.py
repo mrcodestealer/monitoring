@@ -336,9 +336,19 @@ _CFG: Dict[str, Any] = {
     # 判窗对齐时，截图范围在 eval 窗口两侧各扩 N 分钟（``MATCH_EVAL=1`` 时生效）
     "MONITORING_WATCH_SCREENSHOT_PADDING_MINUTES": "3",
     # ``MATCH_EVAL=0`` 时生效
-    "MONITORING_WATCH_SCREENSHOT_FROM": "now-1h",
+    "MONITORING_WATCH_SCREENSHOT_FROM": "now-2h",
     "MONITORING_WATCH_SCREENSHOT_TO": "now",
     "MONITORING_WATCH_SCREENSHOT_TIMEZONE": "browser",
+    # ---- AI 异常二次确认（本地 Ollama 视觉模型）----
+    # 阈值触发后，先把截图发给本地 Ollama 模型判断是否「真异常」；仅当判为异常才发群，并在正文追加 AI 说明
+    "MONITORING_AI_GATE_ENABLE": "1",
+    "MONITORING_AI_OLLAMA_URL": "http://localhost:11434",
+    "MONITORING_AI_MODEL": "qwen3.5:35b-a3b",
+    "MONITORING_AI_TIMEOUT_SECONDS": "120",
+    # AI 不可达 / 无法判定时：1=照常发送（不漏报），0=抑制不发
+    "MONITORING_AI_GATE_FAIL_OPEN": "1",
+    # 自定义判定提示词（留空用内置默认；可用 {alert} 占位符插入告警正文）
+    "MONITORING_AI_PROMPT": "",
     # 每日静默：该时段内不拉数、不判警（本地机器时间；可配两段）
     "MONITORING_WATCH_QUIET_WINDOW_ENABLE": "1",
     "MONITORING_WATCH_QUIET_START_HOUR": "19",
@@ -10723,6 +10733,114 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
     ).start()
 
 
+def _monitoring_ai_abnormal_verdict(
+    png_bytes: bytes, alert_text: str
+) -> Tuple[Optional[bool], str]:
+    """
+    Ask the local Ollama model whether a Grafana alert screenshot shows a genuine
+    abnormality worth paging the group.
+
+    Returns ``(is_abnormal, explanation)``. ``is_abnormal`` is ``None`` when the AI
+    could not be reached / its answer could not be parsed (caller decides fail-open).
+    """
+    import base64
+    import re as _re
+
+    url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+    model = _cfg_str("MONITORING_AI_MODEL", "qwen3.5:35b-a3b").strip()
+    timeout = max(5.0, _cfg_float("MONITORING_AI_TIMEOUT_SECONDS", 120.0))
+    prompt = _cfg_str("MONITORING_AI_PROMPT", "").strip() or (
+        "You are an SRE assistant reviewing a Grafana monitoring screenshot. "
+        "A threshold rule already detected this change:\n"
+        "-----\n"
+        "{alert}\n"
+        "-----\n"
+        "Look at the chart(s) in the screenshot and decide whether this is a GENUINE "
+        "abnormal incident that the on-call group should be paged about, or a NORMAL / "
+        "expected fluctuation (e.g. routine daily dip, an event starting/ending, a "
+        "scheduled job, or a tiny blip that quickly recovered).\n"
+        "Reply with the FIRST line being exactly 'ABNORMAL' or 'NORMAL', then on the "
+        "following lines a short explanation (1-3 sentences) in 中文 and English."
+    )
+    prompt = prompt.replace("{alert}", alert_text or "")
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    body = {
+        "model": model,
+        "stream": False,
+        "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+        "options": {"temperature": 0},
+    }
+    try:
+        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        logger.exception(
+            "monitoring AI gate: Ollama request failed (model=%s url=%s)", model, url
+        )
+        return None, ""
+
+    content = ""
+    if isinstance(data, dict):
+        msg = data.get("message")
+        if isinstance(msg, dict):
+            content = str(msg.get("content") or "").strip()
+        if not content:
+            content = str(data.get("response") or "").strip()
+    if not content:
+        logger.warning("monitoring AI gate: empty response from model=%s", model)
+        return None, ""
+
+    # Drop any <think>...</think> reasoning block some models emit.
+    cleaned = _re.sub(r"(?is)<think>.*?</think>", "", content).strip()
+    upper = cleaned.upper()
+    first_line = upper.split("\n", 1)[0]
+    if "ABNORMAL" in first_line:
+        return True, cleaned
+    if "NORMAL" in first_line:
+        return False, cleaned
+    if "ABNORMAL" in upper:
+        return True, cleaned
+    if "NORMAL" in upper:
+        return False, cleaned
+    logger.warning("monitoring AI gate: could not parse verdict from response=%r", cleaned[:200])
+    return None, cleaned
+
+
+def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[bool, str]:
+    """
+    Second gate after threshold detection: only let the alert through if the AI
+    judges the screenshot abnormal. Returns ``(should_send, reply)`` where ``reply``
+    has the AI explanation appended when the alert is allowed through.
+    """
+    if not _lark_env_truthy_or_default("MONITORING_AI_GATE_ENABLE", default=True):
+        return True, reply
+    fail_open = _lark_env_truthy_or_default("MONITORING_AI_GATE_FAIL_OPEN", default=True)
+    if not alert_pngs:
+        logger.warning(
+            "monitoring AI gate: no screenshot available — %s",
+            "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
+        )
+        return fail_open, reply
+    verdict, explanation = _monitoring_ai_abnormal_verdict(alert_pngs[0], reply)
+    if verdict is None:
+        logger.warning(
+            "monitoring AI gate: undecided verdict — %s",
+            "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
+        )
+        return fail_open, reply
+    if not verdict:
+        logger.info(
+            "monitoring AI gate: AI judged NORMAL — alert suppressed. explanation=%r",
+            (explanation or "")[:300],
+        )
+        return False, reply
+    logger.info("monitoring AI gate: AI judged ABNORMAL — alert will be sent")
+    if explanation:
+        reply = f"{reply}\n\n{explanation}"
+    return True, reply
+
+
 def _monitoring_watchdog_loop() -> None:
     """Periodic Grafana check; alert chat on >= threshold drop/spike."""
     global _monitoring_watch_last_alert_at, _monitoring_watch_pending_confirm
@@ -10831,13 +10949,27 @@ def _monitoring_watchdog_loop() -> None:
                 if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                     try:
                         alert_pngs = _grafana_watchdog_alert_screenshot_png_list(sess_c, payload_c)
-                        if (
-                            len(alert_pngs) == 1
-                            and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
-                        ):
-                            pre_key = _lark_upload_png_image_key(alert_pngs[0])
                     except Exception:
                         logger.exception("monitoring watchdog pre-screenshot failed")
+
+                ai_ok, reply = _monitoring_ai_gate_decide(alert_pngs, reply)
+                if not ai_ok:
+                    logger.info(
+                        "monitoring watchdog: alert suppressed by AI gate (after confirm) chat_prefix=%s...",
+                        alert_chat[:16],
+                    )
+                    time.sleep(sec)
+                    continue
+
+                if (
+                    alert_pngs
+                    and len(alert_pngs) == 1
+                    and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
+                ):
+                    try:
+                        pre_key = _lark_upload_png_image_key(alert_pngs[0])
+                    except Exception:
+                        logger.exception("monitoring watchdog pre-screenshot upload failed")
 
                 used_card, embedded = _lark_send_monitoring_user_message(
                     "chat_id",
@@ -10930,13 +11062,27 @@ def _monitoring_watchdog_loop() -> None:
                 if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                     try:
                         alert_pngs = _grafana_watchdog_alert_screenshot_png_list(sess, payload)
-                        if (
-                            len(alert_pngs) == 1
-                            and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
-                        ):
-                            pre_key = _lark_upload_png_image_key(alert_pngs[0])
                     except Exception:
                         logger.exception("monitoring watchdog pre-screenshot failed")
+
+                ai_ok, reply = _monitoring_ai_gate_decide(alert_pngs, reply)
+                if not ai_ok:
+                    logger.info(
+                        "monitoring watchdog: alert suppressed by AI gate chat_prefix=%s...",
+                        alert_chat[:16],
+                    )
+                    time.sleep(sec)
+                    continue
+
+                if (
+                    alert_pngs
+                    and len(alert_pngs) == 1
+                    and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
+                ):
+                    try:
+                        pre_key = _lark_upload_png_image_key(alert_pngs[0])
+                    except Exception:
+                        logger.exception("monitoring watchdog pre-screenshot upload failed")
 
                 used_card, embedded = _lark_send_monitoring_user_message(
                     "chat_id",
