@@ -343,7 +343,7 @@ _CFG: Dict[str, Any] = {
     # 阈值触发后，先把截图发给本地 Ollama 模型判断是否「真异常」；仅当判为异常才发群，并在正文追加 AI 说明
     "MONITORING_AI_GATE_ENABLE": "1",
     "MONITORING_AI_OLLAMA_URL": "http://localhost:11434",
-    "MONITORING_AI_MODEL": "qwen3.5:35b-a3b",
+    "MONITORING_AI_MODEL": "qwen3.6:35b-a3b",
     "MONITORING_AI_TIMEOUT_SECONDS": "120",
     # AI 不可达 / 无法判定时：1=照常发送（不漏报），0=抑制不发
     "MONITORING_AI_GATE_FAIL_OPEN": "1",
@@ -10747,7 +10747,7 @@ def _monitoring_ai_abnormal_verdict(
     import re as _re
 
     url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
-    model = _cfg_str("MONITORING_AI_MODEL", "qwen3.5:35b-a3b").strip()
+    model = _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
     timeout = max(5.0, _cfg_float("MONITORING_AI_TIMEOUT_SECONDS", 120.0))
     prompt = _cfg_str("MONITORING_AI_PROMPT", "").strip() or (
         "You are an SRE assistant reviewing a Grafana monitoring screenshot. "
