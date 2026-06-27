@@ -277,11 +277,13 @@ _CFG: Dict[str, Any] = {
     "MONITORING_9280_ALERT_PCT": 25,
     "MONITORING_9280_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_DEPOSIT_ENABLE": "1",
-    "MONITORING_DEPOSIT_ALERT_PCT": 25,
-    "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT": 25,
+    # 充值锯齿波动大；用更高 median 阈值（默认 80%），避免 191→242 类分钟噪声
+    "MONITORING_DEPOSIT_ALERT_PCT": 80,
+    "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT": 80,
     "MONITORING_WITHDRAW_ENABLE": "1",
-    "MONITORING_WITHDRAW_ALERT_PCT": 25,
-    "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 25,
+    # 提款同样高波动；默认 80% median 偏离才触发
+    "MONITORING_WITHDRAW_ALERT_PCT": 80,
+    "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 80,
     # Withdraw only: spike/drop vs **median baseline** of eval window (not bucket-to-bucket %).
     # 例 median=200、25% → spike 需 >250；median=30 时 40 仅 +33% vs baseline，不告警。
     "MONITORING_WITHDRAW_MIN_BASELINE_VALUE": "0",
@@ -952,13 +954,13 @@ MONITORING_HTTP_CONTINUOUS_ALERT_PCT = _cfg_float(
 MONITORING_9280_CONTINUOUS_ALERT_PCT = _cfg_float(
     "MONITORING_9280_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
 )
-MONITORING_DEPOSIT_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT)
+MONITORING_DEPOSIT_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_ALERT_PCT", 80.0)
 MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+    "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT", 80.0
 )
-MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT)
+MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", 80.0)
 MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", MONITORING_MEDIAN_ALERT_PCT
+    "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", 80.0
 )
 MONITORING_WITHDRAW_MIN_BASELINE_VALUE = max(
     0.0, _cfg_float("MONITORING_WITHDRAW_MIN_BASELINE_VALUE", 0.0)
@@ -9419,7 +9421,7 @@ def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _merge_deposit_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
-    a = _median_baseline_alert_analysis(pts, MONITORING_MEDIAN_ALERT_PCT)
+    a = _median_baseline_alert_analysis(pts, MONITORING_DEPOSIT_ALERT_PCT)
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
     return a
@@ -9431,7 +9433,7 @@ def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
     a = _median_baseline_alert_analysis(
         pts,
-        MONITORING_MEDIAN_ALERT_PCT,
+        MONITORING_WITHDRAW_ALERT_PCT,
         min_baseline_value=MONITORING_WITHDRAW_MIN_BASELINE_VALUE,
     )
     a["point_count"] = len(pts)
@@ -10839,7 +10841,12 @@ def _monitoring_ai_abnormal_verdict(
         "e.g. 10→11, 2→1, 14→10), respond NORMAL — that is routine noise.\n"
         "3) Respond ABNORMAL only for a genuine incident worth paging on-call (large spike, "
         "sustained outage, or clearly abnormal pattern in the alert lines).\n"
-        "4) Your explanation must reference the specific series and values from the alert "
+        "4) **Main Site Deposit (createProposal)** and **Withdrawal (InitiateWithdrawal)** "
+        "are naturally jagged every minute. A single-minute move similar to others on the "
+        "chart (e.g. deposit 191→242, withdraw 53→32) is NORMAL business volatility — "
+        "respond NORMAL unless the chart shows a sustained flatline, zero traffic, or an "
+        "extreme outlier far outside the usual band.\n"
+        "5) Your explanation must reference the specific series and values from the alert "
         "text, not unrelated peaks elsewhere on the chart.\n"
         "Reply with the FIRST line being exactly 'ABNORMAL' or 'NORMAL', then on the "
         "following lines a short explanation (1-3 sentences) in 中文 and English."
@@ -10885,6 +10892,90 @@ def _monitoring_ai_abnormal_verdict(
     return verdict, explanation
 
 
+def _monitoring_ai_parse_alert_move(line: str) -> Tuple[Optional[float], Optional[float], str]:
+    """Parse ``value of X increased/decreased to … value of Y`` from one alert block line."""
+    m = re.search(
+        r"value of ([\d,]+(?:\.\d+)?)\s+(increased|decreased)\s+to"
+        r"(?:\s+\d{2}-\d{2}\s+\d{2}:\d{2}\s+value of)?\s+([\d,]+(?:\.\d+)?)",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None, None, ""
+    try:
+        fv = float(m.group(1).replace(",", ""))
+        tv = float(m.group(3).replace(",", ""))
+    except (TypeError, ValueError):
+        return None, None, ""
+    direction = "SPIKE" if m.group(2).casefold() == "increased" else "DROP"
+    return fv, tv, direction
+
+
+def _monitoring_ai_alert_block_pairs(alert_text: str) -> List[Tuple[str, str]]:
+    """Each block: ``(emoji header line, following value/time line)``."""
+    pairs: List[Tuple[str, str]] = []
+    lines = [ln.rstrip() for ln in (alert_text or "").splitlines()]
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith(("📈", "📉")):
+            detail = ""
+            if i + 1 < len(lines):
+                nxt = lines[i + 1].strip()
+                if nxt and not nxt.startswith(("📈", "📉", "[", "🤖")):
+                    detail = nxt
+            pairs.append((lines[i], detail))
+            i += 2
+            continue
+        i += 1
+    return pairs
+
+
+def _monitoring_ai_deposit_withdraw_routine_volatility(alert_text: str) -> Optional[str]:
+    """
+    Deposit/withdraw panels are naturally jagged. Single-minute moves like 191→242 or
+    53→32 are routine — suppress before calling the vision model.
+    """
+    text = alert_text or ""
+    pairs = _monitoring_ai_alert_block_pairs(text)
+    if not pairs:
+        return None
+    other_panels = (
+        "请求总数",
+        "错误请求数",
+        "9280",
+        "IGO Distributions",
+        "FPMS-NT",
+        "Providers",
+        "Games",
+    )
+    if any(tok in text for tok in other_panels):
+        return None
+    for header, detail in pairs:
+        fv, tv, direction = _monitoring_ai_parse_alert_move(detail)
+        if fv is None or tv is None:
+            return None
+        peak = max(fv, tv)
+        delta = abs(tv - fv)
+        if "主站充值" in header or "createProposal" in header:
+            if direction != "SPIKE":
+                return None
+            if peak > 450 or peak < 80 or delta > 80:
+                return None
+        elif "提款" in header or "InitiateWithdrawal" in header:
+            if direction != "DROP":
+                return None
+            if fv > 150 or fv < 20 or delta > 40:
+                return None
+        else:
+            return None
+    return (
+        "🤖 AI Assessment: NORMAL\n"
+        "主站充值/提款分钟级锯齿波动属于正常业务节奏，非持续故障。\n"
+        "Main Site Deposit / Withdrawal minute-level jitter is normal business volatility, "
+        "not a sustained outage."
+    )
+
+
 def _monitoring_ai_fail_open_note() -> str:
     return _cfg_str(
         "MONITORING_AI_FAIL_OPEN_NOTE",
@@ -10910,6 +11001,12 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
         if fail_open and fail_note:
             reply = f"{reply}\n\n{fail_note}"
         return fail_open, reply
+    routine = _monitoring_ai_deposit_withdraw_routine_volatility(reply)
+    if routine:
+        logger.info(
+            "monitoring AI gate: deposit/withdraw routine volatility — alert suppressed"
+        )
+        return False, reply
     verdict, explanation = _monitoring_ai_abnormal_verdict(alert_pngs[0], reply)
     if verdict is None:
         logger.warning(
