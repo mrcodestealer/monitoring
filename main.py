@@ -337,8 +337,8 @@ _CFG: Dict[str, Any] = {
     # Watchdog：Prometheus 判窗对齐到整分钟，相对「当前分钟起点」向回偏移（分钟）。例：7 与 2 → 12:46:xx 只评 12:39:00..12:44:00（5 分钟窗，末桶更旧以减少 Pushgateway 迟到回填假跌）
     "MONITORING_WATCH_EVAL_START_OFFSET_MINUTES": "7",
     "MONITORING_WATCH_EVAL_END_OFFSET_MINUTES": "2",
-    # 首次越阈后冻结判窗、等待该秒数再拉同一窗口复核；0=立即告警（关闭确认）。缓解「当分钟 sum 随后被 Prometheus 回填修正」导致的误报
-    "MONITORING_WATCH_CONFIRM_SECONDS": "60",
+    # 首次越阈后冻结判窗、等待该秒数再拉同一窗口复核；0=立即告警（关闭 confirm 清除）
+    "MONITORING_WATCH_CONFIRM_SECONDS": "0",
     # Watchdog 判警是否使用与 /monitoring 相同的拉数窗口（默认 0：窄窗口 eval；设为 1 则与报表一致，避免「报表有大波动但自动告警未扫到」）
     "MONITORING_WATCH_MATCH_REPORT_WINDOW": "0",
     # Watchdog 告警截图：0=用下面相对时间（默认 1h）；1=与告警判窗 payload.window 对齐
@@ -1036,7 +1036,7 @@ MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS = max(
     0.0, _cfg_float("MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS", 90.0)
 )
 MONITORING_WATCH_CONFIRM_SECONDS = max(
-    0.0, _cfg_float("MONITORING_WATCH_CONFIRM_SECONDS", 60.0)
+    0.0, _cfg_float("MONITORING_WATCH_CONFIRM_SECONDS", 0.0)
 )
 MONITORING_WATCH_SCREENSHOT_MATCH_EVAL = _lark_env_truthy_or_default(
     "MONITORING_WATCH_SCREENSHOT_MATCH_EVAL",
