@@ -223,6 +223,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DEPLOY_ALLOWED_OPEN_ID": "ou_039809aab3d6df17028dfe4bdfc568cd",
     "MONITORING_DEPLOY_REPO_DIR": "",
     "MONITORING_DEPLOY_RESTART_CMD": "systemctl restart grafanaplatformbot",
+    # @bot + ``track 2026-06-30 13:30`` — replay watchdog eval windows (admin only)
+    "MONITORING_TRACK_ENABLE": "1",
     # 1=仅 @ 机器人且无其它正文也触发（与 MONITORING_TRIGGER 默认 /mo 同）；1+ANY=1 时 @ 且任意正文也跑监控（非命令且带字会先收到命令说明）
     "MONITORING_AT_MENTION_ENABLE": "0",
     "MONITORING_AT_MENTION_ANY_TEXT": "0",
@@ -952,6 +954,7 @@ MONITORING_DEPLOY_RESTART_CMD = _cfg_str(
     "MONITORING_DEPLOY_RESTART_CMD",
     "systemctl restart grafanaplatformbot",
 ).strip()
+MONITORING_TRACK_ENABLE = _lark_env_truthy_or_default("MONITORING_TRACK_ENABLE", default=True)
 TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
 MONITORING_ALERT_AT_USER_ENABLE = _lark_env_truthy_or_default(
     "MONITORING_ALERT_AT_USER_ENABLE",
@@ -3334,21 +3337,39 @@ def _find_panel(dashboard: Dict[str, Any], title: str) -> Optional[Dict[str, Any
 
 def _find_panel_fuzzy(dashboard: Dict[str, Any], title: str) -> Optional[Dict[str, Any]]:
     """
-    Match panel by normalized title; falls back to substring match (same idea as Playwright highlight).
+    Match panel by normalized title; falls back to substring / equivalence match.
     """
     want = _grafana_normalize_panel_title(title)
     if not want:
         return None
-    partial: Optional[Dict[str, Any]] = None
+    partial: List[Dict[str, Any]] = []
     for p in _walk_panels(dashboard.get("panels")):
-        pt = _grafana_normalize_panel_title(p.get("title") or "")
+        pt_raw = (p.get("title") or "").strip()
+        if not pt_raw:
+            lp = p.get("libraryPanel")
+            if isinstance(lp, dict):
+                pt_raw = str(lp.get("title") or lp.get("name") or "").strip()
+        pt = _grafana_normalize_panel_title(pt_raw)
         if not pt:
             continue
-        if pt == want:
+        if pt == want or _grafana_panel_titles_equivalent(title, pt_raw):
             return p
-        if partial is None and (want in pt or pt in want):
-            partial = p
-    return partial
+        if want in pt or pt in want:
+            partial.append(p)
+    if len(partial) == 1:
+        return partial[0]
+    if partial:
+        want_cf = _grafana_normalize_panel_title_for_match(title)
+        best: Optional[Dict[str, Any]] = None
+        best_len = 10**9
+        for p in partial:
+            pt_raw = (p.get("title") or "").strip()
+            pt_cf = _grafana_normalize_panel_title_for_match(pt_raw)
+            if want_cf in pt_cf and len(pt_cf) < best_len:
+                best = p
+                best_len = len(pt_cf)
+        return best or partial[0]
+    return None
 
 
 def _fetch_dashboard_model(session: requests.Session, uid: str) -> Dict[str, Any]:
@@ -3658,10 +3679,20 @@ def _fetch_panel_series_by_title(
             end = int(time.time()) - lag
             start = end - GRAFANA_QUERY_LOOKBACK_SECONDS
     sess = session or grafana_login_session()
-    dash = _fetch_dashboard_model(sess, GRAFANA_DASHBOARD_UID)
-    panel = _find_panel(dash, panel_title)
+    panel = _grafana_panel_for_title(sess, panel_title)
     if not panel:
-        raise ValueError(f'Panel titled "{panel_title}" not found on dashboard {GRAFANA_DASHBOARD_UID}')
+        try:
+            exact, _ = _grafana_dashboard_panel_maps(sess)
+            titles = sorted(exact.keys())
+            hint = ", ".join(titles[:16])
+            if len(titles) > 16:
+                hint += f", … (+{len(titles) - 16} more)"
+        except Exception:
+            hint = "(could not list dashboard panels)"
+        raise ValueError(
+            f'Panel titled "{panel_title}" not found on dashboard {GRAFANA_DASHBOARD_UID}. '
+            f"Dashboard panels: {hint}"
+        )
 
     q_panel = _panel_query_model(sess, panel)
     panel_ds = _datasource_uid(q_panel.get("datasource")) or _datasource_uid(panel.get("datasource"))
@@ -4772,6 +4803,323 @@ def _monitoring_deploy_worker(chat_id: str, open_id: str, debounce_key: str) -> 
             _monitoring_inflight_keys.discard(debounce_key)
 
 
+_TRACK_PANEL_ALIASES: Dict[str, str] = {
+    "login": "fpms_nt_login",
+    "fpms": "fpms_nt_login",
+    "authenticate": "fpms_nt_login",
+    "http": "http",
+    "deposit": "deposit",
+    "withdraw": "withdraw",
+    "9280": "9280_push",
+    "error": "error_req_1m",
+}
+
+
+def _monitoring_im_matches_track_command(clean: str) -> bool:
+    if not MONITORING_TRACK_ENABLE:
+        return False
+    return bool(re.match(r"^track\b", (clean or "").strip(), flags=re.IGNORECASE))
+
+
+def _monitoring_track_fmt_local_unix(ts: float) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return str(ts)
+
+
+def _monitoring_parse_track_event_unix(text: str) -> Tuple[Optional[float], Optional[str]]:
+    """Parse ``2026-06-30 13:30``, ``06-30 13:30``, or ``13:30`` (today, server local)."""
+    s = re.sub(r"\s+", " ", (text or "").strip())
+    if not s:
+        return None, "Missing date/time after `track`."
+    lt = time.localtime()
+    year = lt.tm_year
+    m = re.match(
+        r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$",
+        s,
+    )
+    if m:
+        y, mo, d, h, mi, sec = (
+            int(m.group(1)),
+            int(m.group(2)),
+            int(m.group(3)),
+            int(m.group(4)),
+            int(m.group(5)),
+            int(m.group(6) or 0),
+        )
+    else:
+        m2 = re.match(r"^(\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
+        if m2:
+            y, mo, d, h, mi, sec = (
+                year,
+                int(m2.group(1)),
+                int(m2.group(2)),
+                int(m2.group(3)),
+                int(m2.group(4)),
+                int(m2.group(5) or 0),
+            )
+        else:
+            m3 = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
+            if not m3:
+                return None, (
+                    "Bad time format. Examples:\n"
+                    "`track 2026-06-30 13:30`\n"
+                    "`track login 2026-06-30 13:30`\n"
+                    "`track 13:30` (today)"
+                )
+            y, mo, d = year, lt.tm_mon, lt.tm_mday
+            h, mi, sec = int(m3.group(1)), int(m3.group(2)), int(m3.group(3) or 0)
+    try:
+        dt = datetime(y, mo, d, h, mi, sec)
+        return dt.timestamp(), None
+    except ValueError as e:
+        return None, f"Invalid datetime: {e}"
+
+
+def _monitoring_parse_track_command(clean: str) -> Tuple[Optional[str], Optional[float], Optional[str]]:
+    """
+    Returns ``(panel_kind_or_none, event_unix, error_message)``.
+    ``panel_kind`` None = all enabled panels.
+    """
+    if not _monitoring_im_matches_track_command(clean):
+        return None, None, None
+    rest = re.sub(r"^track\s*", "", (clean or "").strip(), flags=re.IGNORECASE).strip()
+    if not rest:
+        return None, None, "Usage: `track [login|http|deposit|…] YYYY-MM-DD HH:MM`"
+    parts = rest.split(None, 1)
+    panel_kind: Optional[str] = None
+    time_part = rest
+    if len(parts) >= 2 and parts[0].lower() in _TRACK_PANEL_ALIASES:
+        panel_kind = _TRACK_PANEL_ALIASES[parts[0].lower()]
+        time_part = parts[1].strip()
+    event_unix, err = _monitoring_parse_track_event_unix(time_part)
+    if err:
+        return panel_kind, None, err
+    return panel_kind, event_unix, None
+
+
+def _monitoring_track_panel_specs() -> List[Tuple[str, str, Any, float, bool]]:
+    """``(kind, title, analyzer, threshold_pct, uses_full_payload)``."""
+    specs: List[Tuple[str, str, Any, float, bool]] = [
+        ("http", GRAFANA_PANEL_TITLE, _http_analysis_for_payload, MONITORING_MEDIAN_ALERT_PCT, True),
+    ]
+    if _lark_env_truthy("MONITORING_9280_ENABLE"):
+        specs.append(
+            ("9280_push", GRAFANA_PANEL_TITLE_9280, _analysis_for_9280_payload, MONITORING_MEDIAN_ALERT_PCT, False)
+        )
+    if _lark_env_truthy("MONITORING_DEPOSIT_ENABLE"):
+        specs.append(
+            ("deposit", GRAFANA_PANEL_TITLE_DEPOSIT, _analysis_for_deposit_payload, MONITORING_DEPOSIT_ALERT_PCT, False)
+        )
+    if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
+        specs.append(
+            ("withdraw", GRAFANA_PANEL_TITLE_WITHDRAW, _analysis_for_withdraw_payload, MONITORING_WITHDRAW_ALERT_PCT, False)
+        )
+    if _lark_env_truthy("MONITORING_FPMS_NT_LOGIN_ENABLE"):
+        specs.append(
+            (
+                "fpms_nt_login",
+                GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN,
+                _analysis_for_fpms_nt_login_payload,
+                MONITORING_FPMS_NT_LOGIN_ALERT_PCT,
+                False,
+            )
+        )
+    if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
+        specs.append(
+            (
+                "error_req_1m",
+                GRAFANA_PANEL_TITLE_ERROR_REQ,
+                _analysis_for_error_req_payload,
+                float(MONITORING_ERROR_REQ_MIN_SPIKE_VALUE),
+                False,
+            )
+        )
+    return specs
+
+
+def _monitoring_track_panel_payload(full: Dict[str, Any], kind: str, uses_full: bool) -> Dict[str, Any]:
+    if uses_full:
+        return full
+    for ex in full.get("extraPanels") or []:
+        if isinstance(ex, dict) and (ex.get("kind") or "") == kind:
+            p = ex.get("payload")
+            return p if isinstance(p, dict) else {}
+    return {}
+
+
+def _monitoring_track_login_bucket_lines(panel_payload: Dict[str, Any]) -> List[str]:
+    pts = _merge_fpms_nt_login_points(panel_payload)
+    pts = _snap_series_to_monitoring_minutes(pts, how="sum")
+    raw_n = len(pts)
+    filt = _filter_low_outlier_points(pts, ratio_to_median=0.28)
+    lines = [f"    login buckets raw={raw_n} after_outlier_filter={len(filt)}"]
+    show = filt if len(filt) >= 3 else pts
+    for t, v in show[-8:]:
+        lines.append(f"    {_fmt_ts_short(t)} = {_fmt_num(v)}")
+    return lines
+
+
+def _monitoring_track_panel_lines(
+    kind: str,
+    title: str,
+    analysis: Dict[str, Any],
+    threshold_pct: float,
+    *,
+    panel_payload: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    _mute_purge_expired()
+    muted = _monitoring_alert_channel_muted(kind)
+    hit = bool(analysis.get("hit_alert"))
+    baseline = analysis.get("baseline_median")
+    thr = float(threshold_pct)
+    lines = [f"  [{title}] muted={muted} hit_alert={hit} threshold={thr:g}% median={_fmt_num(baseline) if baseline is not None else 'n/a'}"]
+    ws = analysis.get("window_max_spike")
+    wd = analysis.get("window_max_drop")
+    if isinstance(ws, dict):
+        lines.append(
+            f"    max SPIKE {ws.get('pct')}% "
+            f"{_fmt_num(ws.get('from_val'))}→{_fmt_num(ws.get('to_val'))} "
+            f"@ {_fmt_ts_short(ws.get('to_ts'))}"
+        )
+    if isinstance(wd, dict):
+        lines.append(
+            f"    max DROP {wd.get('pct')}% "
+            f"{_fmt_num(wd.get('from_val'))}→{_fmt_num(wd.get('to_val'))} "
+            f"@ {_fmt_ts_short(wd.get('to_ts'))}"
+        )
+    if not hit:
+        if muted:
+            lines.append("    → no alert: panel is muted (/m)")
+        elif baseline is None or (isinstance(baseline, (int, float)) and float(baseline) <= 0):
+            lines.append("    → no alert: median baseline is zero/empty")
+        elif isinstance(ws, dict) and float(ws.get("pct") or 0) < thr and isinstance(wd, dict) and float(wd.get("pct") or 0) < thr:
+            lines.append(f"    → no alert: max deviation below {thr:g}% threshold")
+        elif kind == "deposit" and isinstance(wd, dict) and float(wd.get("pct") or 0) < thr:
+            lines.append(f"    → no alert: deposit uses {thr:g}% (e.g. 50% drop may be ignored)")
+        elif kind == "fpms_nt_login":
+            lines.append("    → no alert: check outlier filter, narrow 5m window, or event outside eval window")
+            if panel_payload:
+                lines.extend(_monitoring_track_login_bucket_lines(panel_payload))
+        else:
+            lines.append("    → no alert: below threshold or spike not in eval window")
+    else:
+        lines.append("    → WOULD alert (then AI gate / cooldown may still block send)")
+    return lines
+
+
+def _monitoring_track_build_report(event_unix: float, panel_filter: Optional[str]) -> str:
+    lines: List[str] = [
+        "**Track — why no watchdog alert?**",
+        f"Event (server local): {_monitoring_track_fmt_local_unix(event_unix)}",
+        f"confirm={MONITORING_WATCH_CONFIRM_SECONDS:g}s "
+        f"cooldown={_cfg_float('MONITORING_WATCH_ALERT_COOLDOWN_SECONDS', 300):g}s "
+        f"min_bucket_age={MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS:g}s",
+    ]
+    if _monitoring_watch_in_daily_quiet_local(event_unix):
+        lines.append("NOTE: event time falls in **daily quiet window** — watchdog would not run.")
+    specs = [s for s in _monitoring_track_panel_specs() if not panel_filter or s[0] == panel_filter]
+    if panel_filter and not specs:
+        lines.append(f"Unknown/disabled panel filter: {panel_filter!r}")
+        return "\n".join(lines)
+
+    any_hit = False
+    sess = grafana_login_session()
+    for lag_min in (3, 5, 7, 10):
+        run_at = float(event_unix) + lag_min * 60.0
+        w_start, w_end = _monitoring_watch_eval_window_unix(run_at)
+        event_in = w_start <= event_unix <= w_end
+        lines.append("")
+        lines.append(
+            f"--- Watchdog cycle @ event+{lag_min}m ({_monitoring_track_fmt_local_unix(run_at)}) ---"
+        )
+        if _monitoring_watch_in_daily_quiet_local(run_at):
+            lines.append("BLOCKED: daily quiet window at this cycle")
+            continue
+        age = run_at - float(w_end)
+        if MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS > 0 and age < MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS:
+            lines.append(
+                f"SKIP: newest bucket end {_monitoring_track_fmt_local_unix(w_end)} "
+                f"age={age:.0f}s < min {MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS:g}s"
+            )
+            continue
+        lines.append(
+            f"Eval window: {_monitoring_track_fmt_local_unix(w_start)} .. "
+            f"{_monitoring_track_fmt_local_unix(w_end)} | event_in_window={event_in}"
+        )
+        mo_kind = panel_filter if panel_filter and panel_filter != "http" else None
+        try:
+            _tls_analysis_drop.watchdog = True
+            full = fetch_monitoring_payload(
+                session=sess,
+                for_watchdog=True,
+                start_unix=w_start,
+                end_unix=w_end,
+                mo_panel_kind=mo_kind,
+            )
+        finally:
+            _tls_analysis_drop.watchdog = False
+        for kind, title, analyzer, thr, uses_full in specs:
+            pp = _monitoring_track_panel_payload(full, kind, uses_full)
+            if not pp and kind != "http":
+                lines.append(f"  [{title}] no data in window")
+                continue
+            try:
+                a = analyzer(full if uses_full else pp)
+            except Exception as e:
+                lines.append(f"  [{title}] analysis error: {e}")
+                continue
+            if bool(a.get("hit_alert")):
+                any_hit = True
+            lines.extend(
+                _monitoring_track_panel_lines(
+                    kind,
+                    title,
+                    a,
+                    thr,
+                    panel_payload=pp if kind == "fpms_nt_login" else None,
+                )
+            )
+
+    lines.append("")
+    if any_hit:
+        lines.append(
+            "**Summary:** Threshold WAS hit in at least one simulated cycle. "
+            "If no Lark message: check AI gate logs, 5m cooldown, or confirm was enabled at the time."
+        )
+    else:
+        lines.append(
+            "**Summary:** Threshold NOT hit in simulated watchdog windows (+3/+5/+7/+10m). "
+            "Likely: spike/drop outside 5m eval window, deposit 80% threshold, or login outlier filter."
+        )
+    return "\n".join(lines)
+
+
+def _monitoring_track_worker(
+    chat_id: str,
+    open_id: str,
+    debounce_key: str,
+    event_unix: float,
+    panel_filter: Optional[str],
+) -> None:
+    try:
+        rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
+        if not rv:
+            return
+        report = _monitoring_track_build_report(event_unix, panel_filter)
+        _lark_send_text_auto(rt, rv, report, max_chars=8000)
+    except Exception:
+        logger.exception("track worker failed")
+        try:
+            _monitoring_deploy_send_ack(chat_id, open_id, "**Track failed** — see server logs.")
+        except Exception:
+            logger.exception("track failure notify send failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
 def _monitoring_at_mention_help_text() -> str:
     mo = (MONITORING_TRIGGER or "/mo").strip()
     m = (MONITORING_MUTE_TRIGGER or "/m").strip()
@@ -4781,7 +5129,9 @@ def _monitoring_at_mention_help_text() -> str:
         f"- `{mo}` — Grafana monitoring summary (all graphs)\n"
         f"- `{mo} {{panel title}}` — one graph only (e.g. `{mo} 错误请求数/1m`)\n"
         f"- `{m}` — mute alerts (interactive card)\n"
-        f"- `{c}` — clear all mutes"
+        f"- `{c}` — clear all mutes\n"
+        "- `track 2026-06-30 13:30` — why no alert at that time (admin)\n"
+        "- `track login 2026-06-30 13:30` — one panel only"
     )
 
 
@@ -5892,11 +6242,18 @@ def _grafana_dashboard_panel_maps(
     for p in _walk_panels(dash.get("panels")):
         raw = (p.get("title") or "").strip()
         if not raw:
+            lp = p.get("libraryPanel")
+            if isinstance(lp, dict):
+                raw = str(lp.get("title") or lp.get("name") or "").strip()
+        if not raw:
             continue
         exact[raw] = p
         nk = _grafana_normalize_panel_title(raw)
         if nk and nk not in norm:
             norm[nk] = p
+        nk2 = _grafana_normalize_panel_title_for_match(raw)
+        if nk2 and nk2 not in norm:
+            norm[nk2] = p
     _grafana_dashboard_panel_cache[uid] = (now, exact, norm)
     return exact, norm
 
@@ -5911,6 +6268,12 @@ def _grafana_panel_for_title(session: requests.Session, panel_title: str) -> Opt
     nk = _grafana_normalize_panel_title(title)
     if nk in norm:
         return norm[nk]
+    nk2 = _grafana_normalize_panel_title_for_match(title)
+    if nk2 in norm:
+        return norm[nk2]
+    for raw, p in exact.items():
+        if _grafana_panel_titles_equivalent(title, raw):
+            return p
     dash = _fetch_dashboard_model(session, GRAFANA_DASHBOARD_UID)
     return _find_panel_fuzzy(dash, title)
 
@@ -11954,6 +12317,63 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         ).start()
         return
 
+    _track_panel, _track_unix, _track_err = _monitoring_parse_track_command(clean or "")
+    if _monitoring_im_matches_track_command(clean or ""):
+        rt_t, rv_t = _monitoring_deploy_im_receive_target(chat_id, open_id)
+        if _track_err or _track_unix is None:
+            if rv_t:
+                try:
+                    _monitoring_deploy_send_ack(chat_id, open_id, f"Track: {_track_err or 'bad command'}")
+                except Exception:
+                    logger.exception("track usage send failed")
+            return
+        processed_t = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        debounce_key_t = f"{(chat_id or '').strip()}\n__track__\n{int(_track_unix)}"
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                return
+            if processed_t and processed_t in _processed_lark_message_ids:
+                return
+            if debounce_key_t in _monitoring_inflight_keys:
+                if rv_t:
+                    try:
+                        _monitoring_deploy_send_ack(chat_id, open_id, "OK — track already in progress.")
+                    except Exception:
+                        pass
+                return
+            _monitoring_inflight_keys.add(debounce_key_t)
+            if processed_t:
+                _processed_lark_message_ids.add(processed_t)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+        if not _monitoring_deploy_open_id_allowed(open_id):
+            if rv_t:
+                try:
+                    _monitoring_deploy_send_ack(chat_id, open_id, "Track: not authorized.")
+                except Exception:
+                    pass
+            with _monitoring_reply_dispatch_lock:
+                _monitoring_inflight_keys.discard(debounce_key_t)
+            return
+        if rv_t:
+            try:
+                _monitoring_deploy_send_ack(
+                    chat_id,
+                    open_id,
+                    f"OK — tracking watchdog @ {_monitoring_track_fmt_local_unix(_track_unix)}…",
+                )
+            except Exception:
+                logger.exception("track ack send failed")
+        threading.Thread(
+            target=_monitoring_track_worker,
+            args=(chat_id, open_id, debounce_key_t, _track_unix, _track_panel),
+            daemon=True,
+            name="track-alert",
+        ).start()
+        return
+
     cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
     if (
         _lark_effective_bot_open_id()
@@ -11963,6 +12383,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER)
         and not _monitoring_im_is_deploy_command(raw_text or "", clean or "")
+        and not _monitoring_im_matches_track_command(clean or "")
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
