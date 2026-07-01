@@ -297,8 +297,12 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WITHDRAW_MIN_BASELINE_VALUE": "0",
     "MONITORING_FPMS_NT_LOGIN_ENABLE": "1",
     # Authenticate logins: spike/drop vs eval-window **median baseline**.
-    "MONITORING_FPMS_NT_LOGIN_ALERT_PCT": 25,
-    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT": 25,
+    # Raised from 25% -> 100%: this panel's post-incident plateau naturally jitters
+    # 30-90% minute-to-minute (normal noise), which was false-triggering repeat alerts
+    # at the old 25% threshold. 100% still fires immediately on real spikes (e.g. an
+    # ~830% surge) and keeps re-alerting every cooldown while genuinely elevated.
+    "MONITORING_FPMS_NT_LOGIN_ALERT_PCT": 100,
+    "MONITORING_FPMS_NT_LOGIN_CONTINUOUS_ALERT_PCT": 100,
     "MONITORING_ERROR_REQ_ENABLE": "1",
     "MONITORING_ERROR_REQ_ALERT_PCT": 50,
     "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 80,
@@ -9963,7 +9967,7 @@ def _analysis_for_fpms_nt_login_payload(payload: Dict[str, Any]) -> Dict[str, An
         )
     pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="sum")
     pts_filtered = _trim_trailing_minute_buckets(pts_filtered, _analysis_drop_n())
-    a = _median_baseline_alert_analysis(pts_filtered, MONITORING_MEDIAN_ALERT_PCT)
+    a = _median_baseline_alert_analysis(pts_filtered, MONITORING_FPMS_NT_LOGIN_ALERT_PCT)
     a["point_count"] = len(pts_filtered)
     a["merged_points"] = [[t, v] for t, v in pts_filtered]
     return a
