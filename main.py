@@ -58,7 +58,11 @@ from flask import Flask, Response, g, jsonify, request
 # ---------------------------------------------------------------------------
 _CFG: Dict[str, Any] = {
     "PORT": 5002,
-    "HTTP_SERVER": "flask",
+    # waitress = production WSGI thread pool so Feishu card callbacks (`card.action.trigger`,
+    # 3s budget) never queue behind a slow /mo or watchdog Grafana fetch, and it drops the
+    # per-request journald access-log write of the Flask dev server. Both cause Feishu 200341
+    # (callback timeout). Needs `pip install waitress`; falls back to Flask threaded if missing.
+    "HTTP_SERVER": "waitress",
     "LARK_EVENT_MODE": "http",
     "ENABLE_HTTP": "1",
     "WAITRESS_THREADS": 24,
@@ -561,6 +565,12 @@ _lark_bot_open_id_api_cache: Optional[str] = None
 # --- Alert mute (「告警静音」：进程内；按监控通道粒度，供 watchdog / 告警转发过滤) ---
 _MONITORING_MUTE_UNTIL: Dict[str, float] = {}
 _mute_pending_selections: Dict[str, Set[str]] = {}
+# Per-series (single line within a graph) mute. Key = "kind\x1flabel_casefold" (see
+# :func:`_series_mute_key`); value = expiry unix. Only graphs that alert per series
+# (currently ``error_req_1m``) honor this; whole-graph mute above still applies on top.
+_MONITORING_SERIES_MUTE_UNTIL: Dict[str, float] = {}
+# session_key -> set of "kind\x1flabel" pending per-series selections (label kept raw for display).
+_mute_pending_series: Dict[str, Set[str]] = {}
 _grafana_pw_keeper: Optional[Any] = None
 _grafana_pw_keeper_lock = threading.Lock()
 _grafana_pw_keeper_start_attempted: bool = False
@@ -4419,12 +4429,29 @@ def _monitoring_alert_channel_muted(channel: str) -> bool:
     return time.time() < float(until or 0.0)
 
 
+def _series_mute_key(kind: str, label: str) -> str:
+    """Stable key for a single series within a graph (label compared case-insensitively)."""
+    return f"{(kind or '').strip()}\x1f{(label or '').strip().casefold()}"
+
+
+def _monitoring_alert_series_muted(kind: str, label: str) -> bool:
+    """True when this specific series is muted (independent of whole-graph mute)."""
+    until = _MONITORING_SERIES_MUTE_UNTIL.get(_series_mute_key(kind, label), 0.0)
+    return time.time() < float(until or 0.0)
+
+
 def _mute_purge_expired() -> None:
     now = time.time()
     dead = [k for k, t in _MONITORING_MUTE_UNTIL.items() if float(t or 0.0) <= now]
     for k in dead:
         try:
             del _MONITORING_MUTE_UNTIL[k]
+        except KeyError:
+            pass
+    dead_s = [k for k, t in _MONITORING_SERIES_MUTE_UNTIL.items() if float(t or 0.0) <= now]
+    for k in dead_s:
+        try:
+            del _MONITORING_SERIES_MUTE_UNTIL[k]
         except KeyError:
             pass
 
@@ -4449,9 +4476,36 @@ def _mute_apply_channels(channels: Set[str], duration_sec: float) -> Dict[str, f
     return applied
 
 
+def _mute_apply_series(items: Set[str], duration_sec: float) -> Dict[str, float]:
+    """items = {"kind\\x1flabel"}. Returns "kind\\x1flabel" -> expiry unix for confirmation text."""
+    now = time.time()
+    dur = max(1.0, float(duration_sec))
+    applied: Dict[str, float] = {}
+    with _monitoring_reply_dispatch_lock:
+        for it in items:
+            raw = (it or "").strip()
+            if "\x1f" not in raw:
+                continue
+            kind, label = raw.split("\x1f", 1)
+            kind = kind.strip()
+            label = label.strip()
+            if not kind or not label:
+                continue
+            key = _series_mute_key(kind, label)
+            exp = now + dur
+            prev = float(_MONITORING_SERIES_MUTE_UNTIL.get(key, 0.0) or 0.0)
+            if prev > exp:
+                exp = prev
+            _MONITORING_SERIES_MUTE_UNTIL[key] = exp
+            applied[raw] = exp
+    return applied
+
+
 def _mute_clear_all_locked() -> None:
     _MONITORING_MUTE_UNTIL.clear()
     _mute_pending_selections.clear()
+    _MONITORING_SERIES_MUTE_UNTIL.clear()
+    _mute_pending_series.clear()
 
 
 def _mute_toast_response(content: str, toast_type: str = "info") -> Dict[str, Any]:
@@ -4481,7 +4535,8 @@ def _mute_selection_card_elements(rid_t: str, rid: str) -> List[Dict[str, Any]]:
                 "1. Tap a monitor below repeatedly to **add/remove** it from the selection (see toast).\n"
                 "2. **Mute all & duration** selects every monitor in this list at once.\n"
                 "3. When ready, tap **Next: choose duration**.\n"
-                "4. **Cancel** clears this selection session."
+                "4. To silence just one line in a graph, tap **🎯 Mute a specific series**.\n"
+                "5. **Cancel** clears this selection session."
             ),
         }
     ]
@@ -4539,6 +4594,17 @@ def _mute_selection_card_elements(rid_t: str, rid: str) -> List[Dict[str, Any]]:
             ],
         }
     )
+    if _mute_series_capable_channels():
+        row_series = dict(base_rid)
+        row_series.update({"k": "mute_btn", "v": "series_menu"})
+        elements.append(
+            _monitoring_card_v2_callback_button(
+                "🎯 Mute a specific series ▸",
+                "default",
+                _monitoring_card_callback_payload_strings(row_series),
+                element_id="mute_series",
+            )
+        )
     elements.append(
         _monitoring_card_v2_callback_button(
             "Cancel",
@@ -4637,6 +4703,285 @@ def _mute_send_duration_card_async(
             logger.exception("mute: send duration card failed")
 
     threading.Thread(target=_run, daemon=True, name="mute-duration-card").start()
+
+
+# ---------------------------------------------------------------------------
+# /mute — per-series (single line within a graph) suppression
+# ---------------------------------------------------------------------------
+def _mute_series_capable_channels() -> List[Tuple[str, str]]:
+    """
+    (channel_id, display_label) for graphs that alert **per series** (so muting one line
+    while others keep alerting is meaningful). Other graphs alert as one aggregate line —
+    use whole-graph mute for those. Currently only ``错误请求数/1m``.
+    """
+    out: List[Tuple[str, str]] = []
+    if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
+        out.append(("error_req_1m", f"Error req · {GRAFANA_PANEL_TITLE_ERROR_REQ}"))
+    return out
+
+
+def _mute_series_capable_kind_ids() -> Set[str]:
+    return {c for c, _ in _mute_series_capable_channels()}
+
+
+def _mute_alerting_series_for_kind(kind: str, payload: Dict[str, Any]) -> List[str]:
+    """
+    Currently-alerting (spiked) series labels for a per-series graph, excluding ones already
+    muted. Empty for non per-series graphs. ``payload`` is a full monitoring payload.
+    """
+    k = (kind or "").strip()
+    if k != "error_req_1m" or not isinstance(payload, dict):
+        return []
+    p2 = _panel_payload_for_monitor_kind(payload, k)
+    if not isinstance(p2, dict):
+        return []
+    analysis = _analysis_for_error_req_payload(p2)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for ent in analysis.get("series_entries") or []:
+        if not isinstance(ent, dict) or not ent.get("spiked"):
+            continue
+        lbl = str(ent.get("label") or "").strip()
+        if lbl and lbl.casefold() not in seen:
+            seen.add(lbl.casefold())
+            out.append(lbl)
+    return out
+
+
+def _mute_series_pending_label(kind: str, label: str) -> str:
+    """Packed "kind\\x1flabel" used in the pending set and callback payloads."""
+    return f"{(kind or '').strip()}\x1f{(label or '').strip()}"
+
+
+def _mute_series_graph_picker_elements(rid_t: str, rid: str) -> List[Dict[str, Any]]:
+    rt = (rid_t or "").strip()
+    rv = (rid or "").strip()
+    base_rid: Dict[str, Any] = {}
+    if rt in ("chat_id", "open_id") and rv:
+        base_rid = {"rid_t": rt, "rid": rv}
+    caps = _mute_series_capable_channels()
+    if not caps:
+        return [{
+            "tag": "markdown",
+            "content": (
+                "No graph supports per-series mute yet.\n"
+                "Enable a per-series graph (e.g. `MONITORING_ERROR_REQ_ENABLE=1`) or use whole-graph mute."
+            ),
+        }]
+    elements: List[Dict[str, Any]] = [{
+        "tag": "markdown",
+        "content": (
+            "**Mute a specific series**\n\n"
+            "1. Pick a graph below.\n"
+            "2. The card then lists the series **currently alerting** in that graph.\n"
+            "3. Tap the noisy series, then choose a duration.\n\n"
+            "_Graphs that alert as one aggregate line aren't listed — use whole-graph mute for those._"
+        ),
+    }]
+    for kind, lbl in caps:
+        payload = dict(base_rid)
+        payload.update({"k": "mute_btn", "v": "series_pick", "sk_kind": kind})
+        elements.append(
+            _monitoring_card_v2_callback_button(
+                lbl[:80],
+                "default",
+                _monitoring_card_callback_payload_strings(payload),
+                element_id=f"msg_{hashlib.sha256(kind.encode()).hexdigest()[:10]}",
+            )
+        )
+    back = dict(base_rid)
+    back.update({"k": "mute_btn", "v": "cancel_sel"})
+    elements.append(
+        _monitoring_card_v2_callback_button(
+            "Cancel",
+            "default",
+            _monitoring_card_callback_payload_strings(back),
+            element_id="msg_cancel",
+        )
+    )
+    return elements
+
+
+def _mute_series_graph_picker_card_dict(rid_t: str, rid: str) -> Dict[str, Any]:
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": "Mute a specific series"},
+            "subtitle": {
+                "tag": "plain_text",
+                "content": (MONITORING_MUTE_TRIGGER or "/m").strip()[:190],
+            },
+        },
+        "body": {"elements": _mute_series_graph_picker_elements(rid_t, rid)},
+    }
+
+
+def _mute_series_choose_elements(
+    kind: str,
+    rid_t: str,
+    rid: str,
+    operator_open_id: str,
+    chat_id: str,
+    labels: List[str],
+) -> List[Dict[str, Any]]:
+    rt = (rid_t or "").strip()
+    rv = (rid or "").strip()
+    oid = (operator_open_id or "").strip()
+    cid = (chat_id or "").strip()
+    base: Dict[str, Any] = {"k": "mute_btn", "sk_kind": kind, "oid": oid, "cid": cid}
+    if rt in ("chat_id", "open_id") and rv:
+        base["rid_t"] = rt
+        base["rid"] = rv
+    graph_lbl = next((l for k, l in _mute_series_capable_channels() if k == kind), kind)
+    if not labels:
+        elements: List[Dict[str, Any]] = [{
+            "tag": "markdown",
+            "content": (
+                f"**{graph_lbl}**\n\n"
+                "No series is alerting right now, so there's nothing to mute here.\n"
+                "To silence the whole graph instead, run the mute command and pick it from the graph list."
+            ),
+        }]
+        back = dict(base)
+        back["v"] = "series_menu"
+        elements.append(
+            _monitoring_card_v2_callback_button(
+                "Back to graphs",
+                "default",
+                _monitoring_card_callback_payload_strings(back),
+                element_id="msc_back",
+            )
+        )
+        return elements
+    elements = [{
+        "tag": "markdown",
+        "content": (
+            f"**{graph_lbl} — currently alerting series**\n\n"
+            "Tap a series to **add/remove** it from the selection (see toast), then tap "
+            "**Next: choose duration**."
+        ),
+    }]
+    for lbl in labels:
+        payload = dict(base)
+        payload.update({"v": "series_toggle", "lbl": lbl})
+        elements.append(
+            _monitoring_card_v2_callback_button(
+                lbl[:80],
+                "default",
+                _monitoring_card_callback_payload_strings(payload),
+                element_id=f"mss_{hashlib.sha256(lbl.encode()).hexdigest()[:10]}",
+            )
+        )
+    row_next = dict(base)
+    row_next["v"] = "series_next"
+    row_back = dict(base)
+    row_back["v"] = "series_menu"
+    elements.append(
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "default",
+            "horizontal_align": "left",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        _monitoring_card_v2_callback_button(
+                            "Next: choose duration",
+                            "primary",
+                            _monitoring_card_callback_payload_strings(row_next),
+                            element_id="msc_next",
+                        )
+                    ],
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        _monitoring_card_v2_callback_button(
+                            "Back to graphs",
+                            "default",
+                            _monitoring_card_callback_payload_strings(row_back),
+                            element_id="msc_back",
+                        )
+                    ],
+                },
+            ],
+        }
+    )
+    return elements
+
+
+def _mute_series_choose_card_dict(
+    kind: str,
+    rid_t: str,
+    rid: str,
+    operator_open_id: str,
+    chat_id: str,
+    labels: List[str],
+) -> Dict[str, Any]:
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": "Choose series to mute"},
+            "subtitle": {
+                "tag": "plain_text",
+                "content": (MONITORING_MUTE_TRIGGER or "/m").strip()[:190],
+            },
+        },
+        "body": {
+            "elements": _mute_series_choose_elements(
+                kind, rid_t, rid, operator_open_id, chat_id, labels
+            )
+        },
+    }
+
+
+def _mute_send_series_graph_picker_async(rid_t: str, rid: str) -> None:
+    def _run() -> None:
+        try:
+            rt = (rid_t or "").strip()
+            rv = (rid or "").strip()
+            if rt not in ("chat_id", "open_id") or not rv:
+                return
+            card = _mute_series_graph_picker_card_dict(rt, rv)
+            _lark_send_interactive_card(rt, rv, card)
+        except Exception:
+            logger.exception("mute: send series graph picker failed")
+
+    threading.Thread(target=_run, daemon=True, name="mute-series-menu").start()
+
+
+def _mute_send_series_choose_card_async(
+    kind: str, rid_t: str, rid: str, operator_open_id: str, chat_id: str
+) -> None:
+    def _run() -> None:
+        try:
+            rt = (rid_t or "").strip()
+            rv = (rid or "").strip()
+            if rt not in ("chat_id", "open_id") or not rv:
+                return
+            labels: List[str] = []
+            try:
+                payload = fetch_monitoring_payload()
+                labels = _mute_alerting_series_for_kind(kind, payload)
+            except Exception:
+                logger.exception("mute: fetch alerting series failed kind=%r", kind)
+            card = _mute_series_choose_card_dict(
+                kind, rt, rv, operator_open_id, chat_id, labels
+            )
+            _lark_send_interactive_card(rt, rv, card)
+        except Exception:
+            logger.exception("mute: send series choose card failed")
+
+    threading.Thread(target=_run, daemon=True, name="mute-series-choose").start()
 
 
 def _mute_send_selection_card_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
@@ -5208,7 +5553,45 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
     if v == "cancel_sel":
         with _monitoring_reply_dispatch_lock:
             _mute_pending_selections.pop(sk, None)
+            _mute_pending_series.pop(sk, None)
         return _mute_toast_response("Selection cleared", "info")
+
+    if v == "series_menu":
+        if not _mute_series_capable_channels():
+            return _mute_toast_response("No graph supports per-series mute", "warning")
+        _mute_send_series_graph_picker_async(rid_t, rid)
+        return _mute_toast_response("Choose a graph", "info")
+
+    if v == "series_pick":
+        kind = _lark_dict_pick_str(val, "sk_kind").strip()
+        if kind not in _mute_series_capable_kind_ids():
+            return _mute_toast_response("Graph does not support per-series mute", "warning")
+        _mute_send_series_choose_card_async(kind, rid_t, rid, op_open or "", chat_id)
+        return _mute_toast_response("Loading currently-alerting series…", "info")
+
+    if v == "series_toggle":
+        kind = _lark_dict_pick_str(val, "sk_kind").strip()
+        lbl = _lark_dict_pick_str(val, "lbl").strip()
+        if kind not in _mute_series_capable_kind_ids() or not lbl:
+            return _mute_toast_response("Unknown series", "warning")
+        packed = _mute_series_pending_label(kind, lbl)
+        with _monitoring_reply_dispatch_lock:
+            pend_s = _mute_pending_series.setdefault(sk, set())
+            if packed in pend_s:
+                pend_s.discard(packed)
+                msg = f"Removed: {lbl} ({len(pend_s)} series selected)"
+            else:
+                pend_s.add(packed)
+                msg = f"Added: {lbl} ({len(pend_s)} series selected)"
+        return _mute_toast_response(msg, "success")
+
+    if v == "series_next":
+        with _monitoring_reply_dispatch_lock:
+            pend_s = set(_mute_pending_series.get(sk) or set())
+        if not pend_s:
+            return _mute_toast_response("Select at least one series first", "warning")
+        _mute_send_duration_card_async(rid_t, rid, op_open or "", chat_id)
+        return _mute_toast_response("Choose a duration", "success")
 
     if v == "next":
         with _monitoring_reply_dispatch_lock:
@@ -5231,16 +5614,27 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
             return _mute_toast_response("Invalid duration", "warning")
         with _monitoring_reply_dispatch_lock:
             pend = set(_mute_pending_selections.pop(sk2, set()) or set())
-        if not pend:
+            pend_s = set(_mute_pending_series.pop(sk2, set()) or set())
+        if not pend and not pend_s:
             return _mute_toast_response(
                 f"Nothing to mute — run {MONITORING_MUTE_TRIGGER} and select monitors again", "warning"
             )
-        applied = _mute_apply_channels(pend, float(sec))
-        if not applied:
+        applied = _mute_apply_channels(pend, float(sec)) if pend else {}
+        applied_s = _mute_apply_series(pend_s, float(sec)) if pend_s else {}
+        if not applied and not applied_s:
             return _mute_toast_response("Could not apply mute", "warning")
-        lines = [f"Alert mute enabled for {len(applied)} monitor(s):"]
-        for ch, exp in sorted(applied.items(), key=lambda kv: kv[0]):
-            lines.append(f"- {_mute_channel_display_label(ch)} until {_fmt_ts_short(exp)}")
+        lines: List[str] = []
+        if applied:
+            lines.append(f"Alert mute enabled for {len(applied)} monitor(s):")
+            for ch, exp in sorted(applied.items(), key=lambda kv: kv[0]):
+                lines.append(f"- {_mute_channel_display_label(ch)} until {_fmt_ts_short(exp)}")
+        if applied_s:
+            lines.append(f"Alert mute enabled for {len(applied_s)} series:")
+            for packed, exp in sorted(applied_s.items(), key=lambda kv: kv[0]):
+                kind, _sep, label = packed.partition("\x1f")
+                lines.append(
+                    f"- {_mute_channel_display_label(kind)} — {label} until {_fmt_ts_short(exp)}"
+                )
         summary = "\n".join(lines)
         try:
             rt = (rid_t or "").strip()
@@ -10178,6 +10572,14 @@ def _analysis_for_error_req_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             })
             total_pts += int(a.get("point_count") or 0)
             merged_all.extend(a.get("merged_points") or [])
+    # Per-series mute (/m → specific series): a muted line no longer counts as spiked, so it
+    # drops out of hit_alert, the alert text, and per-series alert screenshots.
+    for _e in entries:
+        if _e.get("spiked") and _monitoring_alert_series_muted(
+            "error_req_1m", str(_e.get("label") or "")
+        ):
+            _e["spiked"] = False
+            _e["muted"] = True
     return {
         "hit_alert": any(bool(e.get("spiked")) for e in entries),
         "dual_spike_required": False,
