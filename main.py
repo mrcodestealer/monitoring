@@ -566,6 +566,10 @@ _monitoring_user_send_in_progress: set = set()
 _monitoring_chat_reply_sent_at: Dict[str, float] = {}
 _monitoring_chat_send_in_progress: set = set()
 _monitoring_card_action_event_ids: set = set()
+# Dedicated lock for the card-action event-id dedup ONLY (the first op on every button click).
+# Keeping it off _monitoring_reply_dispatch_lock guarantees a button callback never waits on the
+# shared lock used by the watchdog / IM handlers, so it always answers within Feishu's 3s budget.
+_card_action_dedup_lock = threading.Lock()
 _monitoring_watch_last_alert_at: float = 0.0
 _monitoring_watch_started: bool = False
 # (start_unix, end_unix, confirm_deadline_monotonic) — watchdog 冻结判窗待复核；None=无挂起
@@ -4832,9 +4836,10 @@ def _mute_duration_card_dict(rid_t: str, rid: str, operator_open_id: str, chat_i
 
 
 def _mute_send_duration_card_async(
-    rid_t: str, rid: str, operator_open_id: str, chat_id: str
+    rid_t: str, rid: str, operator_open_id: str, chat_id: str, reply_to_mid: str = ""
 ) -> None:
     def _run() -> None:
+        _set_reply_to_mid(reply_to_mid)
         try:
             rt = (rid_t or "").strip()
             rv = (rid or "").strip()
@@ -5087,8 +5092,9 @@ def _mute_series_choose_card_dict(
     }
 
 
-def _mute_send_series_graph_picker_async(rid_t: str, rid: str) -> None:
+def _mute_send_series_graph_picker_async(rid_t: str, rid: str, reply_to_mid: str = "") -> None:
     def _run() -> None:
+        _set_reply_to_mid(reply_to_mid)
         try:
             rt = (rid_t or "").strip()
             rv = (rid or "").strip()
@@ -5103,9 +5109,10 @@ def _mute_send_series_graph_picker_async(rid_t: str, rid: str) -> None:
 
 
 def _mute_send_series_choose_card_async(
-    kind: str, rid_t: str, rid: str, operator_open_id: str, chat_id: str
+    kind: str, rid_t: str, rid: str, operator_open_id: str, chat_id: str, reply_to_mid: str = ""
 ) -> None:
     def _run() -> None:
+        _set_reply_to_mid(reply_to_mid)
         try:
             rt = (rid_t or "").strip()
             rv = (rid or "").strip()
@@ -5644,7 +5651,7 @@ def _monitoring_at_mention_help_worker(chat_id: str, open_id: str, debounce_key:
 def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return HTTP response dict for card.action when toast should be shown synchronously."""
     ev_id = _lark_im_payload_event_id(data)
-    with _monitoring_reply_dispatch_lock:
+    with _card_action_dedup_lock:
         if ev_id and ev_id in _monitoring_card_action_event_ids:
             return _mute_toast_response("Duplicate click ignored", "info")
         if ev_id:
@@ -5669,6 +5676,9 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
         op_id = op.get("operator_id") if isinstance(op.get("operator_id"), dict) else {}
         op_open = _lark_dict_pick_str(op_id, "open_id", "openId", "user_id", "userId")
 
+    # message_id of the clicked card — reply-in-thread to it so every follow-up card (graph picker →
+    # series → duration → confirmation) lands in the same thread as the original /m command.
+    reply_mid = _lark_card_action_message_id(data)
     sk = _mute_session_key(chat_id, op_open or "")
     v = _lark_dict_pick_str(val, "v")
     allowed = _monitoring_mutable_channel_ids()
@@ -5690,7 +5700,7 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
     if v == "all":
         with _monitoring_reply_dispatch_lock:
             _mute_pending_selections[sk] = set(allowed)
-        _mute_send_duration_card_async(rid_t, rid, op_open or "", chat_id)
+        _mute_send_duration_card_async(rid_t, rid, op_open or "", chat_id, reply_to_mid=reply_mid)
         return _mute_toast_response("All monitors selected — pick a duration", "success")
 
     if v == "cancel_sel":
@@ -5702,14 +5712,14 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
     if v == "series_menu":
         if not _mute_series_capable_channels():
             return _mute_toast_response("No graph supports per-series mute", "warning")
-        _mute_send_series_graph_picker_async(rid_t, rid)
+        _mute_send_series_graph_picker_async(rid_t, rid, reply_to_mid=reply_mid)
         return _mute_toast_response("Choose a graph", "info")
 
     if v == "series_pick":
         kind = _lark_dict_pick_str(val, "sk_kind").strip()
         if kind not in _mute_series_capable_kind_ids():
             return _mute_toast_response("Graph does not support per-series mute", "warning")
-        _mute_send_series_choose_card_async(kind, rid_t, rid, op_open or "", chat_id)
+        _mute_send_series_choose_card_async(kind, rid_t, rid, op_open or "", chat_id, reply_to_mid=reply_mid)
         return _mute_toast_response("Loading currently-alerting series…", "info")
 
     if v == "series_toggle":
@@ -5733,7 +5743,7 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
             pend_s = set(_mute_pending_series.get(sk) or set())
         if not pend_s:
             return _mute_toast_response("Select at least one series first", "warning")
-        _mute_send_duration_card_async(rid_t, rid, op_open or "", chat_id)
+        _mute_send_duration_card_async(rid_t, rid, op_open or "", chat_id, reply_to_mid=reply_mid)
         return _mute_toast_response("Choose a duration", "success")
 
     if v == "next":
@@ -5742,7 +5752,7 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
             pend = set(pend)
         if not pend:
             return _mute_toast_response("Select at least one monitor first", "warning")
-        _mute_send_duration_card_async(rid_t, rid, op_open or "", chat_id)
+        _mute_send_duration_card_async(rid_t, rid, op_open or "", chat_id, reply_to_mid=reply_mid)
         return _mute_toast_response("Choose a duration", "success")
 
     if v == "apply":
@@ -5785,6 +5795,7 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
             # Send confirmation OFF the callback thread: a synchronous Lark API call here (token +
             # HTTP round-trip) can exceed Feishu's 3s card-callback budget and cause 200341.
             def _send_confirm() -> None:
+                _set_reply_to_mid(reply_mid)
                 try:
                     _lark_send_text(rt, rv, summary)
                 except Exception:
@@ -11706,6 +11717,16 @@ def _lark_card_action_value(data: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _lark_card_action_message_id(data: Dict[str, Any]) -> str:
+    """message_id of the card the button is on — reply-in-thread to it so follow-up cards join the thread."""
+    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+    ctx = ev.get("context") if isinstance(ev.get("context"), dict) else {}
+    mid = _lark_dict_pick_str(ctx, "open_message_id", "openMessageId", "message_id", "messageId")
+    if not mid:
+        mid = _lark_dict_pick_str(ev, "open_message_id", "openMessageId", "message_id", "messageId")
+    return mid
+
+
 def _lark_card_action_target_ids(data: Dict[str, Any]) -> Tuple[str, str]:
     ev = data.get("event") if isinstance(data.get("event"), dict) else {}
     chat_id = _lark_dict_pick_str(ev, "open_chat_id", "openChatId", "chat_id", "chatId")
@@ -11780,7 +11801,7 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
     if not (k == "monitoring_btn" and v == "refresh"):
         return
     ev_id = _lark_im_payload_event_id(data)
-    with _monitoring_reply_dispatch_lock:
+    with _card_action_dedup_lock:
         if ev_id and ev_id in _monitoring_card_action_event_ids:
             logger.info("duplicate card.action event_id=%r — skip", ev_id)
             return
@@ -12190,16 +12211,23 @@ def _monitoring_watchdog_loop() -> None:
                     continue
 
                 now_m = time.monotonic()
+                # Decide under the lock, then release it BEFORE sleeping. Holding
+                # _monitoring_reply_dispatch_lock across time.sleep(sec) stalled card-button callbacks
+                # (they take the same lock) for 15-20s during an alert cooldown → Feishu 200341.
+                _cooldown_left = -1.0
                 with _monitoring_reply_dispatch_lock:
                     prev = _monitoring_watch_last_alert_at
                     if cool > 0 and prev > 0 and (now_m - prev) < cool:
-                        logger.info(
-                            "monitoring watchdog alert skipped by cooldown after confirm (%.0fs left)",
-                            cool - (now_m - prev),
-                        )
-                        time.sleep(sec)
-                        continue
-                    _monitoring_watch_last_alert_at = now_m
+                        _cooldown_left = cool - (now_m - prev)
+                    else:
+                        _monitoring_watch_last_alert_at = now_m
+                if _cooldown_left >= 0.0:
+                    logger.info(
+                        "monitoring watchdog alert skipped by cooldown after confirm (%.0fs left)",
+                        _cooldown_left,
+                    )
+                    time.sleep(sec)
+                    continue
 
                 reply = _format_alert_trigger_reply(payload_c)
                 pre_key: Optional[str] = None
@@ -12288,15 +12316,20 @@ def _monitoring_watchdog_loop() -> None:
                     continue
 
                 now_m = time.monotonic()
+                # Release the lock before sleeping (see cooldown-after-confirm note above) so card
+                # button callbacks that share _monitoring_reply_dispatch_lock never stall → 200341.
+                _cooldown_left = -1.0
                 with _monitoring_reply_dispatch_lock:
                     prev = _monitoring_watch_last_alert_at
                     if cool > 0 and prev > 0 and (now_m - prev) < cool:
-                        logger.info(
-                            "monitoring watchdog alert skipped by cooldown (%.0fs left)",
-                            cool - (now_m - prev),
-                        )
-                        time.sleep(sec)
-                        continue
+                        _cooldown_left = cool - (now_m - prev)
+                if _cooldown_left >= 0.0:
+                    logger.info(
+                        "monitoring watchdog alert skipped by cooldown (%.0fs left)",
+                        _cooldown_left,
+                    )
+                    time.sleep(sec)
+                    continue
 
                 if confirm_s > 0 and not match_rp:
                     w_s, w_e = _monitoring_watch_eval_window_unix()
@@ -12830,10 +12863,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             if debounce_key_d in _monitoring_inflight_keys:
                 logger.info("deploy skip — already in flight")
                 if rv_d:
-                    try:
-                        _monitoring_deploy_send_ack(chat_id, open_id, "OK — deploy already in progress.")
-                    except Exception:
-                        logger.exception("deploy in-flight ack send failed")
+                    def _dup_ack_d() -> None:
+                        try:
+                            _monitoring_deploy_send_ack(chat_id, open_id, "OK — deploy already in progress.")
+                        except Exception:
+                            logger.exception("deploy in-flight ack send failed")
+
+                    threading.Thread(target=_dup_ack_d, daemon=True, name="deploy-dup-ack").start()
                 return
             _monitoring_inflight_keys.add(debounce_key_d)
             if processed_d:
@@ -12901,10 +12937,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 return
             if debounce_key_t in _monitoring_inflight_keys:
                 if rv_t:
-                    try:
-                        _monitoring_deploy_send_ack(chat_id, open_id, "OK — track already in progress.")
-                    except Exception:
-                        pass
+                    def _dup_ack_t() -> None:
+                        try:
+                            _monitoring_deploy_send_ack(chat_id, open_id, "OK — track already in progress.")
+                        except Exception:
+                            pass
+
+                    threading.Thread(target=_dup_ack_t, daemon=True, name="track-dup-ack").start()
                 return
             _monitoring_inflight_keys.add(debounce_key_t)
             if processed_t:
