@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONPATH=\"C:/Users/jcsia/Desktop/ALL/monitoring\" python *)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONPATH=C:/Users/jcsia/Desktop/ALL/monitoring python *)"
+    ]
+  }
+}

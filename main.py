@@ -222,6 +222,13 @@ _CFG: Dict[str, Any] = {
     "MONITORING_TRIGGER": "/mo",
     "MONITORING_MUTE_TRIGGER": "/m",
     "MONITORING_CANCELMUTE_TRIGGER": "/c",
+    # React on the command message: 「got it」(OnIt) when accepted, 「done」(DONE) when finished.
+    # Works with the app scope `im:message` (already used to send) or `im:message.reactions:write_only`;
+    # without either, reactions just log a warning and are skipped. Emoji keys are Feishu emoji_type
+    # values (e.g. OnIt, DONE, OK, GLANCE, THUMBSUP). Set MONITORING_REACT_ACK_ENABLE=0 to disable.
+    "MONITORING_REACT_ACK_ENABLE": "1",
+    "MONITORING_REACT_GOTIT_EMOJI": "OnIt",
+    "MONITORING_REACT_DONE_EMOJI": "DONE",
     # @bot + "git pull and restart service" — git pull in repo then systemd restart (admin only)
     "MONITORING_DEPLOY_ENABLE": "1",
     "MONITORING_DEPLOY_ALLOWED_OPEN_ID": "ou_039809aab3d6df17028dfe4bdfc568cd",
@@ -958,6 +965,9 @@ LARK_HOST = _cfg_str("LARK_HOST", "https://open.feishu.cn").rstrip("/")
 MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/mo")
 MONITORING_MUTE_TRIGGER = _cfg_str("MONITORING_MUTE_TRIGGER", "/m").strip()
 MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").strip()
+MONITORING_REACT_ACK_ENABLE = _lark_env_truthy_or_default("MONITORING_REACT_ACK_ENABLE", default=True)
+MONITORING_REACT_GOTIT_EMOJI = _cfg_str("MONITORING_REACT_GOTIT_EMOJI", "OnIt").strip() or "OnIt"
+MONITORING_REACT_DONE_EMOJI = _cfg_str("MONITORING_REACT_DONE_EMOJI", "DONE").strip() or "DONE"
 MONITORING_DEPLOY_ENABLE = _lark_env_truthy_or_default("MONITORING_DEPLOY_ENABLE", default=True)
 MONITORING_DEPLOY_ALLOWED_OPEN_ID = _cfg_str(
     "MONITORING_DEPLOY_ALLOWED_OPEN_ID",
@@ -4107,6 +4117,72 @@ def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
         raise RuntimeError(
             f"Lark send failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
         )
+
+
+def _lark_add_message_reaction(message_id: str, emoji_type: str) -> None:
+    """Add one emoji reaction to a message via Open API (SDK client reuses its cached tenant token)."""
+    from lark_oapi.api.im.v1.model.create_message_reaction_request import CreateMessageReactionRequest
+    from lark_oapi.api.im.v1.model.create_message_reaction_request_body import CreateMessageReactionRequestBody
+    from lark_oapi.api.im.v1.model.emoji import Emoji
+
+    mid = (message_id or "").strip()
+    et = (emoji_type or "").strip()
+    if not mid or not et:
+        return
+    client = _get_lark_oapi_client()
+    body = (
+        CreateMessageReactionRequestBody.builder()
+        .reaction_type(Emoji.builder().emoji_type(et).build())
+        .build()
+    )
+    req = (
+        CreateMessageReactionRequest.builder()
+        .message_id(mid)
+        .request_body(body)
+        .build()
+    )
+    resp = client.im.v1.message_reaction.create(req)
+    if not resp.success():
+        raise RuntimeError(
+            f"Lark reaction failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
+        )
+
+
+def _lark_react_safe(message_id: str, emoji_type: str) -> None:
+    """Fire-and-forget message reaction in a background thread; never raises. Off when MONITORING_REACT_ACK_ENABLE=0."""
+    if not MONITORING_REACT_ACK_ENABLE:
+        return
+    mid = (message_id or "").strip()
+    et = (emoji_type or "").strip()
+    if not mid or not et:
+        return
+
+    def _run() -> None:
+        try:
+            _lark_add_message_reaction(mid, et)
+        except Exception as e:
+            logger.warning(
+                "lark reaction %r failed (grant app scope im:message or im:message.reactions:write_only?): %s",
+                et,
+                e,
+            )
+
+    threading.Thread(target=_run, daemon=True, name=f"lark-react-{et}").start()
+
+
+def _spawn_reacting_worker(
+    message_id: str, target: Any, args: Tuple[Any, ...], name: str
+) -> None:
+    """Spawn a command worker thread and add the 「done」reaction to the trigger message when it returns."""
+    def _wrapped() -> None:
+        try:
+            target(*args)
+        except Exception:
+            logger.exception("command worker %r crashed", name)
+        finally:
+            _lark_react_safe(message_id, MONITORING_REACT_DONE_EMOJI)
+
+    threading.Thread(target=_wrapped, daemon=True, name=name).start()
 
 
 def _split_text_for_lark(text: str, max_chars: int = 3200) -> List[str]:
@@ -12642,20 +12718,21 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                     _processed_lark_im_event_ids.clear()
                     _processed_lark_im_event_ids.add(im_event_id)
         logger.info("%s command accepted chat=%r open=%r", sp_cmd, bool(chat_id), bool(open_id))
+        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
         if sp_cmd == "mute":
-            threading.Thread(
-                target=_mute_send_selection_card_worker,
-                args=(chat_id, open_id, debounce_key_m),
-                daemon=True,
-                name="mute-selection-card",
-            ).start()
+            _spawn_reacting_worker(
+                mid,
+                _mute_send_selection_card_worker,
+                (chat_id, open_id, debounce_key_m),
+                "mute-selection-card",
+            )
         else:
-            threading.Thread(
-                target=_cancelmute_worker,
-                args=(chat_id, open_id, debounce_key_m),
-                daemon=True,
-                name="cancelmute",
-            ).start()
+            _spawn_reacting_worker(
+                mid,
+                _cancelmute_worker,
+                (chat_id, open_id, debounce_key_m),
+                "cancelmute",
+            )
         return
 
     if _monitoring_im_is_deploy_command(raw_text or "", clean or ""):
@@ -12706,6 +12783,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 _monitoring_inflight_keys.discard(debounce_key_d)
             return
         logger.info("deploy command accepted chat=%r open_id_prefix=%r", bool(chat_id), (open_id or "")[:12])
+        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
         if rv_d:
             try:
                 _monitoring_deploy_send_ack(
@@ -12715,12 +12793,12 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 )
             except Exception:
                 logger.exception("deploy immediate ack send failed")
-        threading.Thread(
-            target=_monitoring_deploy_worker,
-            args=(chat_id, open_id, debounce_key_d),
-            daemon=True,
-            name="deploy-git-pull",
-        ).start()
+        _spawn_reacting_worker(
+            mid,
+            _monitoring_deploy_worker,
+            (chat_id, open_id, debounce_key_d),
+            "deploy-git-pull",
+        )
         return
 
     _track_panel, _track_unix, _track_err = _monitoring_parse_track_command(clean or "")
@@ -12763,6 +12841,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             with _monitoring_reply_dispatch_lock:
                 _monitoring_inflight_keys.discard(debounce_key_t)
             return
+        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
         if rv_t:
             try:
                 _monitoring_deploy_send_ack(
@@ -12772,12 +12851,12 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 )
             except Exception:
                 logger.exception("track ack send failed")
-        threading.Thread(
-            target=_monitoring_track_worker,
-            args=(chat_id, open_id, debounce_key_t, _track_unix, _track_panel),
-            daemon=True,
-            name="track-alert",
-        ).start()
+        _spawn_reacting_worker(
+            mid,
+            _monitoring_track_worker,
+            (chat_id, open_id, debounce_key_t, _track_unix, _track_panel),
+            "track-alert",
+        )
         return
 
     cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
@@ -12956,12 +13035,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 _processed_lark_im_event_ids.clear()
                 _processed_lark_im_event_ids.add(im_event_id)
 
-    threading.Thread(
-        target=_run_monitoring_background_job,
-        args=(chat_id, open_id, mid, debounce_key, chat_aliases, mo_panel_arg),
-        daemon=True,
-        name="monitoring-reply",
-    ).start()
+    _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
+    _spawn_reacting_worker(
+        mid,
+        _run_monitoring_background_job,
+        (chat_id, open_id, mid, debounce_key, chat_aliases, mo_panel_arg),
+        "monitoring-reply",
+    )
 
 
 def _ws_log_message_snip(data: Dict[str, Any]) -> Tuple[Any, Any, str]:
@@ -13577,6 +13657,14 @@ def run_monitoring_bot() -> None:
     mode = raw_mode if raw_mode else "http"
 
     def run_http() -> None:
+        # Feishu card/webhook callbacks have a ~3s budget. The Flask/werkzeug dev server writes one
+        # access-log line per request to journald *before* flushing the response; under this bot's
+        # heavy logging journald backpressures and that write can block for seconds → the callback
+        # misses 3s → Feishu shows 200341. Silence werkzeug's per-request access log unless explicitly
+        # debugging (LARK_WEBHOOK_WSGI_LOG=1). Waitress doesn't use this logger, so this is the fix
+        # that keeps the Flask fallback fast when waitress isn't installed.
+        if not _lark_env_truthy("LARK_WEBHOOK_WSGI_LOG"):
+            logging.getLogger("werkzeug").setLevel(logging.WARNING)
         stack = _cfg_str("HTTP_SERVER", "flask").strip().lower()
         use_waitress = stack in ("waitress", "wsgi")
         if not use_waitress:
