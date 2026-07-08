@@ -229,6 +229,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_REACT_ACK_ENABLE": "1",
     "MONITORING_REACT_GOTIT_EMOJI": "OnIt",
     "MONITORING_REACT_DONE_EMOJI": "DONE",
+    # 1 = the bot replies **in a thread on your original command message** (Feishu reply_in_thread)
+    # instead of posting a standalone message in the chat. Set 0 for the old standalone behavior.
+    "MONITORING_REPLY_IN_THREAD": "1",
     # @bot + "git pull and restart service" — git pull in repo then systemd restart (admin only)
     "MONITORING_DEPLOY_ENABLE": "1",
     "MONITORING_DEPLOY_ALLOWED_OPEN_ID": "ou_039809aab3d6df17028dfe4bdfc568cd",
@@ -968,6 +971,7 @@ MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").
 MONITORING_REACT_ACK_ENABLE = _lark_env_truthy_or_default("MONITORING_REACT_ACK_ENABLE", default=True)
 MONITORING_REACT_GOTIT_EMOJI = _cfg_str("MONITORING_REACT_GOTIT_EMOJI", "OnIt").strip() or "OnIt"
 MONITORING_REACT_DONE_EMOJI = _cfg_str("MONITORING_REACT_DONE_EMOJI", "DONE").strip() or "DONE"
+MONITORING_REPLY_IN_THREAD = _lark_env_truthy_or_default("MONITORING_REPLY_IN_THREAD", default=True)
 MONITORING_DEPLOY_ENABLE = _lark_env_truthy_or_default("MONITORING_DEPLOY_ENABLE", default=True)
 MONITORING_DEPLOY_ALLOWED_OPEN_ID = _cfg_str(
     "MONITORING_DEPLOY_ALLOWED_OPEN_ID",
@@ -4100,9 +4104,60 @@ def _get_lark_oapi_client() -> Any:
     return _lark_oapi_client
 
 
+# Per-worker "reply to this message in a thread" target. Each command worker sets this to the
+# triggering message_id (see _spawn_reacting_worker); the senders below then use the Feishu reply
+# API (reply_in_thread) instead of a standalone message. Thread-local so concurrent commands don't
+# cross wires; freshly-spawned child threads don't inherit it (intentional — see _spawn_reacting_worker).
+_reply_ctx = threading.local()
+
+
+def _set_reply_to_mid(message_id: str) -> None:
+    _reply_ctx.mid = (message_id or "").strip()
+
+
+def _current_reply_to_mid() -> str:
+    return getattr(_reply_ctx, "mid", "") or ""
+
+
+def _lark_reply_message(
+    message_id: str, msg_type: str, content_str: str, *, in_thread: bool = True
+) -> None:
+    """Reply to a message (threaded when ``in_thread``) via the SDK reply API (reuses cached token)."""
+    from lark_oapi.api.im.v1.model.reply_message_request import ReplyMessageRequest
+    from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageRequestBody
+
+    client = _get_lark_oapi_client()
+    body = (
+        ReplyMessageRequestBody.builder()
+        .content(content_str)
+        .msg_type(msg_type)
+        .reply_in_thread(bool(in_thread))
+        .build()
+    )
+    req = (
+        ReplyMessageRequest.builder()
+        .message_id(message_id)
+        .request_body(body)
+        .build()
+    )
+    resp = client.im.v1.message.reply(req)
+    if not resp.success():
+        raise RuntimeError(
+            f"Lark reply failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
+        )
+
+
 def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
     from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
     from lark_oapi.api.im.v1.model.create_message_request_body import CreateMessageRequestBody
+
+    rmid = _current_reply_to_mid()
+    if MONITORING_REPLY_IN_THREAD and rmid:
+        try:
+            _lark_reply_message(rmid, "text", json.dumps({"text": text}), in_thread=True)
+            return
+        except Exception as e:
+            logger.warning("reply-in-thread (text) failed, falling back to standalone send: %s", e)
 
     client = _get_lark_oapi_client()
     body = (
@@ -4179,13 +4234,19 @@ def _lark_react_safe(message_id: str, emoji_type: str) -> None:
 def _spawn_reacting_worker(
     message_id: str, target: Any, args: Tuple[Any, ...], name: str
 ) -> None:
-    """Spawn a command worker thread and add the 「done」reaction to the trigger message when it returns."""
+    """Spawn a command worker thread and add the 「done」reaction to the trigger message when it returns.
+
+    Also sets the thread-local reply target so every message the worker sends becomes a threaded
+    reply on the original command message (see :func:`_current_reply_to_mid`).
+    """
     def _wrapped() -> None:
+        _set_reply_to_mid(message_id)
         try:
             target(*args)
         except Exception:
             logger.exception("command worker %r crashed", name)
         finally:
+            _set_reply_to_mid("")
             _lark_react_safe(message_id, MONITORING_REACT_DONE_EMOJI)
 
     threading.Thread(target=_wrapped, daemon=True, name=name).start()
@@ -5802,9 +5863,16 @@ def _monitoring_interactive_card_dict(
 
 def _lark_send_interactive_card(receive_id_type: str, receive_id: str, card: Dict[str, Any]) -> None:
     """Send ``msg_type=interactive`` via HTTP ``im/v1/messages`` (reliable JSON encoding)."""
+    content_str = json.dumps(card, ensure_ascii=False)
+    rmid = _current_reply_to_mid()
+    if MONITORING_REPLY_IN_THREAD and rmid:
+        try:
+            _lark_reply_message(rmid, "interactive", content_str, in_thread=True)
+            return
+        except Exception as e:
+            logger.warning("reply-in-thread (card) failed, falling back to standalone send: %s", e)
     tok = _lark_tenant_access_token_string()
     url = f"{_lark_api_domain()}/open-apis/im/v1/messages"
-    content_str = json.dumps(card, ensure_ascii=False)
     payload = {"receive_id": receive_id, "msg_type": "interactive", "content": content_str}
     r = requests.post(
         url,
