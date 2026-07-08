@@ -2830,7 +2830,13 @@ def _monitoring_at_bot_requirement_satisfied(
 
     When Lark delivers one payload to multiple apps, ``mentions[]`` may list **both** bots; we resolve the
     **primary** @ target from body ``<at>`` order (then mentions order) so only the addressed bot replies.
+
+    Private (``p2p``) chat: there is no other participant to disambiguate, so a command works **without**
+    @mentioning the bot even when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``. The @-gate only exists to keep
+    multiple bots in a **shared group** from all replying, which cannot happen in a 1:1 chat.
     """
+    if (chat_type or "").strip().lower() == "p2p":
+        return True
     if isinstance(mentions, list):
         mentions_list = mentions
     elif isinstance(mentions, dict) and mentions:
@@ -4611,7 +4617,7 @@ def _mute_selection_card_elements(rid_t: str, rid: str) -> List[Dict[str, Any]]:
                 "1. Tap a monitor below repeatedly to **add/remove** it from the selection (see toast).\n"
                 "2. **Mute all & duration** selects every monitor in this list at once.\n"
                 "3. When ready, tap **Next: choose duration**.\n"
-                "4. To silence just one line in a graph, tap **🎯 Mute a specific series**.\n"
+                "4. To silence just one line in a graph, tap **🎯 Mute alert**.\n"
                 "5. **Cancel** clears this selection session."
             ),
         }
@@ -4675,7 +4681,7 @@ def _mute_selection_card_elements(rid_t: str, rid: str) -> List[Dict[str, Any]]:
         row_series.update({"k": "mute_btn", "v": "series_menu"})
         elements.append(
             _monitoring_card_v2_callback_button(
-                "🎯 Mute a specific series ▸",
+                "🎯 Mute alert ▸",
                 "default",
                 _monitoring_card_callback_payload_strings(row_series),
                 element_id="mute_series",
@@ -4847,7 +4853,7 @@ def _mute_series_graph_picker_elements(rid_t: str, rid: str) -> List[Dict[str, A
     elements: List[Dict[str, Any]] = [{
         "tag": "markdown",
         "content": (
-            "**Mute a specific series**\n\n"
+            "**Mute alert**\n\n"
             "1. Pick a graph below.\n"
             "2. The card then lists the series **currently alerting** in that graph.\n"
             "3. Tap the noisy series, then choose a duration.\n\n"
@@ -4884,7 +4890,7 @@ def _mute_series_graph_picker_card_dict(rid_t: str, rid: str) -> Dict[str, Any]:
         "config": {"update_multi": True, "wide_screen_mode": True},
         "header": {
             "template": "orange",
-            "title": {"tag": "plain_text", "content": "Mute a specific series"},
+            "title": {"tag": "plain_text", "content": "Mute alert"},
             "subtitle": {
                 "tag": "plain_text",
                 "content": (MONITORING_MUTE_TRIGGER or "/m").strip()[:190],
