@@ -5718,13 +5718,18 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
                     f"- {_mute_channel_display_label(kind)} — {label} until {_fmt_ts_short(exp)}"
                 )
         summary = "\n".join(lines)
-        try:
-            rt = (rid_t or "").strip()
-            rv = (rid or "").strip()
-            if rt in ("chat_id", "open_id") and rv:
-                _lark_send_text(rt, rv, summary)
-        except Exception:
-            logger.exception("mute: confirmation text send failed")
+        rt = (rid_t or "").strip()
+        rv = (rid or "").strip()
+        if rt in ("chat_id", "open_id") and rv:
+            # Send confirmation OFF the callback thread: a synchronous Lark API call here (token +
+            # HTTP round-trip) can exceed Feishu's 3s card-callback budget and cause 200341.
+            def _send_confirm() -> None:
+                try:
+                    _lark_send_text(rt, rv, summary)
+                except Exception:
+                    logger.exception("mute: confirmation text send failed")
+
+            threading.Thread(target=_send_confirm, daemon=True, name="mute-confirm-send").start()
         return _mute_toast_response("Mute applied", "success")
 
     return _mute_toast_response("Unknown action", "warning")
