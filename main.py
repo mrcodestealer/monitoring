@@ -29,6 +29,8 @@ HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额�
 默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1``：``/mo`` 无告警时整页截图。``/mo {panel}`` 单图模式在 ``GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL=1`` 时对该面板走 ``/d-solo/…?panelId=``（与告警 solo 相同）。``GRAFANA_SCREENSHOT_ALERT_SOLO_PANEL=1``（默认）时 **告警** 对每个触发面板各走 solo 截一张；整页回退时仍一张 dashboard + 多红框。
 告警截图默认 ``GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT=1``：solo 模式下红框包住该单面板；整页回退时仍按标题匹配多面板。
 多轮滚动 + Spinner 轮询见 ``GRAFANA_SCREENSHOT_STABILIZE_ROUNDS`` 等键；Prometheus 无数据/报错的格子无法被脚本「画出曲线」。
+可选 ``/freespin``（``MONITORING_FREESPIN_ENABLE=1`` 默认开）：Freespin Carnival V2 dashboard 整页截图（等全部面板加载完再截，复用 /mo 截图管线）；
+每日 ``FREESPIN_DAILY_SEND_TIMES``（默认 21:00/21:15/21:30 服务器本地时间）自动发送到 ``FREESPIN_DAILY_CHAT_ID``（空 = ``MONITORING_ALERT_CHAT_ID``）。
 """
 
 import base64
@@ -399,6 +401,20 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
     # In which group
     "MONITORING_ALERT_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
+    # ---- /freespin：Freespin Carnival V2 dashboard 整页截图 + 每日定时自动发送 ----
+    "MONITORING_FREESPIN_ENABLE": "1",
+    "MONITORING_FREESPIN_TRIGGER": "/freespin",
+    "FREESPIN_DASHBOARD_PATH": "/d/8345e1da-af7a-416f-90a2-0326a3a163d9/freespin-carnival-v2",
+    "FREESPIN_DASHBOARD_FROM": "now-30m",
+    "FREESPIN_DASHBOARD_TO": "now",
+    "FREESPIN_DASHBOARD_TIMEZONE": "browser",
+    # 原样追加到 dashboard URL 的 query（模板变量等）
+    "FREESPIN_DASHBOARD_EXTRA_QUERY": "var-env=prod",
+    "FREESPIN_DAILY_SEND_ENABLE": "1",
+    # 每日自动发送时刻（服务器本地时间 HH:MM，逗号分隔）
+    "FREESPIN_DAILY_SEND_TIMES": "21:00,21:15,21:30",
+    # 每日自动发送的目标群（空 = 回退到 MONITORING_ALERT_CHAT_ID）
+    "FREESPIN_DAILY_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
 }
 
 
@@ -5619,16 +5635,186 @@ def _monitoring_track_worker(
             _monitoring_inflight_keys.discard(debounce_key)
 
 
+MONITORING_FREESPIN_TRIGGER = _cfg_str("MONITORING_FREESPIN_TRIGGER", "/freespin").strip()
+FREESPIN_DASHBOARD_PATH = _cfg_str(
+    "FREESPIN_DASHBOARD_PATH",
+    "/d/8345e1da-af7a-416f-90a2-0326a3a163d9/freespin-carnival-v2",
+)
+FREESPIN_DASHBOARD_FROM = _cfg_str("FREESPIN_DASHBOARD_FROM", "now-30m")
+FREESPIN_DASHBOARD_TO = _cfg_str("FREESPIN_DASHBOARD_TO", "now")
+FREESPIN_DASHBOARD_TIMEZONE = _cfg_str("FREESPIN_DASHBOARD_TIMEZONE", "browser")
+FREESPIN_DASHBOARD_EXTRA_QUERY = _cfg_str("FREESPIN_DASHBOARD_EXTRA_QUERY", "var-env=prod")
+
+_freespin_daily_started: bool = False
+
+
+def _monitoring_im_matches_freespin_command(clean: str) -> bool:
+    if not _lark_env_truthy("MONITORING_FREESPIN_ENABLE"):
+        return False
+    return _im_command_matches(clean or "", MONITORING_FREESPIN_TRIGGER)
+
+
+def _freespin_dashboard_url() -> str:
+    """Freespin Carnival V2 dashboard URL (same kiosk handling as the /mo screenshot URL)."""
+    params: List[Tuple[str, str]] = [("orgId", "1")]
+    rf = (FREESPIN_DASHBOARD_FROM or "now-30m").strip() or "now-30m"
+    rt = (FREESPIN_DASHBOARD_TO or "now").strip() or "now"
+    params.extend([("from", rf), ("to", rt)])
+    tz = (FREESPIN_DASHBOARD_TIMEZONE or "").strip()
+    if tz and tz.lower() not in ("none", "-", "off", "0", "false", "no"):
+        params.append(("timezone", tz))
+    k = (GRAFANA_SCREENSHOT_KIOSK or "").strip().lower()
+    if k and k not in ("0", "false", "no", "off"):
+        params.append(("kiosk", "1" if k in ("1", "true", "yes", "on") else k))
+    q = urlencode(params)
+    extra = (FREESPIN_DASHBOARD_EXTRA_QUERY or "").strip().lstrip("?&")
+    if extra:
+        q = f"{q}&{extra}"
+    return f"{GRAFANA_BASE_URL}{FREESPIN_DASHBOARD_PATH}?{q}"
+
+
+def _freespin_screenshot_png() -> bytes:
+    """
+    Full-page PNG of the Freespin dashboard. Reuses the /mo capture pipeline (persistent keeper
+    with ephemeral fallback): lazy-panel scroll, spinner polling, then panel-ready wait so every
+    graph has painted before the screenshot is taken.
+    """
+    session = grafana_login_session()
+    url = _freespin_dashboard_url()
+    logger.info("freespin screenshot: url=%s", url[:300])
+    return _grafana_headless_screenshot_png_at_url(session, url)
+
+
+def _freespin_send_screenshot(receive_id_type: str, receive_id: str) -> None:
+    png = _freespin_screenshot_png()
+    key = _lark_upload_png_image_key(png)
+    _lark_send_image_message(receive_id_type, receive_id, key)
+
+
+def _monitoring_freespin_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
+    try:
+        rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
+        if not rv:
+            return
+        _freespin_send_screenshot(rt, rv)
+    except Exception:
+        logger.exception("freespin worker failed")
+        try:
+            _monitoring_deploy_send_ack(
+                chat_id, open_id, "**Freespin screenshot failed** — see server logs."
+            )
+        except Exception:
+            logger.exception("freespin failure notify send failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _freespin_daily_send_times() -> List[int]:
+    """Parse ``FREESPIN_DAILY_SEND_TIMES`` (``HH:MM`` / ``HH:MM:SS``, comma-separated) → sorted seconds-of-day."""
+    raw = _cfg_str("FREESPIN_DAILY_SEND_TIMES", "21:00,21:15,21:30")
+    out: Set[int] = set()
+    for part in re.split(r"[\s,;]+", raw.strip()):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", part)
+        if not m:
+            logger.warning("FREESPIN_DAILY_SEND_TIMES: bad entry %r — skipped", part)
+            continue
+        h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+        if h > 23 or mi > 59 or s > 59:
+            logger.warning("FREESPIN_DAILY_SEND_TIMES: out-of-range entry %r — skipped", part)
+            continue
+        out.add(h * 3600 + mi * 60 + s)
+    return sorted(out)
+
+
+def _freespin_daily_target_chat_id() -> str:
+    return _cfg_str("FREESPIN_DAILY_CHAT_ID", "").strip() or (MONITORING_ALERT_CHAT_ID or "").strip()
+
+
+def _freespin_daily_sender_loop() -> None:
+    """
+    Auto-send the Freespin dashboard screenshot at fixed **server-local** times daily
+    (default 21:00 / 21:15 / 21:30). A slot missed by more than the grace window
+    (restart, long capture) is skipped rather than sent late.
+    """
+    times = _freespin_daily_send_times()
+    if not times:
+        logger.warning("freespin daily sender: no valid FREESPIN_DAILY_SEND_TIMES — thread exiting")
+        return
+    grace_s = 120
+    logger.info(
+        "freespin daily sender started times=%s (server-local) chat=%r",
+        ",".join(f"{t // 3600:02d}:{t // 60 % 60:02d}" for t in times),
+        bool(_freespin_daily_target_chat_id()),
+    )
+    fired: Set[Tuple[int, int]] = set()  # (tm_yday, slot_seconds_of_day)
+    while True:
+        try:
+            lt = time.localtime()
+            tod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+            due: Optional[int] = None
+            for t in times:
+                if t <= tod <= t + grace_s and (lt.tm_yday, t) not in fired:
+                    due = t
+                    break
+            if due is None:
+                if len(fired) > 8 * len(times):
+                    fired = {k for k in fired if k[0] == lt.tm_yday}
+                time.sleep(10.0)
+                continue
+            fired.add((lt.tm_yday, due))
+            chat = _freespin_daily_target_chat_id()
+            if not chat:
+                logger.warning(
+                    "freespin daily send %02d:%02d skipped — FREESPIN_DAILY_CHAT_ID / "
+                    "MONITORING_ALERT_CHAT_ID empty",
+                    due // 3600,
+                    due // 60 % 60,
+                )
+                continue
+            _freespin_send_screenshot("chat_id", chat)
+            logger.info(
+                "freespin daily screenshot sent slot=%02d:%02d chat_prefix=%s...",
+                due // 3600,
+                due // 60 % 60,
+                chat[:16],
+            )
+        except Exception:
+            logger.exception("freespin daily send cycle failed")
+            time.sleep(30.0)
+
+
+def _start_freespin_daily_sender_if_enabled() -> None:
+    global _freespin_daily_started
+    if not (
+        _lark_env_truthy("MONITORING_FREESPIN_ENABLE")
+        and _lark_env_truthy("FREESPIN_DAILY_SEND_ENABLE")
+    ):
+        logger.info(
+            "freespin daily sender disabled (MONITORING_FREESPIN_ENABLE / FREESPIN_DAILY_SEND_ENABLE)"
+        )
+        return
+    with _monitoring_reply_dispatch_lock:
+        if _freespin_daily_started:
+            return
+        _freespin_daily_started = True
+    threading.Thread(target=_freespin_daily_sender_loop, daemon=True, name="freespin-daily").start()
+
+
 def _monitoring_at_mention_help_text() -> str:
     mo = (MONITORING_TRIGGER or "/mo").strip()
     m = (MONITORING_MUTE_TRIGGER or "/m").strip()
     c = (MONITORING_CANCELMUTE_TRIGGER or "/c").strip()
+    fs = (MONITORING_FREESPIN_TRIGGER or "/freespin").strip()
     return (
         "Commands:\n"
         f"- `{mo}` — Grafana monitoring summary (all graphs)\n"
         f"- `{mo} {{panel title}}` — one graph only (e.g. `{mo} 错误请求数/1m`)\n"
         f"- `{m}` — mute alerts (interactive card)\n"
         f"- `{c}` — clear all mutes\n"
+        f"- `{fs}` — Freespin Carnival dashboard screenshot (last 30m)\n"
         "- `track 2026-06-30 13:30` — why no alert at that time (admin)\n"
         "- `track login 2026-06-30 13:30` — one panel only"
     )
@@ -12977,6 +13163,39 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         return
 
+    if _monitoring_im_matches_freespin_command(clean or ""):
+        processed_f = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        debounce_key_f = f"{(chat_id or '').strip()}\n__freespin__"
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                logger.info("duplicate IM event_id=%s — skip (freespin)", im_event_id)
+                return
+            if processed_f and processed_f in _processed_lark_message_ids:
+                logger.info("duplicate freespin stick=%r — skip", processed_f[:96])
+                return
+            if debounce_key_f in _monitoring_inflight_keys:
+                logger.info("freespin skip — already in flight")
+                return
+            _monitoring_inflight_keys.add(debounce_key_f)
+            if processed_f:
+                _processed_lark_message_ids.add(processed_f)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                    _processed_lark_im_event_ids.clear()
+                    _processed_lark_im_event_ids.add(im_event_id)
+        logger.info("freespin command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
+        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
+        _spawn_reacting_worker(
+            mid,
+            _monitoring_freespin_worker,
+            (chat_id, open_id, debounce_key_f),
+            "freespin-screenshot",
+        )
+        return
+
     cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
     if (
         _lark_effective_bot_open_id()
@@ -12987,6 +13206,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER)
         and not _monitoring_im_is_deploy_command(raw_text or "", clean or "")
         and not _monitoring_im_matches_track_command(clean or "")
+        and not _monitoring_im_matches_freespin_command(clean or "")
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
@@ -13748,6 +13968,7 @@ def run_monitoring_bot() -> None:
     )
     _start_grafana_playwright_keeper_if_enabled()
     _start_monitoring_watchdog_if_enabled()
+    _start_freespin_daily_sender_if_enabled()
     port = _cfg_listen_port()
     if MONITORING_AT_MENTION_ENABLE or MONITORING_TRIGGER_REQUIRES_AT_BOT:
         _oid = _lark_effective_bot_open_id()
