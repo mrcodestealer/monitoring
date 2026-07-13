@@ -30,7 +30,8 @@ HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额�
 告警截图默认 ``GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT=1``：solo 模式下红框包住该单面板；整页回退时仍按标题匹配多面板。
 多轮滚动 + Spinner 轮询见 ``GRAFANA_SCREENSHOT_STABILIZE_ROUNDS`` 等键；Prometheus 无数据/报错的格子无法被脚本「画出曲线」。
 可选 ``/freespin``（``MONITORING_FREESPIN_ENABLE=1`` 默认开）：Freespin Carnival V2 dashboard 整页截图（等全部面板加载完再截，复用 /mo 截图管线）；
-每日 ``FREESPIN_DAILY_SEND_TIMES``（默认 21:00/21:15/21:30 服务器本地时间）自动发送到 ``FREESPIN_DAILY_CHAT_ID``（空 = ``MONITORING_ALERT_CHAT_ID``）。
+每日 ``FREESPIN_DAILY_SEND_TIMES``（默认 21:00/21:15/21:30 服务器本地时间）自动发送到 ``FREESPIN_DAILY_CHAT_ID``（空 = ``MONITORING_ALERT_CHAT_ID``），
+发送前先发 ``FREESPIN_DAILY_MESSAGE`` 文字。``FREESPIN_BOOT_WARM=1`` 启动预渲染 + ``FREESPIN_DAILY_PREWARM_SECONDS``（默认 180）定时发送前预热，让截图更快。
 """
 
 import base64
@@ -417,6 +418,10 @@ _CFG: Dict[str, Any] = {
     "FREESPIN_DAILY_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
     # 每日自动发送截图前附带的说明文字（空 = 只发图）
     "FREESPIN_DAILY_MESSAGE": "Hi team, FYI Ongoing Free Spin event - 9pm",
+    # 启动时在常驻 Chromium 里预渲染一次 freespin dashboard（首次 /freespin 更快；需 GRAFANA_PERSISTENT_BROWSER=1）
+    "FREESPIN_BOOT_WARM": "1",
+    # 每日自动发送前 N 秒先预热渲染一次（0=关；让 21:00 等时点的截图更快、更准点）
+    "FREESPIN_DAILY_PREWARM_SECONDS": "180",
 }
 
 
@@ -5735,45 +5740,91 @@ def _freespin_daily_target_chat_id() -> str:
     return _cfg_str("FREESPIN_DAILY_CHAT_ID", "").strip() or (MONITORING_ALERT_CHAT_ID or "").strip()
 
 
+def _freespin_warm_render(reason: str) -> None:
+    """
+    Throwaway render of the Freespin dashboard in the persistent Chromium so the next real
+    capture hits warm caches (Grafana JS chunks, panel plugins, dashboard model). The PNG is
+    discarded; failures never affect real captures.
+    """
+    if _grafana_pw_keeper is None or not _grafana_persistent_browser_enabled():
+        logger.info("freespin warm render (%s) skipped — persistent browser off", reason)
+        return
+    try:
+        t0 = time.monotonic()
+        png = _freespin_screenshot_png()
+        logger.info(
+            "freespin warm render (%s) done bytes=%s in %.1fs",
+            reason,
+            len(png),
+            time.monotonic() - t0,
+        )
+    except Exception:
+        logger.exception("freespin warm render (%s) failed — real captures unaffected", reason)
+
+
+def _freespin_daily_events() -> List[Tuple[int, str]]:
+    """
+    Sorted daily schedule as ``(seconds_of_day, kind)``: a ``send`` per configured slot, plus a
+    ``warm`` ``FREESPIN_DAILY_PREWARM_SECONDS`` earlier (wraps past midnight) so the send itself
+    starts from warm browser caches.
+    """
+    times = _freespin_daily_send_times()
+    events: List[Tuple[int, str]] = [(t, "send") for t in times]
+    prewarm_s = max(0, min(3600, _cfg_int("FREESPIN_DAILY_PREWARM_SECONDS", 180)))
+    if prewarm_s > 0:
+        events.extend(((t - prewarm_s) % 86400, "warm") for t in times)
+    return sorted(set(events))
+
+
 def _freespin_daily_sender_loop() -> None:
     """
     Auto-send the Freespin dashboard screenshot at fixed **server-local** times daily
-    (default 21:00 / 21:15 / 21:30). A slot missed by more than the grace window
-    (restart, long capture) is skipped rather than sent late.
+    (default 21:00 / 21:15 / 21:30), pre-warming the browser shortly before each slot.
+    An event missed by more than the grace window (restart, long capture) is skipped
+    rather than run late.
     """
-    times = _freespin_daily_send_times()
-    if not times:
+    events = _freespin_daily_events()
+    if not events:
         logger.warning("freespin daily sender: no valid FREESPIN_DAILY_SEND_TIMES — thread exiting")
         return
     grace_s = 120
     logger.info(
-        "freespin daily sender started times=%s (server-local) chat=%r",
-        ",".join(f"{t // 3600:02d}:{t // 60 % 60:02d}" for t in times),
+        "freespin daily sender started events=%s (server-local) chat=%r",
+        ",".join(f"{t // 3600:02d}:{t // 60 % 60:02d}({kind})" for t, kind in events),
         bool(_freespin_daily_target_chat_id()),
     )
-    fired: Set[Tuple[int, int]] = set()  # (tm_yday, slot_seconds_of_day)
+    fired: Set[Tuple[int, int, str]] = set()  # (tm_yday, seconds_of_day, kind)
     while True:
         try:
             lt = time.localtime()
             tod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
-            due: Optional[int] = None
-            for t in times:
-                if t <= tod <= t + grace_s and (lt.tm_yday, t) not in fired:
-                    due = t
+            due: Optional[Tuple[int, str]] = None
+            for t, kind in events:
+                if t <= tod <= t + grace_s and (lt.tm_yday, t, kind) not in fired:
+                    due = (t, kind)
                     break
             if due is None:
-                if len(fired) > 8 * len(times):
+                if len(fired) > 8 * len(events):
                     fired = {k for k in fired if k[0] == lt.tm_yday}
                 time.sleep(10.0)
                 continue
-            fired.add((lt.tm_yday, due))
+            due_t, due_kind = due
+            fired.add((lt.tm_yday, due_t, due_kind))
+            if due_kind == "warm":
+                threading.Thread(
+                    target=_freespin_warm_render,
+                    args=(f"daily pre-warm {due_t // 3600:02d}:{due_t // 60 % 60:02d}",),
+                    daemon=True,
+                    name="freespin-prewarm",
+                ).start()
+                continue
             chat = _freespin_daily_target_chat_id()
             if not chat:
                 logger.warning(
                     "freespin daily send %02d:%02d skipped — FREESPIN_DAILY_CHAT_ID / "
                     "MONITORING_ALERT_CHAT_ID empty",
-                    due // 3600,
-                    due // 60 % 60,
+                    due_t // 3600,
+                    due_t // 60 % 60,
                 )
                 continue
             note = _cfg_str("FREESPIN_DAILY_MESSAGE", "").strip()
@@ -5785,8 +5836,8 @@ def _freespin_daily_sender_loop() -> None:
             _freespin_send_screenshot("chat_id", chat)
             logger.info(
                 "freespin daily screenshot sent slot=%02d:%02d note=%s chat_prefix=%s...",
-                due // 3600,
-                due // 60 % 60,
+                due_t // 3600,
+                due_t // 60 % 60,
                 bool(note),
                 chat[:16],
             )
@@ -5810,6 +5861,25 @@ def _start_freespin_daily_sender_if_enabled() -> None:
             return
         _freespin_daily_started = True
     threading.Thread(target=_freespin_daily_sender_loop, daemon=True, name="freespin-daily").start()
+
+
+def _start_freespin_boot_warm_if_enabled() -> None:
+    """Pre-render the Freespin dashboard once at startup (after the keeper's own warm-up)."""
+    if not (
+        _lark_env_truthy("MONITORING_FREESPIN_ENABLE") and _lark_env_truthy("FREESPIN_BOOT_WARM")
+    ):
+        return
+    if not _grafana_persistent_browser_enabled():
+        logger.info("freespin boot warm skipped — persistent browser off")
+        return
+
+    def _worker() -> None:
+        k = _grafana_pw_keeper
+        if k is not None:
+            k.wait_ready(300.0)
+        _freespin_warm_render("boot warm-up")
+
+    threading.Thread(target=_worker, daemon=True, name="freespin-boot-warm").start()
 
 
 def _monitoring_at_mention_help_text() -> str:
@@ -13978,6 +14048,7 @@ def run_monitoring_bot() -> None:
     _start_grafana_playwright_keeper_if_enabled()
     _start_monitoring_watchdog_if_enabled()
     _start_freespin_daily_sender_if_enabled()
+    _start_freespin_boot_warm_if_enabled()
     port = _cfg_listen_port()
     if MONITORING_AT_MENTION_ENABLE or MONITORING_TRIGGER_REQUIRES_AT_BOT:
         _oid = _lark_effective_bot_open_id()
