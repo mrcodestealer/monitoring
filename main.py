@@ -415,6 +415,8 @@ _CFG: Dict[str, Any] = {
     "FREESPIN_DAILY_SEND_TIMES": "21:00,21:15,21:30",
     # 每日自动发送的目标群（空 = 回退到 MONITORING_ALERT_CHAT_ID）
     "FREESPIN_DAILY_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
+    # 每日自动发送截图前附带的说明文字（空 = 只发图）
+    "FREESPIN_DAILY_MESSAGE": "Hi team, FYI Ongoing Free Spin event - 9pm",
 }
 
 
@@ -5774,11 +5776,18 @@ def _freespin_daily_sender_loop() -> None:
                     due // 60 % 60,
                 )
                 continue
+            note = _cfg_str("FREESPIN_DAILY_MESSAGE", "").strip()
+            if note:
+                try:
+                    _lark_send_text("chat_id", chat, note)
+                except Exception:
+                    logger.exception("freespin daily note send failed — still sending screenshot")
             _freespin_send_screenshot("chat_id", chat)
             logger.info(
-                "freespin daily screenshot sent slot=%02d:%02d chat_prefix=%s...",
+                "freespin daily screenshot sent slot=%02d:%02d note=%s chat_prefix=%s...",
                 due // 3600,
                 due // 60 % 60,
+                bool(note),
                 chat[:16],
             )
         except Exception:
