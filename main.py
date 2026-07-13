@@ -416,8 +416,8 @@ _CFG: Dict[str, Any] = {
     "FREESPIN_DAILY_SEND_TIMES": "21:00,21:15,21:30",
     # 每日自动发送的目标群（空 = 回退到 MONITORING_ALERT_CHAT_ID）
     "FREESPIN_DAILY_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
-    # 每日自动发送截图前附带的说明文字（空 = 只发图）
-    "FREESPIN_DAILY_MESSAGE": "Hi team, FYI Ongoing Free Spin event - 9pm",
+    # 每日自动发送截图前附带的说明文字（空 = 只发图；``{time}`` 会替换成该时点，如 9pm / 9:15pm / 9:30pm）
+    "FREESPIN_DAILY_MESSAGE": "Hi team, FYI Ongoing Free Spin event - {time}",
     # 启动时在常驻 Chromium 里预渲染一次 freespin dashboard（首次 /freespin 更快；需 GRAFANA_PERSISTENT_BROWSER=1）
     "FREESPIN_BOOT_WARM": "1",
     # 每日自动发送前 N 秒先预热渲染一次（0=关；让 21:00 等时点的截图更快、更准点）
@@ -5762,6 +5762,15 @@ def _freespin_warm_render(reason: str) -> None:
         logger.exception("freespin warm render (%s) failed — real captures unaffected", reason)
 
 
+def _freespin_slot_display_12h(t: int) -> str:
+    """Seconds-of-day → 12-hour label: 75600 → ``9pm``, 76500 → ``9:15pm``."""
+    h24 = t // 3600
+    mi = t // 60 % 60
+    ampm = "am" if h24 < 12 else "pm"
+    h12 = h24 % 12 or 12
+    return f"{h12}{ampm}" if mi == 0 else f"{h12}:{mi:02d}{ampm}"
+
+
 def _freespin_daily_events() -> List[Tuple[int, str]]:
     """
     Sorted daily schedule as ``(seconds_of_day, kind)``: a ``send`` per configured slot, plus a
@@ -5829,6 +5838,7 @@ def _freespin_daily_sender_loop() -> None:
                 continue
             note = _cfg_str("FREESPIN_DAILY_MESSAGE", "").strip()
             if note:
+                note = note.replace("{time}", _freespin_slot_display_12h(due_t))
                 try:
                     _lark_send_text("chat_id", chat, note)
                 except Exception:
