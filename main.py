@@ -361,7 +361,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_EVAL_START_OFFSET_MINUTES": "7",
     "MONITORING_WATCH_EVAL_END_OFFSET_MINUTES": "2",
     # 首次越阈后冻结判窗、等待该秒数再拉同一窗口复核；0=立即告警（关闭 confirm 清除）
-    "MONITORING_WATCH_CONFIRM_SECONDS": "0",
+    # 90s：给 IGO Distributions 等系列多一轮结算/回填时间，复核仍越阈才真正告警，避免尾桶未写满的假跌
+    "MONITORING_WATCH_CONFIRM_SECONDS": "90",
     # Watchdog 判警是否使用与 /monitoring 相同的拉数窗口（默认 0：窄窗口 eval；设为 1 则与报表一致，避免「报表有大波动但自动告警未扫到」）
     "MONITORING_WATCH_MATCH_REPORT_WINDOW": "0",
     # Watchdog 告警截图：0=用下面相对时间（默认 1h）；1=与告警判窗 payload.window 对齐
