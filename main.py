@@ -416,7 +416,7 @@ _CFG: Dict[str, Any] = {
     # 每日自动发送时刻（服务器本地时间 HH:MM，逗号分隔）
     "FREESPIN_DAILY_SEND_TIMES": "21:00,21:15,21:30",
     # 每日自动发送的目标群（空 = 回退到 MONITORING_ALERT_CHAT_ID）
-    "FREESPIN_DAILY_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
+    "FREESPIN_DAILY_CHAT_ID": "oc_7713b00dc15c884caf5ee615ef948ef3",
     # 每日自动发送截图前附带的说明文字（空 = 只发图；``{time}`` 会替换成该时点，如 9pm / 9:15pm / 9:30pm）
     "FREESPIN_DAILY_MESSAGE": "Hi team, FYI Ongoing Free Spin event - {time}",
     # 启动时在常驻 Chromium 里预渲染一次 freespin dashboard（首次 /freespin 更快；需 GRAFANA_PERSISTENT_BROWSER=1）
