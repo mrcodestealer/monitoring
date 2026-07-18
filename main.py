@@ -403,6 +403,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
     # In which group
     "MONITORING_ALERT_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
+    # 完全忽略这些群里收到的所有消息 / 命令（逗号分隔的 chat_id；只发不收的群）。
+    # 例：freespin 每日截图目标群只接收播报、不响应 /mo 等命令。
+    "MONITORING_IGNORE_CHAT_IDS": "oc_7713b00dc15c884caf5ee615ef948ef3",
     # ---- /freespin：Freespin Carnival V2 dashboard 整页截图 + 每日定时自动发送 ----
     "MONITORING_FREESPIN_ENABLE": "1",
     "MONITORING_FREESPIN_TRIGGER": "/freespin",
@@ -1359,6 +1362,22 @@ def _lark_message_chat_id_aliases(msg: Dict[str, Any]) -> List[str]:
             for k in ("chat_id", "chatId", "open_chat_id", "openChatId"):
                 _add(c.get(k))
     return out
+
+
+def _monitoring_ignored_chat_ids() -> Set[str]:
+    """chat_ids whose incoming messages / commands are ignored entirely (``MONITORING_IGNORE_CHAT_IDS``)."""
+    raw = _cfg_str("MONITORING_IGNORE_CHAT_IDS", "")
+    return {x.strip() for x in re.split(r"[\s,;]+", raw) if x.strip()}
+
+
+def _monitoring_chat_is_ignored(chat_id: str, aliases: List[str]) -> bool:
+    """True when this message's chat (any alias) is on the ignore list."""
+    ignored = _monitoring_ignored_chat_ids()
+    if not ignored:
+        return False
+    if (chat_id or "").strip() in ignored:
+        return True
+    return any((a or "").strip() in ignored for a in aliases)
 
 
 def _lark_im_message_dedupe_id(msg: Dict[str, Any]) -> str:
@@ -13005,6 +13024,12 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         (chat_resolved[:12] + "…") if len(chat_resolved) > 12 else (chat_resolved or None),
     )
     logger.debug("im.message msg_keys=%s", list(msg.keys())[:24] if isinstance(msg, dict) else [])
+    if _monitoring_chat_is_ignored(chat_resolved, _lark_message_chat_id_aliases(msg)):
+        logger.info(
+            "im.message ignored (MONITORING_IGNORE_CHAT_IDS): chat_prefix=%r",
+            (chat_resolved[:12] + "…") if len(chat_resolved) > 12 else (chat_resolved or None),
+        )
+        return
     if mtype and mtype in _SKIP_IM_MESSAGE_TYPES:
         logger.info("im.message ignored (non-textual): message_type=%r", mtype)
         return
