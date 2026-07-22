@@ -336,8 +336,10 @@ _CFG: Dict[str, Any] = {
     "MONITORING_GAMES_JILI_ALERT_PCT": 25,
     "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT": 25,
     "MONITORING_GAMES_GENERAL_ENABLE": "1",
-    "MONITORING_GAMES_GENERAL_ALERT_PCT": 25,
-    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT": 25,
+    # series 1492288 是高振幅锯齿波（谷 ~16k / 峰 ~30k，绕 median ±30%），25% 阈值会把每个正常峰值
+    # 判成 SPIKE。比照 deposit/withdraw 锯齿波惯例调到 80%（需上面的 per-panel 阈值 wiring 生效）。
+    "MONITORING_GAMES_GENERAL_ALERT_PCT": 80,
+    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT": 80,
     "MONITORING_GAMES_INHOUSE_ENABLE": "1",
     # Games panels: spike/drop vs **median baseline** in eval window (not bucket-to-bucket %).
     "MONITORING_GAMES_INHOUSE_ALERT_PCT": 25,
@@ -347,6 +349,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ALERT_WINDOW_SECONDS": 120,
     # 1=alert text skips Fast/Continuous SPIKE/DROP lines; only a short time/value tail (Grafana-like).
     "MONITORING_SIMPLE_ALERT_TEXT": "0",
+    # 1=告警卡片附带快捷静音按钮（Mute 30min / 1hour / 6hours）；只静音本次告警涉及的面板。
+    "MONITORING_ALERT_QUICK_MUTE_ENABLE": "1",
     # 1=/mo hides extra-panel ``within Xm drop/spike`` footer lines; tables only.
     "MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS": "0",
     "MONITORING_WATCH_ENABLE": "1",
@@ -4568,10 +4572,32 @@ _MUTE_DURATION_CHOICES: List[Tuple[str, int]] = [
     ("2 hours", 7200),
     ("3 hours", 10800),
     ("4 hours", 14400),
+    ("6 hours", 21600),
     ("8 hours", 28800),
     ("12 hours", 43200),
     ("1 day", 86400),
 ]
+
+# Quick-mute buttons rendered directly on an alert card (mute only that alert's own panels).
+_ALERT_QUICK_MUTE_CHOICES: List[Tuple[str, int]] = [
+    ("🔕 Mute 30 min", 1800),
+    ("🔕 Mute 1 hour", 3600),
+    ("🔕 Mute 6 hours", 21600),
+]
+
+
+def _mute_duration_human(sec: int) -> str:
+    """Compact human label for a mute duration: 1800→'30 min', 3600→'1 hour', 21600→'6 hours'."""
+    s = int(sec)
+    if s % 86400 == 0:
+        n = s // 86400
+        return f"{n} day" if n == 1 else f"{n} days"
+    if s % 3600 == 0:
+        n = s // 3600
+        return f"{n} hour" if n == 1 else f"{n} hours"
+    if s % 60 == 0:
+        return f"{s // 60} min"
+    return f"{s}s"
 
 
 def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
@@ -4725,7 +4751,8 @@ def _mute_selection_card_elements(rid_t: str, rid: str) -> List[Dict[str, Any]]:
                 "1. Tap a monitor below repeatedly to **add/remove** it from the selection (see toast).\n"
                 "2. **Mute all & duration** selects every monitor in this list at once.\n"
                 "3. When ready, tap **Next: choose duration**.\n"
-                "4. To silence just one line in a graph, tap **🎯 Mute alert**.\n"
+                "4. To silence only what's **firing right now**, tap **🎯 Mute alert (currently firing)** "
+                "— it lists every currently-alerting graph (per-series for 错误请求数, whole-graph for the rest).\n"
                 "5. **Cancel** clears this selection session."
             ),
         }
@@ -4784,17 +4811,16 @@ def _mute_selection_card_elements(rid_t: str, rid: str) -> List[Dict[str, Any]]:
             ],
         }
     )
-    if _mute_series_capable_channels():
-        row_series = dict(base_rid)
-        row_series.update({"k": "mute_btn", "v": "series_menu"})
-        elements.append(
-            _monitoring_card_v2_callback_button(
-                "🎯 Mute alert ▸",
-                "default",
-                _monitoring_card_callback_payload_strings(row_series),
-                element_id="mute_series",
-            )
+    row_series = dict(base_rid)
+    row_series.update({"k": "mute_btn", "v": "series_menu"})
+    elements.append(
+        _monitoring_card_v2_callback_button(
+            "🎯 Mute alert (currently firing) ▸",
+            "default",
+            _monitoring_card_callback_payload_strings(row_series),
+            element_id="mute_series",
         )
+    )
     elements.append(
         _monitoring_card_v2_callback_button(
             "Cancel",
@@ -4944,42 +4970,81 @@ def _mute_series_pending_label(kind: str, label: str) -> str:
     return f"{(kind or '').strip()}\x1f{(label or '').strip()}"
 
 
-def _mute_series_graph_picker_elements(rid_t: str, rid: str) -> List[Dict[str, Any]]:
+def _mute_series_graph_picker_elements(
+    rid_t: str,
+    rid: str,
+    alerting_kinds: Optional[List[str]] = None,
+    fetch_ok: bool = True,
+) -> List[Dict[str, Any]]:
     rt = (rid_t or "").strip()
     rv = (rid or "").strip()
     base_rid: Dict[str, Any] = {}
     if rt in ("chat_id", "open_id") and rv:
         base_rid = {"rid_t": rt, "rid": rv}
     caps = _mute_series_capable_channels()
-    if not caps:
-        return [{
-            "tag": "markdown",
-            "content": (
-                "No graph supports per-series mute yet.\n"
-                "Enable a per-series graph (e.g. `MONITORING_ERROR_REQ_ENABLE=1`) or use whole-graph mute."
-            ),
-        }]
+    cap_ids = {c for c, _ in caps}
+    alerting = [k for k in (alerting_kinds or []) if k]
+    # Currently-alerting graphs that DON'T support per-series mute → whole-graph toggle.
+    whole_graph_alerting = [k for k in alerting if k not in cap_ids]
+
     elements: List[Dict[str, Any]] = [{
         "tag": "markdown",
         "content": (
             "**Mute alert**\n\n"
-            "1. Pick a graph below.\n"
-            "2. The card then lists the series **currently alerting** in that graph.\n"
-            "3. Tap the noisy series, then choose a duration.\n\n"
-            "_Graphs that alert as one aggregate line aren't listed — use whole-graph mute for those._"
+            "🎯 **Per-series graphs** — tap to drill into the exact line(s) currently alerting.\n"
+            "🔴 **Currently-alerting graphs** — tap to add the whole graph, then **Next: choose duration**.\n"
+            "_Tap a graph again to unselect (see toast)._"
         ),
     }]
+
+    # 1) Per-series capable graphs (e.g. 错误请求数) — keep the drill-into-series flow.
     for kind, lbl in caps:
         payload = dict(base_rid)
         payload.update({"k": "mute_btn", "v": "series_pick", "sk_kind": kind})
+        firing = " 🔴" if kind in alerting else ""
         elements.append(
             _monitoring_card_v2_callback_button(
-                lbl[:80],
+                f"🎯 {lbl}{firing}"[:80],
                 "default",
                 _monitoring_card_callback_payload_strings(payload),
                 element_id=f"msg_{hashlib.sha256(kind.encode()).hexdigest()[:10]}",
             )
         )
+
+    # 2) Other currently-alerting graphs — whole-graph toggle (reuses the main selection machinery).
+    if not fetch_ok:
+        elements.append({
+            "tag": "markdown",
+            "content": "_⚠️ Couldn't fetch current alert state — showing per-series graphs only._",
+        })
+    elif whole_graph_alerting:
+        for kind in whole_graph_alerting:
+            payload = dict(base_rid)
+            payload.update({"k": "mute_btn", "v": "toggle", "ch": kind})
+            elements.append(
+                _monitoring_card_v2_callback_button(
+                    f"🔴 {_mute_channel_display_label(kind)}"[:80],
+                    "default",
+                    _monitoring_card_callback_payload_strings(payload),
+                    element_id=f"mqa_{hashlib.sha256(kind.encode()).hexdigest()[:10]}",
+                )
+            )
+        row_next = dict(base_rid)
+        row_next.update({"k": "mute_btn", "v": "next"})
+        elements.append(
+            _monitoring_card_v2_callback_button(
+                "Next: choose duration",
+                "primary",
+                _monitoring_card_callback_payload_strings(row_next),
+                element_id="mqa_next",
+            )
+        )
+    else:
+        elements.append({
+            "tag": "markdown",
+            "content": "_No other graph is alerting right now._",
+        })
+
     back = dict(base_rid)
     back.update({"k": "mute_btn", "v": "cancel_sel"})
     elements.append(
@@ -4993,7 +5058,12 @@ def _mute_series_graph_picker_elements(rid_t: str, rid: str) -> List[Dict[str, A
     return elements
 
 
-def _mute_series_graph_picker_card_dict(rid_t: str, rid: str) -> Dict[str, Any]:
+def _mute_series_graph_picker_card_dict(
+    rid_t: str,
+    rid: str,
+    alerting_kinds: Optional[List[str]] = None,
+    fetch_ok: bool = True,
+) -> Dict[str, Any]:
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "wide_screen_mode": True},
@@ -5005,7 +5075,11 @@ def _mute_series_graph_picker_card_dict(rid_t: str, rid: str) -> Dict[str, Any]:
                 "content": (MONITORING_MUTE_TRIGGER or "/m").strip()[:190],
             },
         },
-        "body": {"elements": _mute_series_graph_picker_elements(rid_t, rid)},
+        "body": {
+            "elements": _mute_series_graph_picker_elements(
+                rid_t, rid, alerting_kinds, fetch_ok
+            )
+        },
     }
 
 
@@ -5143,7 +5217,16 @@ def _mute_send_series_graph_picker_async(rid_t: str, rid: str, reply_to_mid: str
             rv = (rid or "").strip()
             if rt not in ("chat_id", "open_id") or not rv:
                 return
-            card = _mute_series_graph_picker_card_dict(rt, rv)
+            alerting: List[str] = []
+            fetch_ok = True
+            try:
+                sess = grafana_login_session()
+                payload = fetch_monitoring_payload(session=sess, for_watchdog=True)
+                alerting = _monitoring_alerting_channel_kinds(payload)
+            except Exception:
+                logger.exception("mute alert picker: fetch current alert state failed")
+                fetch_ok = False
+            card = _mute_series_graph_picker_card_dict(rt, rv, alerting, fetch_ok)
             _lark_send_interactive_card(rt, rv, card)
         except Exception:
             logger.exception("mute: send series graph picker failed")
@@ -5978,6 +6061,42 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
     v = _lark_dict_pick_str(val, "v")
     allowed = _monitoring_mutable_channel_ids()
 
+    if v == "quick":
+        # Alert-card quick mute: silence ONLY this alert's own panels (``kinds``) for a fixed duration.
+        try:
+            sec = int(float(_lark_dict_pick_str(val, "sec") or "0"))
+        except (TypeError, ValueError):
+            sec = 0
+        if sec <= 0:
+            return _mute_toast_response("Invalid duration", "warning")
+        kinds = {
+            x.strip() for x in (_lark_dict_pick_str(val, "kinds") or "").split(",") if x.strip()
+        } & allowed
+        if not kinds:
+            return _mute_toast_response("No panel to mute for this alert", "warning")
+        applied = _mute_apply_channels(kinds, float(sec))
+        if not applied:
+            return _mute_toast_response("Could not apply mute", "warning")
+        human = _mute_duration_human(sec)
+        lines = [f"🔕 Alert mute enabled for {len(applied)} monitor(s) — {human}:"]
+        for ch, exp in sorted(applied.items(), key=lambda kv: kv[0]):
+            lines.append(f"- {_mute_channel_display_label(ch)} until {_fmt_ts_short(exp)}")
+        summary = "\n".join(lines)
+        rt_q = (rid_t or "").strip()
+        rv_q = (rid or "").strip()
+        if rt_q in ("chat_id", "open_id") and rv_q:
+            def _send_quick_confirm() -> None:
+                _set_reply_to_mid(reply_mid)
+                try:
+                    _lark_send_text(rt_q, rv_q, summary)
+                except Exception:
+                    logger.exception("mute: quick-mute confirmation send failed")
+
+            threading.Thread(
+                target=_send_quick_confirm, daemon=True, name="mute-quick-confirm"
+            ).start()
+        return _mute_toast_response(f"Muted {len(applied)} panel(s) · {human}", "success")
+
     if v == "toggle":
         ch = _lark_dict_pick_str(val, "ch").strip()
         if ch not in allowed:
@@ -6005,10 +6124,8 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
         return _mute_toast_response("Selection cleared", "info")
 
     if v == "series_menu":
-        if not _mute_series_capable_channels():
-            return _mute_toast_response("No graph supports per-series mute", "warning")
         _mute_send_series_graph_picker_async(rid_t, rid, reply_to_mid=reply_mid)
-        return _mute_toast_response("Choose a graph", "info")
+        return _mute_toast_response("Loading current alerts…", "info")
 
     if v == "series_pick":
         kind = _lark_dict_pick_str(val, "sk_kind").strip()
@@ -6116,13 +6233,58 @@ def _lark_dispatch_card_action(data: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def _alert_quick_mute_button_elements(
+    receive_id_type: str, receive_id: str, alert_kinds: List[str]
+) -> List[Dict[str, Any]]:
+    """A row of quick-mute buttons (30m / 1h / 6h) that mute only ``alert_kinds`` (this alert's panels)."""
+    kinds = [k for k in alert_kinds if (k or "").strip()]
+    if not kinds:
+        return []
+    rt = (receive_id_type or "").strip()
+    rv = (receive_id or "").strip()
+    base: Dict[str, Any] = {"k": "mute_btn", "v": "quick", "kinds": ",".join(kinds)}
+    if rt in ("chat_id", "open_id") and rv:
+        base["rid_t"] = rt
+        base["rid"] = rv
+    columns: List[Dict[str, Any]] = []
+    for label, secs in _ALERT_QUICK_MUTE_CHOICES:
+        pl = dict(base)
+        pl["sec"] = str(int(secs))
+        columns.append(
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [
+                    _monitoring_card_v2_callback_button(
+                        label,
+                        "default",
+                        _monitoring_card_callback_payload_strings(pl),
+                        element_id=f"aqm_{secs}"[:20],
+                    )
+                ],
+            }
+        )
+    return [
+        {"tag": "markdown", "content": "_Mute this alert's panel(s):_"},
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "default",
+            "horizontal_align": "left",
+            "columns": columns,
+        },
+    ]
+
+
 def _monitoring_interactive_card_dict(
     reply: str,
     receive_id_type: str,
     receive_id: str,
     lark_img_key: Optional[str] = None,
+    alert_kinds: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Feishu card JSON v2 — markdown card, optional embedded PNG."""
+    """Feishu card JSON v2 — markdown card, optional embedded PNG, optional alert quick-mute row."""
     title = "📊 GRAFANA PLATFORM GRAPH"
     is_alert_card = (reply or "").lstrip().startswith("[ALERT]")
     elements: List[Dict[str, Any]] = [
@@ -6136,6 +6298,10 @@ def _monitoring_interactive_card_dict(
                 "img_key": ik,
                 "alt": {"tag": "plain_text", "content": "Grafana"},
             }
+        )
+    if alert_kinds and _lark_env_truthy("MONITORING_ALERT_QUICK_MUTE_ENABLE"):
+        elements.extend(
+            _alert_quick_mute_button_elements(receive_id_type, receive_id, list(alert_kinds))
         )
     if _lark_env_truthy("MONITORING_MESSAGE_CARD_BUTTON_ENABLE"):
         cb_payload: Dict[str, Any] = {"k": "monitoring_btn", "v": "refresh"}
@@ -6201,9 +6367,11 @@ def _lark_send_monitoring_user_message(
     receive_id: str,
     reply: str,
     lark_img_key: Optional[str] = None,
+    alert_kinds: Optional[List[str]] = None,
 ) -> Tuple[bool, bool]:
     """
     Send monitoring summary to the user: interactive card (optional embedded PNG) or plain text.
+    ``alert_kinds`` (currently-alerting channels) adds a quick-mute button row on alert cards.
 
     Returns ``(sent_interactive_card_ok, embedded_png_in_card)``.
     """
@@ -6238,7 +6406,7 @@ def _lark_send_monitoring_user_message(
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
             card = _monitoring_interactive_card_dict(
-                reply_for_card, receive_id_type, rid, lark_img_key
+                reply_for_card, receive_id_type, rid, lark_img_key, alert_kinds=alert_kinds
             )
             _lark_send_interactive_card(receive_id_type, rid, card)
             return True, bool((lark_img_key or "").strip())
@@ -11360,9 +11528,12 @@ def _analysis_for_keyword_baseline_payload(
         )
     pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="max")
     pts_filtered = _trim_trailing_minute_buckets(pts_filtered, _analysis_drop_n())
+    # Honour the caller's per-panel threshold (e.g. MONITORING_GAMES_GENERAL_ALERT_PCT) instead of
+    # the global MONITORING_MEDIAN_ALERT_PCT, so high-amplitude sawtooth panels can be tuned up like
+    # deposit/withdraw. continuous_threshold_pct is unused: the unified rule uses a single threshold.
     a = _median_baseline_alert_analysis(
         pts_filtered,
-        MONITORING_MEDIAN_ALERT_PCT,
+        fast_threshold_pct,
         min_baseline_value=min_baseline_value,
     )
     a["point_count"] = len(pts_filtered)
@@ -11760,6 +11931,56 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
         if k == "games_inhouse" and bool(_analysis_for_games_inhouse_payload(p2).get("hit_alert")):
             return True
     return False
+
+
+_MONITORING_EXTRA_PANEL_ANALYZERS: Dict[str, Any] = {
+    "9280_push": _analysis_for_9280_payload,
+    "deposit": _analysis_for_deposit_payload,
+    "withdraw": _analysis_for_withdraw_payload,
+    "fpms_nt_login": _analysis_for_fpms_nt_login_payload,
+    "error_req_1m": _analysis_for_error_req_payload,
+    "provider_jili": _analysis_for_provider_jili_payload,
+    "provider_general": _analysis_for_provider_general_payload,
+    "provider_inhouse": _analysis_for_provider_inhouse_payload,
+    "games_jili": _analysis_for_games_jili_payload,
+    "games_general": _analysis_for_games_general_payload,
+    "games_inhouse": _analysis_for_games_inhouse_payload,
+}
+
+
+def _monitoring_alerting_channel_kinds(payload: Dict[str, Any]) -> List[str]:
+    """
+    Channel kinds currently in an alerting state for this payload, in display order and excluding
+    muted ones. Parallels :func:`_monitoring_payload_hit_alert` but collects every hit instead of
+    returning on the first. Used for alert-card quick-mute and the ``/m`` "currently alerting" list.
+    """
+    _mute_purge_expired()
+    out: List[str] = []
+    if not isinstance(payload, dict):
+        return out
+    mo_only = (payload.get("moPanelOnlyKind") or "").strip()
+    if (
+        (not mo_only or mo_only == "http")
+        and not _monitoring_alert_channel_muted("http")
+        and bool(_http_analysis_for_payload(payload).get("hit_alert"))
+    ):
+        out.append("http")
+    for ex in payload.get("extraPanels") or []:
+        if not isinstance(ex, dict):
+            continue
+        k = (ex.get("kind") or "").strip()
+        if mo_only and k != mo_only:
+            continue
+        analyzer = _MONITORING_EXTRA_PANEL_ANALYZERS.get(k)
+        if analyzer is None or _monitoring_alert_channel_muted(k):
+            continue
+        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+        try:
+            if bool(analyzer(p2).get("hit_alert")):
+                out.append(k)
+        except Exception:
+            logger.exception("alerting-kinds analysis failed for kind=%r", k)
+    return out
 
 
 def _fmt_ts_short(ts: Any) -> str:
@@ -12557,6 +12778,7 @@ def _monitoring_watchdog_loop() -> None:
                     alert_chat,
                     reply,
                     pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
+                    alert_kinds=_monitoring_alerting_channel_kinds(payload_c),
                 )
                 logger.info(
                     "monitoring watchdog alert sent (after confirm) chat_prefix=%s... card=%s embedded_png=%s",
@@ -12675,6 +12897,7 @@ def _monitoring_watchdog_loop() -> None:
                     alert_chat,
                     reply,
                     pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
+                    alert_kinds=_monitoring_alerting_channel_kinds(payload),
                 )
                 logger.info(
                     "monitoring watchdog alert sent chat_prefix=%s... card=%s embedded_png=%s",
