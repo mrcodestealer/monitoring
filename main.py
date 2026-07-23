@@ -6013,6 +6013,8 @@ def _monitoring_freespin_slot_worker(
         if note:
             note = note.replace("{time}", slot_label)
         _freespin_send_combined_card(rt, rv, note, time_label=slot_label)
+        # Faithfully mirror the auto-send: the LAST slot (9:30) also posts the core-metrics graph.
+        _freespin_send_core_metrics_if_last_slot(int(slot_seconds), rt, rv)
     except Exception:
         logger.exception("freespin demo worker failed (slot_seconds=%s)", slot_seconds)
         try:
@@ -6059,6 +6061,30 @@ def _core_metrics_send_graph(receive_id_type: str, receive_id: str) -> None:
                 "core metrics card send failed — falling back to plain image", exc_info=True
             )
     _lark_send_image_message(receive_id_type, receive_id, key)
+
+
+def _freespin_send_core_metrics_if_last_slot(
+    slot_seconds: int, receive_id_type: str, receive_id: str
+) -> None:
+    """
+    After the LAST freespin slot (default 21:30), also post the core-metrics whole graph.
+    Shared by the daily auto-send and the ``/freespin930`` demo so both behave identically.
+    """
+    send_times = _freespin_daily_send_times()
+    if not (send_times and int(slot_seconds) == max(send_times)):
+        return
+    if not _lark_env_truthy("FREESPIN_CORE_METRICS_AFTER_LAST_ENABLE"):
+        return
+    try:
+        _core_metrics_send_graph(receive_id_type, receive_id)
+        logger.info(
+            "core metrics graph sent after last freespin slot=%02d:%02d chat_prefix=%s...",
+            int(slot_seconds) // 3600,
+            int(slot_seconds) // 60 % 60,
+            (receive_id or "")[:16],
+        )
+    except Exception:
+        logger.exception("core metrics graph send (after last freespin slot) failed")
 
 
 def _monitoring_coremetrics_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
@@ -6214,22 +6240,7 @@ def _freespin_daily_sender_loop() -> None:
                 chat[:16],
             )
             # After the LAST freespin slot (default 21:30), also post the core-metrics whole graph.
-            send_times = _freespin_daily_send_times()
-            if (
-                send_times
-                and due_t == max(send_times)
-                and _lark_env_truthy("FREESPIN_CORE_METRICS_AFTER_LAST_ENABLE")
-            ):
-                try:
-                    _core_metrics_send_graph("chat_id", chat)
-                    logger.info(
-                        "core metrics graph sent after last freespin slot=%02d:%02d chat_prefix=%s...",
-                        due_t // 3600,
-                        due_t // 60 % 60,
-                        chat[:16],
-                    )
-                except Exception:
-                    logger.exception("core metrics graph send (after last freespin slot) failed")
+            _freespin_send_core_metrics_if_last_slot(due_t, "chat_id", chat)
         except Exception:
             logger.exception("freespin daily send cycle failed")
             time.sleep(30.0)
