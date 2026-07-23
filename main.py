@@ -5969,6 +5969,10 @@ def _monitoring_freespin_worker(chat_id: str, open_id: str, debounce_key: str) -
 def _monitoring_freespin9_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
     """Preview the daily 9pm send: same combined card (9pm caption + screenshot) the 21:00 slot posts."""
     try:
+        # Post as a standalone message (NOT a threaded reply under the /freespin9 command), so the
+        # preview looks exactly like the real 21:00 broadcast. The 'DONE' reaction still lands on the
+        # command message. (_spawn_reacting_worker set the thread target; clear it just for this send.)
+        _set_reply_to_mid("")
         rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
         if not rv:
             return
