@@ -202,9 +202,11 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_PANEL_READY_RATIO": 0.92,
     # 截图前“全面板加载”最少面板数（防小屏/过滤时占比误判）
     "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 8,
-    # 全面板加载等待预算（毫秒）。Freespin(SigNoz) 展开折叠行后有 ~46 面板，18s 只画到 36/46 → 顶部空白截图；
-    # 这是上限而非固定等待（快的看板画完即返回），故调大只让慢看板多等、不拖慢 /mo / 告警。
-    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 40000,
+    # 全面板加载等待预算（毫秒）。上限而非固定等待（快的看板画完即返回）。
+    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 18000,
+    # 这些看板（URL 子串匹配）截图时不展开折叠行。Freespin 展开后多出的 ~20 个 SigNoz 面板永远画不完
+    # （卡在 36/46），既拖满超时又导致顶部空白；折叠状态下 26/26 秒开且完整。逗号分隔。
+    "GRAFANA_SCREENSHOT_SKIP_ROW_EXPAND_PATHS": "freespin-carnival-v2",
     # 告警截图：Playwright 在触发告警的面板外框加红边（仅告警路径传入 panel titles 时生效）
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT": "1",
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT_COLOR": "#FF0000",
@@ -6928,6 +6930,23 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     page.wait_for_timeout(200)
 
 
+def _grafana_screenshot_skip_row_expand(url: str) -> bool:
+    """
+    True when this dashboard URL is on ``GRAFANA_SCREENSHOT_SKIP_ROW_EXPAND_PATHS`` — capture it with
+    collapsed rows left collapsed (e.g. Freespin: expanding adds ~20 SigNoz panels that never finish
+    painting → 36/46 timeout + blank top; collapsed it's 26/26, fast and complete).
+    """
+    u = (url or "").strip()
+    if not u:
+        return False
+    raw = _cfg_str("GRAFANA_SCREENSHOT_SKIP_ROW_EXPAND_PATHS", "")
+    for part in re.split(r"[\s,;]+", raw):
+        p = part.strip()
+        if p and p in u:
+            return True
+    return False
+
+
 def _grafana_expand_collapsed_dashboard_rows(page: Any) -> None:
     """
     Grafana dashboards often collapse row groups (only the row title e.g. ``KPI`` is visible).
@@ -8144,7 +8163,8 @@ def _grafana_playwright_ensure_dashboard_charts_visible(
         _grafana_playwright_dock_nav_only(page, timeout_ms)
         _grafana_click_dashboard_refresh(page, timeout_ms)
         _grafana_playwright_dock_nav_only(page, timeout_ms)
-        _grafana_expand_collapsed_dashboard_rows(page)
+        if not _grafana_screenshot_skip_row_expand(url):
+            _grafana_expand_collapsed_dashboard_rows(page)
         _grafana_wait_dashboard_ready(page, min(18000, timeout_ms // 2))
         _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
         _grafana_stabilize_dashboard_render(page, timeout_ms, rounds=2)
@@ -8178,7 +8198,9 @@ def _grafana_playwright_render_dashboard_and_png(
     _grafana_click_dashboard_refresh(page, timeout_ms)
     # Refresh 有时会重新弹出 mega-menu；再收一次侧栏
     _grafana_playwright_dock_nav_only(page, timeout_ms)
-    _grafana_expand_collapsed_dashboard_rows(page)
+    _skip_row_expand = _grafana_screenshot_skip_row_expand(url)
+    if not _skip_row_expand:
+        _grafana_expand_collapsed_dashboard_rows(page)
     _grafana_wait_dashboard_ready(page, timeout_ms)
     _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
     _grafana_stabilize_dashboard_render(page, timeout_ms)
@@ -8186,7 +8208,8 @@ def _grafana_playwright_render_dashboard_and_png(
     page.wait_for_timeout(180)
 
     if not _grafana_dashboard_has_visual_content(page):
-        _grafana_expand_collapsed_dashboard_rows(page)
+        if not _skip_row_expand:
+            _grafana_expand_collapsed_dashboard_rows(page)
         _grafana_click_dashboard_refresh(
             page,
             timeout_ms,
@@ -8211,7 +8234,8 @@ def _grafana_playwright_render_dashboard_and_png(
             _grafana_playwright_dock_nav_only(page, timeout_ms)
             _grafana_click_dashboard_refresh(page, timeout_ms)
             _grafana_playwright_dock_nav_only(page, timeout_ms)
-            _grafana_expand_collapsed_dashboard_rows(page)
+            if not _skip_row_expand:
+                _grafana_expand_collapsed_dashboard_rows(page)
             _grafana_wait_dashboard_ready(page, min(20000, timeout_ms // 2))
             _grafana_wait_dashboard_body_populated(
                 page, min(8000, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
