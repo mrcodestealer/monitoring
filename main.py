@@ -416,8 +416,10 @@ _CFG: Dict[str, Any] = {
     # ---- /freespin：Freespin Carnival V2 dashboard 整页截图 + 每日定时自动发送 ----
     "MONITORING_FREESPIN_ENABLE": "1",
     "MONITORING_FREESPIN_TRIGGER": "/freespin",
-    # 手动预览每日 9pm 定时发送（合并卡片：9pm 文案 + 截图，与 21:00 那条一模一样）
+    # 手动预览每日定时发送（合并卡片：标题 + 截图，与对应 21:00/21:15/21:30 那条一模一样）
     "MONITORING_FREESPIN9_TRIGGER": "/freespin9",
+    "MONITORING_FREESPIN915_TRIGGER": "/freespin915",
+    "MONITORING_FREESPIN930_TRIGGER": "/freespin930",
     "FREESPIN_DASHBOARD_PATH": "/d/8345e1da-af7a-416f-90a2-0326a3a163d9/freespin-carnival-v2",
     "FREESPIN_DASHBOARD_FROM": "now-30m",
     "FREESPIN_DASHBOARD_TO": "now",
@@ -429,14 +431,20 @@ _CFG: Dict[str, Any] = {
     "FREESPIN_DAILY_SEND_TIMES": "21:00,21:15,21:30",
     # 每日自动发送的目标群（空 = 回退到 MONITORING_ALERT_CHAT_ID）
     "FREESPIN_DAILY_CHAT_ID": "oc_7713b00dc15c884caf5ee615ef948ef3",
-    # 每日自动发送截图前附带的说明文字（空 = 只发图；``{time}`` 会替换成该时点，如 9pm / 9:15pm / 9:30pm）
-    "FREESPIN_DAILY_MESSAGE": "Hi team, FYI Ongoing Free Spin event - {time}",
+    # 卡片正文说明文字（空 = 不显示，只发标题 + 图；``{time}`` 会替换成该时点）。标题已含活动名+时间，故默认留空。
+    "FREESPIN_DAILY_MESSAGE": "",
     # 合并卡片的标题（``{time}`` 会替换成该时点，如 9pm / 9:15pm；留空该占位符则只显示前缀）
     "FREESPIN_CARD_TITLE": "🎰 Free Spin Event {time}",
     # 启动时在常驻 Chromium 里预渲染一次 freespin dashboard（首次 /freespin 更快；需 GRAFANA_PERSISTENT_BROWSER=1）
     "FREESPIN_BOOT_WARM": "1",
     # 每日自动发送前 N 秒先预热渲染一次（0=关；让 21:00 等时点的截图更快、更准点）
     "FREESPIN_DAILY_PREWARM_SECONDS": "180",
+    # 最后一个 freespin 时点（默认 21:30）发完后，紧接着自动发一张 core-metrics 主看板整图到同一群。
+    "FREESPIN_CORE_METRICS_AFTER_LAST_ENABLE": "1",
+    "FREESPIN_CORE_METRICS_TITLE": "📊 Core Metrics",
+    # core-metrics 整图时间范围（空 = 用 GRAFANA_DASHBOARD_FROM/TO，默认 now-1h..now）
+    "FREESPIN_CORE_METRICS_FROM": "",
+    "FREESPIN_CORE_METRICS_TO": "",
 }
 
 
@@ -5814,6 +5822,8 @@ def _monitoring_track_worker(
 
 MONITORING_FREESPIN_TRIGGER = _cfg_str("MONITORING_FREESPIN_TRIGGER", "/freespin").strip()
 MONITORING_FREESPIN9_TRIGGER = _cfg_str("MONITORING_FREESPIN9_TRIGGER", "/freespin9").strip()
+MONITORING_FREESPIN915_TRIGGER = _cfg_str("MONITORING_FREESPIN915_TRIGGER", "/freespin915").strip()
+MONITORING_FREESPIN930_TRIGGER = _cfg_str("MONITORING_FREESPIN930_TRIGGER", "/freespin930").strip()
 FREESPIN_DASHBOARD_PATH = _cfg_str(
     "FREESPIN_DASHBOARD_PATH",
     "/d/8345e1da-af7a-416f-90a2-0326a3a163d9/freespin-carnival-v2",
@@ -5832,13 +5842,24 @@ def _monitoring_im_matches_freespin_command(clean: str) -> bool:
     return _im_command_matches(clean or "", MONITORING_FREESPIN_TRIGGER)
 
 
-def _monitoring_im_matches_freespin9_command(clean: str) -> bool:
-    """``/freespin9`` — on-demand preview of the daily 9pm send (combined caption + screenshot card)."""
+def _freespin_demo_slot_triggers() -> List[Tuple[str, int]]:
+    """(trigger, seconds-of-day) for the manual /freespin9|915|930 slot-preview commands."""
+    return [
+        (MONITORING_FREESPIN9_TRIGGER, 21 * 3600),
+        (MONITORING_FREESPIN915_TRIGGER, 21 * 3600 + 15 * 60),
+        (MONITORING_FREESPIN930_TRIGGER, 21 * 3600 + 30 * 60),
+    ]
+
+
+def _monitoring_freespin_demo_slot(clean: str) -> Optional[int]:
+    """Seconds-of-day slot for a /freespin9|915|930 preview command, else None. (No prefix collisions:
+    _im_command_matches needs exact or trigger+space, so /freespin915 never matches /freespin9.)"""
     if not _lark_env_truthy("MONITORING_FREESPIN_ENABLE"):
-        return False
-    if not MONITORING_FREESPIN9_TRIGGER:
-        return False
-    return _im_command_matches(clean or "", MONITORING_FREESPIN9_TRIGGER)
+        return None
+    for trig, secs in _freespin_demo_slot_triggers():
+        if trig and _im_command_matches(clean or "", trig):
+            return secs
+    return None
 
 
 def _freespin_dashboard_url() -> str:
@@ -5966,32 +5987,68 @@ def _monitoring_freespin_worker(chat_id: str, open_id: str, debounce_key: str) -
             _monitoring_inflight_keys.discard(debounce_key)
 
 
-def _monitoring_freespin9_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
-    """Preview the daily 9pm send: same combined card (9pm caption + screenshot) the 21:00 slot posts."""
+def _monitoring_freespin_slot_worker(
+    chat_id: str, open_id: str, debounce_key: str, slot_seconds: int
+) -> None:
+    """Preview a daily freespin send for the given slot: same standalone card the auto-send posts."""
     try:
-        # Post as a standalone message (NOT a threaded reply under the /freespin9 command), so the
-        # preview looks exactly like the real 21:00 broadcast. The 'DONE' reaction still lands on the
-        # command message. (_spawn_reacting_worker set the thread target; clear it just for this send.)
+        # Post as a standalone message (NOT a threaded reply under the command), so the preview looks
+        # exactly like the real broadcast. The 'DONE' reaction still lands on the command message.
         _set_reply_to_mid("")
         rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
         if not rv:
             return
-        slot_label = _freespin_slot_display_12h(21 * 3600)  # 21:00 → "9pm"
+        slot_label = _freespin_slot_display_12h(int(slot_seconds))
         note = _cfg_str("FREESPIN_DAILY_MESSAGE", "").strip()
         if note:
             note = note.replace("{time}", slot_label)
         _freespin_send_combined_card(rt, rv, note, time_label=slot_label)
     except Exception:
-        logger.exception("freespin9 worker failed")
+        logger.exception("freespin demo worker failed (slot_seconds=%s)", slot_seconds)
         try:
             _monitoring_deploy_send_ack(
-                chat_id, open_id, "**Freespin 9pm demo failed** — see server logs."
+                chat_id, open_id, "**Freespin demo failed** — see server logs."
             )
         except Exception:
-            logger.exception("freespin9 failure notify send failed")
+            logger.exception("freespin demo failure notify send failed")
     finally:
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _core_metrics_screenshot_png() -> bytes:
+    """Full-page PNG of the main core-metrics dashboard (same capture pipeline as /mo / freespin)."""
+    session = grafana_login_session()
+    rf = _cfg_str("FREESPIN_CORE_METRICS_FROM", "").strip() or (GRAFANA_DASHBOARD_FROM or "now-1h").strip()
+    rt = _cfg_str("FREESPIN_CORE_METRICS_TO", "").strip() or (GRAFANA_DASHBOARD_TO or "now").strip()
+    url = _grafana_build_screenshot_dashboard_url(0, 0, relative_from=rf, relative_to=rt)
+    logger.info("core metrics screenshot: url=%s", url[:300])
+    return _grafana_headless_screenshot_png_at_url(session, url)
+
+
+def _core_metrics_send_graph(receive_id_type: str, receive_id: str) -> None:
+    """Send the whole core-metrics dashboard as one card (title + full screenshot); image on fallback."""
+    png = _core_metrics_screenshot_png()
+    key = _lark_upload_png_image_key(png)
+    title = _cfg_str("FREESPIN_CORE_METRICS_TITLE", "📊 Core Metrics") or "📊 Core Metrics"
+    if MONITORING_MESSAGE_CARD_ENABLE:
+        try:
+            card = {
+                "schema": "2.0",
+                "config": {"update_multi": True, "wide_screen_mode": True},
+                "header": {
+                    "template": "blue",
+                    "title": {"tag": "plain_text", "content": title[:190]},
+                },
+                "body": {"elements": [_lark_card_full_image_element(key, "Core Metrics")]},
+            }
+            _lark_send_interactive_card(receive_id_type, receive_id, card)
+            return
+        except Exception:
+            logger.warning(
+                "core metrics card send failed — falling back to plain image", exc_info=True
+            )
+    _lark_send_image_message(receive_id_type, receive_id, key)
 
 
 def _freespin_daily_send_times() -> List[int]:
@@ -6125,6 +6182,23 @@ def _freespin_daily_sender_loop() -> None:
                 bool(note),
                 chat[:16],
             )
+            # After the LAST freespin slot (default 21:30), also post the core-metrics whole graph.
+            send_times = _freespin_daily_send_times()
+            if (
+                send_times
+                and due_t == max(send_times)
+                and _lark_env_truthy("FREESPIN_CORE_METRICS_AFTER_LAST_ENABLE")
+            ):
+                try:
+                    _core_metrics_send_graph("chat_id", chat)
+                    logger.info(
+                        "core metrics graph sent after last freespin slot=%02d:%02d chat_prefix=%s...",
+                        due_t // 3600,
+                        due_t // 60 % 60,
+                        chat[:16],
+                    )
+                except Exception:
+                    logger.exception("core metrics graph send (after last freespin slot) failed")
         except Exception:
             logger.exception("freespin daily send cycle failed")
             time.sleep(30.0)
@@ -6172,6 +6246,8 @@ def _monitoring_at_mention_help_text() -> str:
     c = (MONITORING_CANCELMUTE_TRIGGER or "/c").strip()
     fs = (MONITORING_FREESPIN_TRIGGER or "/freespin").strip()
     fs9 = (MONITORING_FREESPIN9_TRIGGER or "/freespin9").strip()
+    fs915 = (MONITORING_FREESPIN915_TRIGGER or "/freespin915").strip()
+    fs930 = (MONITORING_FREESPIN930_TRIGGER or "/freespin930").strip()
     return (
         "Commands:\n"
         f"- `{mo}` — Grafana monitoring summary (all graphs)\n"
@@ -6179,7 +6255,7 @@ def _monitoring_at_mention_help_text() -> str:
         f"- `{m}` — mute alerts (interactive card)\n"
         f"- `{c}` — clear all mutes\n"
         f"- `{fs}` — Freespin Carnival dashboard screenshot (last 30m)\n"
-        f"- `{fs9}` — preview the daily 9pm Freespin send (caption + screenshot card)\n"
+        f"- `{fs9}` / `{fs915}` / `{fs930}` — preview the daily 9pm / 9:15pm / 9:30pm Freespin send\n"
         "- `track 2026-06-30 13:30` — why no alert at that time (admin)\n"
         "- `track login 2026-06-30 13:30` — one panel only"
     )
@@ -13669,20 +13745,21 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         return
 
-    if _monitoring_im_matches_freespin9_command(clean or ""):
+    _fs_demo_slot = _monitoring_freespin_demo_slot(clean or "")
+    if _fs_demo_slot is not None:
         processed_f9 = _monitoring_processed_stick(
             mid, im_event_id, chat_id or "", sender_debounce, msg_time
         )
-        debounce_key_f9 = f"{(chat_id or '').strip()}\n__freespin9__"
+        debounce_key_f9 = f"{(chat_id or '').strip()}\n__freespin_demo_{_fs_demo_slot}__"
         with _monitoring_reply_dispatch_lock:
             if im_event_id and im_event_id in _processed_lark_im_event_ids:
-                logger.info("duplicate IM event_id=%s — skip (freespin9)", im_event_id)
+                logger.info("duplicate IM event_id=%s — skip (freespin demo)", im_event_id)
                 return
             if processed_f9 and processed_f9 in _processed_lark_message_ids:
-                logger.info("duplicate freespin9 stick=%r — skip", processed_f9[:96])
+                logger.info("duplicate freespin demo stick=%r — skip", processed_f9[:96])
                 return
             if debounce_key_f9 in _monitoring_inflight_keys:
-                logger.info("freespin9 skip — already in flight")
+                logger.info("freespin demo skip — already in flight")
                 return
             _monitoring_inflight_keys.add(debounce_key_f9)
             if processed_f9:
@@ -13692,12 +13769,17 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
                     _processed_lark_im_event_ids.clear()
                     _processed_lark_im_event_ids.add(im_event_id)
-        logger.info("freespin9 command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
+        logger.info(
+            "freespin demo command accepted slot_seconds=%s chat=%r open=%r",
+            _fs_demo_slot,
+            bool(chat_id),
+            bool(open_id),
+        )
         _spawn_reacting_worker(
             mid,
-            _monitoring_freespin9_worker,
-            (chat_id, open_id, debounce_key_f9),
-            "freespin9-demo",
+            _monitoring_freespin_slot_worker,
+            (chat_id, open_id, debounce_key_f9, _fs_demo_slot),
+            "freespin-demo",
         )
         return
 
@@ -13744,7 +13826,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _monitoring_im_is_deploy_command(raw_text or "", clean or "")
         and not _monitoring_im_matches_track_command(clean or "")
         and not _monitoring_im_matches_freespin_command(clean or "")
-        and not _monitoring_im_matches_freespin9_command(clean or "")
+        and _monitoring_freespin_demo_slot(clean or "") is None
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
