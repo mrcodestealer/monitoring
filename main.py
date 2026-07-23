@@ -202,8 +202,9 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_PANEL_READY_RATIO": 0.92,
     # 截图前“全面板加载”最少面板数（防小屏/过滤时占比误判）
     "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 8,
-    # 全面板加载等待预算（毫秒）
-    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 18000,
+    # 全面板加载等待预算（毫秒）。Freespin(SigNoz) 展开折叠行后有 ~46 面板，18s 只画到 36/46 → 顶部空白截图；
+    # 这是上限而非固定等待（快的看板画完即返回），故调大只让慢看板多等、不拖慢 /mo / 告警。
+    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 40000,
     # 告警截图：Playwright 在触发告警的面板外框加红边（仅告警路径传入 panel titles 时生效）
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT": "1",
     "GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT_COLOR": "#FF0000",
