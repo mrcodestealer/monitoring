@@ -431,6 +431,8 @@ _CFG: Dict[str, Any] = {
     "FREESPIN_DAILY_CHAT_ID": "oc_7713b00dc15c884caf5ee615ef948ef3",
     # 每日自动发送截图前附带的说明文字（空 = 只发图；``{time}`` 会替换成该时点，如 9pm / 9:15pm / 9:30pm）
     "FREESPIN_DAILY_MESSAGE": "Hi team, FYI Ongoing Free Spin event - {time}",
+    # 合并卡片的标题（``{time}`` 会替换成该时点，如 9pm / 9:15pm；留空该占位符则只显示前缀）
+    "FREESPIN_CARD_TITLE": "🎰 Free Spin Event {time}",
     # 启动时在常驻 Chromium 里预渲染一次 freespin dashboard（首次 /freespin 更快；需 GRAFANA_PERSISTENT_BROWSER=1）
     "FREESPIN_BOOT_WARM": "1",
     # 每日自动发送前 N 秒先预热渲染一次（0=关；让 21:00 等时点的截图更快、更准点）
@@ -5891,7 +5893,7 @@ def _lark_card_full_image_element(img_key: str, alt_text: str) -> Dict[str, Any]
     }
 
 
-def _freespin_card_dict(note: str, img_key: str) -> Dict[str, Any]:
+def _freespin_card_dict(note: str, img_key: str, time_label: str = "") -> Dict[str, Any]:
     """Single card carrying the daily caption + the freespin screenshot (so they arrive together)."""
     elements: List[Dict[str, Any]] = []
     n = (note or "").strip()
@@ -5900,18 +5902,22 @@ def _freespin_card_dict(note: str, img_key: str) -> Dict[str, Any]:
     ik = (img_key or "").strip()
     if ik:
         elements.append(_lark_card_full_image_element(ik, "Freespin"))
+    title_tmpl = _cfg_str("FREESPIN_CARD_TITLE", "🎰 Free Spin Event {time}")
+    title = re.sub(r"\s{2,}", " ", title_tmpl.replace("{time}", (time_label or "").strip())).strip()
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "wide_screen_mode": True},
         "header": {
             "template": "turquoise",
-            "title": {"tag": "plain_text", "content": "🎰 Free Spin Carnival"[:190]},
+            "title": {"tag": "plain_text", "content": (title or "🎰 Free Spin Event")[:190]},
         },
         "body": {"elements": elements},
     }
 
 
-def _freespin_send_combined_card(receive_id_type: str, receive_id: str, note: str) -> None:
+def _freespin_send_combined_card(
+    receive_id_type: str, receive_id: str, note: str, time_label: str = ""
+) -> None:
     """
     Render the dashboard once, then post the caption + screenshot as a SINGLE interactive card so
     they arrive together (no ~30s window where only the caption text shows). Falls back to separate
@@ -5923,7 +5929,9 @@ def _freespin_send_combined_card(receive_id_type: str, receive_id: str, note: st
     n = (note or "").strip()
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
-            _lark_send_interactive_card(receive_id_type, receive_id, _freespin_card_dict(n, key))
+            _lark_send_interactive_card(
+                receive_id_type, receive_id, _freespin_card_dict(n, key, time_label)
+            )
             return
         except Exception:
             logger.warning(
@@ -5964,10 +5972,11 @@ def _monitoring_freespin9_worker(chat_id: str, open_id: str, debounce_key: str) 
         rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
         if not rv:
             return
+        slot_label = _freespin_slot_display_12h(21 * 3600)  # 21:00 → "9pm"
         note = _cfg_str("FREESPIN_DAILY_MESSAGE", "").strip()
         if note:
-            note = note.replace("{time}", _freespin_slot_display_12h(21 * 3600))  # 21:00 → "9pm"
-        _freespin_send_combined_card(rt, rv, note)
+            note = note.replace("{time}", slot_label)
+        _freespin_send_combined_card(rt, rv, note, time_label=slot_label)
     except Exception:
         logger.exception("freespin9 worker failed")
         try:
@@ -6100,10 +6109,11 @@ def _freespin_daily_sender_loop() -> None:
                     due_t // 60 % 60,
                 )
                 continue
+            slot_label = _freespin_slot_display_12h(due_t)
             note = _cfg_str("FREESPIN_DAILY_MESSAGE", "").strip()
             if note:
-                note = note.replace("{time}", _freespin_slot_display_12h(due_t))
-            _freespin_send_combined_card("chat_id", chat, note)
+                note = note.replace("{time}", slot_label)
+            _freespin_send_combined_card("chat_id", chat, note, time_label=slot_label)
             logger.info(
                 "freespin daily screenshot sent slot=%02d:%02d note=%s chat_prefix=%s...",
                 due_t // 3600,
