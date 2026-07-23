@@ -235,6 +235,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_REACT_ACK_ENABLE": "1",
     "MONITORING_REACT_GOTIT_EMOJI": "OnIt",
     "MONITORING_REACT_DONE_EMOJI": "DONE",
+    # 反应有时漏掉：飞书 reaction API 偶发失败/限流，且快命令会「删 OnIt」早于飞书登记该 reaction。重试消化这些。
+    "MONITORING_REACT_RETRY": "3",
     # 1 = the bot replies **in a thread on your original command message** (Feishu reply_in_thread)
     # instead of posting a standalone message in the chat. Set 0 for the old standalone behavior.
     "MONITORING_REPLY_IN_THREAD": "1",
@@ -4307,33 +4309,51 @@ def _lark_delete_message_reaction(message_id: str, reaction_id: str) -> None:
         )
 
 
+def _lark_react_call_retry(fn: Any, what: str) -> Tuple[bool, Any]:
+    """
+    Run a reaction API call with retries. The Feishu reaction API is flaky under load/rate limits, and
+    for fast commands the 'delete OnIt' can race ahead of Feishu registering the add — a short retry
+    absorbs both so reactions land consistently. Returns ``(ok, result)``; never raises.
+    """
+    attempts = 1 + max(0, min(6, _cfg_int("MONITORING_REACT_RETRY", 3)))
+    last: Optional[BaseException] = None
+    for i in range(attempts):
+        try:
+            return True, fn()
+        except Exception as e:  # noqa: BLE001 — best-effort ack, never break the command
+            last = e
+            if i + 1 < attempts:
+                time.sleep(0.4 * (i + 1))
+    logger.warning(
+        "lark reaction %s failed after %d tries (scope im:message / im:message.reactions:write_only?): %s",
+        what,
+        attempts,
+        last,
+    )
+    return False, None
+
+
 def _lark_add_reaction_get_id(message_id: str, emoji_type: str) -> Optional[str]:
-    """Add a reaction and return its id; never raises. Off when MONITORING_REACT_ACK_ENABLE=0."""
+    """Add a reaction (with retry) and return its id; never raises. Off when MONITORING_REACT_ACK_ENABLE=0."""
     if not MONITORING_REACT_ACK_ENABLE:
         return None
-    try:
-        return _lark_add_message_reaction(message_id, emoji_type)
-    except Exception as e:
-        logger.warning(
-            "lark reaction %r failed (grant app scope im:message or im:message.reactions:write_only?): %s",
-            emoji_type,
-            e,
-        )
-        return None
+    ok, rid = _lark_react_call_retry(
+        lambda: _lark_add_message_reaction(message_id, emoji_type), f"add {emoji_type!r}"
+    )
+    return rid if ok else None
 
 
 def _lark_delete_reaction_safe(message_id: str, reaction_id: str) -> None:
-    """Remove a reaction by id; never raises. No-op when the id is empty."""
+    """Remove a reaction by id (with retry); never raises. No-op when the id is empty."""
     if not (reaction_id or "").strip():
         return
-    try:
-        _lark_delete_message_reaction(message_id, reaction_id)
-    except Exception as e:
-        logger.warning("lark reaction delete failed: %s", e)
+    _lark_react_call_retry(
+        lambda: _lark_delete_message_reaction(message_id, reaction_id), "delete"
+    )
 
 
 def _lark_react_safe(message_id: str, emoji_type: str) -> None:
-    """Fire-and-forget message reaction in a background thread; never raises. Off when MONITORING_REACT_ACK_ENABLE=0."""
+    """Fire-and-forget message reaction (with retry) in a background thread; never raises."""
     if not MONITORING_REACT_ACK_ENABLE:
         return
     mid = (message_id or "").strip()
@@ -4342,14 +4362,7 @@ def _lark_react_safe(message_id: str, emoji_type: str) -> None:
         return
 
     def _run() -> None:
-        try:
-            _lark_add_message_reaction(mid, et)
-        except Exception as e:
-            logger.warning(
-                "lark reaction %r failed (grant app scope im:message or im:message.reactions:write_only?): %s",
-                et,
-                e,
-            )
+        _lark_react_call_retry(lambda: _lark_add_message_reaction(mid, et), f"add {et!r}")
 
     threading.Thread(target=_run, daemon=True, name=f"lark-react-{et}").start()
 
