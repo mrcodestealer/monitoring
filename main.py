@@ -5876,6 +5876,21 @@ def _freespin_send_screenshot(receive_id_type: str, receive_id: str) -> None:
     _lark_send_image_message(receive_id_type, receive_id, key)
 
 
+def _lark_card_full_image_element(img_key: str, alt_text: str) -> Dict[str, Any]:
+    """
+    Card image shown in FULL. Feishu's default ``scale_type`` is ``crop_center``, which center-crops
+    a tall dashboard screenshot so only a slice is visible until tapped. ``fit_horizontal`` scales the
+    whole image to the card width (no crop); ``preview`` keeps tap-to-zoom for reading fine detail.
+    """
+    return {
+        "tag": "img",
+        "img_key": (img_key or "").strip(),
+        "alt": {"tag": "plain_text", "content": alt_text or ""},
+        "scale_type": "fit_horizontal",
+        "preview": True,
+    }
+
+
 def _freespin_card_dict(note: str, img_key: str) -> Dict[str, Any]:
     """Single card carrying the daily caption + the freespin screenshot (so they arrive together)."""
     elements: List[Dict[str, Any]] = []
@@ -5884,9 +5899,7 @@ def _freespin_card_dict(note: str, img_key: str) -> Dict[str, Any]:
         elements.append({"tag": "markdown", "content": n})
     ik = (img_key or "").strip()
     if ik:
-        elements.append(
-            {"tag": "img", "img_key": ik, "alt": {"tag": "plain_text", "content": "Freespin"}}
-        )
+        elements.append(_lark_card_full_image_element(ik, "Freespin"))
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "wide_screen_mode": True},
@@ -6438,13 +6451,7 @@ def _monitoring_interactive_card_dict(
     ]
     ik = (lark_img_key or "").strip()
     if ik:
-        elements.append(
-            {
-                "tag": "img",
-                "img_key": ik,
-                "alt": {"tag": "plain_text", "content": "Grafana"},
-            }
-        )
+        elements.append(_lark_card_full_image_element(ik, "Grafana"))
     if alert_kinds and _lark_env_truthy("MONITORING_ALERT_QUICK_MUTE_ENABLE"):
         elements.extend(
             _alert_quick_mute_button_elements(receive_id_type, receive_id, list(alert_kinds))
