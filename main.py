@@ -442,9 +442,11 @@ _CFG: Dict[str, Any] = {
     # 最后一个 freespin 时点（默认 21:30）发完后，紧接着自动发一张 core-metrics 主看板整图到同一群。
     "FREESPIN_CORE_METRICS_AFTER_LAST_ENABLE": "1",
     "FREESPIN_CORE_METRICS_TITLE": "📊 Core Metrics",
-    # core-metrics 整图时间范围（空 = 用 GRAFANA_DASHBOARD_FROM/TO，默认 now-1h..now）
-    "FREESPIN_CORE_METRICS_FROM": "",
-    "FREESPIN_CORE_METRICS_TO": "",
+    # core-metrics 整图时间范围（空 = 用 GRAFANA_DASHBOARD_FROM/TO）
+    "FREESPIN_CORE_METRICS_FROM": "now-2h",
+    "FREESPIN_CORE_METRICS_TO": "now",
+    # 手动即时发送 core-metrics 整图（方便测试，不必等 21:30）
+    "MONITORING_COREMETRICS_TRIGGER": "/coremetrics",
 }
 
 
@@ -5824,6 +5826,7 @@ MONITORING_FREESPIN_TRIGGER = _cfg_str("MONITORING_FREESPIN_TRIGGER", "/freespin
 MONITORING_FREESPIN9_TRIGGER = _cfg_str("MONITORING_FREESPIN9_TRIGGER", "/freespin9").strip()
 MONITORING_FREESPIN915_TRIGGER = _cfg_str("MONITORING_FREESPIN915_TRIGGER", "/freespin915").strip()
 MONITORING_FREESPIN930_TRIGGER = _cfg_str("MONITORING_FREESPIN930_TRIGGER", "/freespin930").strip()
+MONITORING_COREMETRICS_TRIGGER = _cfg_str("MONITORING_COREMETRICS_TRIGGER", "/coremetrics").strip()
 FREESPIN_DASHBOARD_PATH = _cfg_str(
     "FREESPIN_DASHBOARD_PATH",
     "/d/8345e1da-af7a-416f-90a2-0326a3a163d9/freespin-carnival-v2",
@@ -5860,6 +5863,13 @@ def _monitoring_freespin_demo_slot(clean: str) -> Optional[int]:
         if trig and _im_command_matches(clean or "", trig):
             return secs
     return None
+
+
+def _monitoring_im_matches_coremetrics_command(clean: str) -> bool:
+    """``/coremetrics`` — send the core-metrics whole-dashboard graph on demand (same as the 21:30 auto-send)."""
+    if not MONITORING_COREMETRICS_TRIGGER:
+        return False
+    return _im_command_matches(clean or "", MONITORING_COREMETRICS_TRIGGER)
 
 
 def _freespin_dashboard_url() -> str:
@@ -6049,6 +6059,27 @@ def _core_metrics_send_graph(receive_id_type: str, receive_id: str) -> None:
                 "core metrics card send failed — falling back to plain image", exc_info=True
             )
     _lark_send_image_message(receive_id_type, receive_id, key)
+
+
+def _monitoring_coremetrics_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
+    """On-demand ``/coremetrics``: send the core-metrics whole graph to the requesting chat (standalone)."""
+    try:
+        _set_reply_to_mid("")  # standalone card, matching the 21:30 auto-send format
+        rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
+        if not rv:
+            return
+        _core_metrics_send_graph(rt, rv)
+    except Exception:
+        logger.exception("coremetrics worker failed")
+        try:
+            _monitoring_deploy_send_ack(
+                chat_id, open_id, "**Core metrics graph failed** — see server logs."
+            )
+        except Exception:
+            logger.exception("coremetrics failure notify send failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
 
 
 def _freespin_daily_send_times() -> List[int]:
@@ -6256,6 +6287,7 @@ def _monitoring_at_mention_help_text() -> str:
         f"- `{c}` — clear all mutes\n"
         f"- `{fs}` — Freespin Carnival dashboard screenshot (last 30m)\n"
         f"- `{fs9}` / `{fs915}` / `{fs930}` — preview the daily 9pm / 9:15pm / 9:30pm Freespin send\n"
+        f"- `{(MONITORING_COREMETRICS_TRIGGER or '/coremetrics').strip()}` — send the core-metrics whole graph now (same as the 9:30 auto-send)\n"
         "- `track 2026-06-30 13:30` — why no alert at that time (admin)\n"
         "- `track login 2026-06-30 13:30` — one panel only"
     )
@@ -13783,6 +13815,38 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         return
 
+    if _monitoring_im_matches_coremetrics_command(clean or ""):
+        processed_cm = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        debounce_key_cm = f"{(chat_id or '').strip()}\n__coremetrics__"
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                logger.info("duplicate IM event_id=%s — skip (coremetrics)", im_event_id)
+                return
+            if processed_cm and processed_cm in _processed_lark_message_ids:
+                logger.info("duplicate coremetrics stick=%r — skip", processed_cm[:96])
+                return
+            if debounce_key_cm in _monitoring_inflight_keys:
+                logger.info("coremetrics skip — already in flight")
+                return
+            _monitoring_inflight_keys.add(debounce_key_cm)
+            if processed_cm:
+                _processed_lark_message_ids.add(processed_cm)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                    _processed_lark_im_event_ids.clear()
+                    _processed_lark_im_event_ids.add(im_event_id)
+        logger.info("coremetrics command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
+        _spawn_reacting_worker(
+            mid,
+            _monitoring_coremetrics_worker,
+            (chat_id, open_id, debounce_key_cm),
+            "coremetrics",
+        )
+        return
+
     if _monitoring_im_matches_freespin_command(clean or ""):
         processed_f = _monitoring_processed_stick(
             mid, im_event_id, chat_id or "", sender_debounce, msg_time
@@ -13827,6 +13891,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _monitoring_im_matches_track_command(clean or "")
         and not _monitoring_im_matches_freespin_command(clean or "")
         and _monitoring_freespin_demo_slot(clean or "") is None
+        and not _monitoring_im_matches_coremetrics_command(clean or "")
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
