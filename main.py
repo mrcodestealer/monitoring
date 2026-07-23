@@ -382,7 +382,10 @@ _CFG: Dict[str, Any] = {
     "MONITORING_AI_GATE_ENABLE": "1",
     "MONITORING_AI_OLLAMA_URL": "http://localhost:11434",
     "MONITORING_AI_MODEL": "qwen3.6:35b-a3b",
-    "MONITORING_AI_TIMEOUT_SECONDS": "120",
+    # 36B 视觉模型冷加载(~23GB) + 推理常超过 120s → ReadTimeout → fail-open「AI unavailable」。放宽到 300s。
+    "MONITORING_AI_TIMEOUT_SECONDS": "300",
+    # 让 Ollama 在每次判定后把模型常驻此时长（"30m"/"-1"=永久）；告警稀疏时避免每次都冷加载超时。
+    "MONITORING_AI_KEEP_ALIVE": "30m",
     # AI 不可达 / 无法判定时：1=照常发送（不漏报），0=抑制不发
     "MONITORING_AI_GATE_FAIL_OPEN": "1",
     # fail-open 时在正文末尾追加的说明（空=不追加）
@@ -12467,6 +12470,10 @@ def _monitoring_ai_abnormal_verdict(
         "messages": [{"role": "user", "content": prompt, "images": [b64]}],
         "options": {"temperature": 0},
     }
+    # Keep the (large) model resident between sporadic alerts so the next one isn't a cold load.
+    keep_alive = _cfg_str("MONITORING_AI_KEEP_ALIVE", "30m").strip()
+    if keep_alive:
+        body["keep_alive"] = keep_alive
     # Qwen3 reasoning models: prefer direct answer in ``content`` (not only ``thinking``).
     if "qwen3" in model.casefold():
         body["think"] = False
