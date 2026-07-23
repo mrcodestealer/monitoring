@@ -4236,8 +4236,11 @@ def _lark_send_text(receive_id_type: str, receive_id: str, text: str) -> None:
         )
 
 
-def _lark_add_message_reaction(message_id: str, emoji_type: str) -> None:
-    """Add one emoji reaction to a message via Open API (SDK client reuses its cached tenant token)."""
+def _lark_add_message_reaction(message_id: str, emoji_type: str) -> Optional[str]:
+    """
+    Add one emoji reaction to a message via Open API (SDK client reuses its cached tenant token).
+    Returns the created ``reaction_id`` (needed to remove it later) or ``None``.
+    """
     from lark_oapi.api.im.v1.model.create_message_reaction_request import CreateMessageReactionRequest
     from lark_oapi.api.im.v1.model.create_message_reaction_request_body import CreateMessageReactionRequestBody
     from lark_oapi.api.im.v1.model.emoji import Emoji
@@ -4245,7 +4248,7 @@ def _lark_add_message_reaction(message_id: str, emoji_type: str) -> None:
     mid = (message_id or "").strip()
     et = (emoji_type or "").strip()
     if not mid or not et:
-        return
+        return None
     client = _get_lark_oapi_client()
     body = (
         CreateMessageReactionRequestBody.builder()
@@ -4263,6 +4266,55 @@ def _lark_add_message_reaction(message_id: str, emoji_type: str) -> None:
         raise RuntimeError(
             f"Lark reaction failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
         )
+    data = getattr(resp, "data", None)
+    return getattr(data, "reaction_id", None) if data is not None else None
+
+
+def _lark_delete_message_reaction(message_id: str, reaction_id: str) -> None:
+    """Remove a previously-added reaction by its ``reaction_id`` (e.g. clear the 'OnIt' ack)."""
+    from lark_oapi.api.im.v1.model.delete_message_reaction_request import DeleteMessageReactionRequest
+
+    mid = (message_id or "").strip()
+    rid = (reaction_id or "").strip()
+    if not mid or not rid:
+        return
+    client = _get_lark_oapi_client()
+    req = (
+        DeleteMessageReactionRequest.builder()
+        .message_id(mid)
+        .reaction_id(rid)
+        .build()
+    )
+    resp = client.im.v1.message_reaction.delete(req)
+    if not resp.success():
+        raise RuntimeError(
+            f"Lark reaction delete failed: code={resp.code!r} msg={resp.msg!r} log_id={resp.get_log_id()!r}"
+        )
+
+
+def _lark_add_reaction_get_id(message_id: str, emoji_type: str) -> Optional[str]:
+    """Add a reaction and return its id; never raises. Off when MONITORING_REACT_ACK_ENABLE=0."""
+    if not MONITORING_REACT_ACK_ENABLE:
+        return None
+    try:
+        return _lark_add_message_reaction(message_id, emoji_type)
+    except Exception as e:
+        logger.warning(
+            "lark reaction %r failed (grant app scope im:message or im:message.reactions:write_only?): %s",
+            emoji_type,
+            e,
+        )
+        return None
+
+
+def _lark_delete_reaction_safe(message_id: str, reaction_id: str) -> None:
+    """Remove a reaction by id; never raises. No-op when the id is empty."""
+    if not (reaction_id or "").strip():
+        return
+    try:
+        _lark_delete_message_reaction(message_id, reaction_id)
+    except Exception as e:
+        logger.warning("lark reaction delete failed: %s", e)
 
 
 def _lark_react_safe(message_id: str, emoji_type: str) -> None:
@@ -4297,13 +4349,21 @@ def _spawn_reacting_worker(
     """
     def _wrapped() -> None:
         _set_reply_to_mid(message_id)
+        # React 'OnIt' while processing; on completion remove it and react 'DONE'. Adding it here
+        # (synchronously, first) keeps the ack→done flip atomic within this one thread so we always
+        # hold the reaction_id needed to delete it — no cross-thread race.
+        ack_rid: Optional[str] = None
+        if MONITORING_REACT_ACK_ENABLE:
+            ack_rid = _lark_add_reaction_get_id(message_id, MONITORING_REACT_GOTIT_EMOJI)
         try:
             target(*args)
         except Exception:
             logger.exception("command worker %r crashed", name)
         finally:
             _set_reply_to_mid("")
-            _lark_react_safe(message_id, MONITORING_REACT_DONE_EMOJI)
+            if MONITORING_REACT_ACK_ENABLE:
+                _lark_delete_reaction_safe(message_id, ack_rid or "")
+                _lark_react_safe(message_id, MONITORING_REACT_DONE_EMOJI)
 
     threading.Thread(target=_wrapped, daemon=True, name=name).start()
 
@@ -13444,7 +13504,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                     _processed_lark_im_event_ids.clear()
                     _processed_lark_im_event_ids.add(im_event_id)
         logger.info("%s command accepted chat=%r open=%r", sp_cmd, bool(chat_id), bool(open_id))
-        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
         if sp_cmd == "mute":
             _spawn_reacting_worker(
                 mid,
@@ -13512,7 +13571,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 _monitoring_inflight_keys.discard(debounce_key_d)
             return
         logger.info("deploy command accepted chat=%r open_id_prefix=%r", bool(chat_id), (open_id or "")[:12])
-        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
         if rv_d:
             try:
                 _monitoring_deploy_send_ack(
@@ -13573,7 +13631,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             with _monitoring_reply_dispatch_lock:
                 _monitoring_inflight_keys.discard(debounce_key_t)
             return
-        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
         if rv_t:
             try:
                 _monitoring_deploy_send_ack(
@@ -13615,7 +13672,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                     _processed_lark_im_event_ids.clear()
                     _processed_lark_im_event_ids.add(im_event_id)
         logger.info("freespin9 command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
-        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
         _spawn_reacting_worker(
             mid,
             _monitoring_freespin9_worker,
@@ -13648,7 +13704,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                     _processed_lark_im_event_ids.clear()
                     _processed_lark_im_event_ids.add(im_event_id)
         logger.info("freespin command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
-        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
         _spawn_reacting_worker(
             mid,
             _monitoring_freespin_worker,
@@ -13835,7 +13890,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 _processed_lark_im_event_ids.clear()
                 _processed_lark_im_event_ids.add(im_event_id)
 
-    _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
     _spawn_reacting_worker(
         mid,
         _run_monitoring_background_job,
