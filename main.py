@@ -416,6 +416,8 @@ _CFG: Dict[str, Any] = {
     # ---- /freespin：Freespin Carnival V2 dashboard 整页截图 + 每日定时自动发送 ----
     "MONITORING_FREESPIN_ENABLE": "1",
     "MONITORING_FREESPIN_TRIGGER": "/freespin",
+    # 手动预览每日 9pm 定时发送（合并卡片：9pm 文案 + 截图，与 21:00 那条一模一样）
+    "MONITORING_FREESPIN9_TRIGGER": "/freespin9",
     "FREESPIN_DASHBOARD_PATH": "/d/8345e1da-af7a-416f-90a2-0326a3a163d9/freespin-carnival-v2",
     "FREESPIN_DASHBOARD_FROM": "now-30m",
     "FREESPIN_DASHBOARD_TO": "now",
@@ -5749,6 +5751,7 @@ def _monitoring_track_worker(
 
 
 MONITORING_FREESPIN_TRIGGER = _cfg_str("MONITORING_FREESPIN_TRIGGER", "/freespin").strip()
+MONITORING_FREESPIN9_TRIGGER = _cfg_str("MONITORING_FREESPIN9_TRIGGER", "/freespin9").strip()
 FREESPIN_DASHBOARD_PATH = _cfg_str(
     "FREESPIN_DASHBOARD_PATH",
     "/d/8345e1da-af7a-416f-90a2-0326a3a163d9/freespin-carnival-v2",
@@ -5765,6 +5768,15 @@ def _monitoring_im_matches_freespin_command(clean: str) -> bool:
     if not _lark_env_truthy("MONITORING_FREESPIN_ENABLE"):
         return False
     return _im_command_matches(clean or "", MONITORING_FREESPIN_TRIGGER)
+
+
+def _monitoring_im_matches_freespin9_command(clean: str) -> bool:
+    """``/freespin9`` — on-demand preview of the daily 9pm send (combined caption + screenshot card)."""
+    if not _lark_env_truthy("MONITORING_FREESPIN_ENABLE"):
+        return False
+    if not MONITORING_FREESPIN9_TRIGGER:
+        return False
+    return _im_command_matches(clean or "", MONITORING_FREESPIN9_TRIGGER)
 
 
 def _freespin_dashboard_url() -> str:
@@ -5868,6 +5880,29 @@ def _monitoring_freespin_worker(chat_id: str, open_id: str, debounce_key: str) -
             )
         except Exception:
             logger.exception("freespin failure notify send failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _monitoring_freespin9_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
+    """Preview the daily 9pm send: same combined card (9pm caption + screenshot) the 21:00 slot posts."""
+    try:
+        rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
+        if not rv:
+            return
+        note = _cfg_str("FREESPIN_DAILY_MESSAGE", "").strip()
+        if note:
+            note = note.replace("{time}", _freespin_slot_display_12h(21 * 3600))  # 21:00 → "9pm"
+        _freespin_send_combined_card(rt, rv, note)
+    except Exception:
+        logger.exception("freespin9 worker failed")
+        try:
+            _monitoring_deploy_send_ack(
+                chat_id, open_id, "**Freespin 9pm demo failed** — see server logs."
+            )
+        except Exception:
+            logger.exception("freespin9 failure notify send failed")
     finally:
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
@@ -6049,6 +6084,7 @@ def _monitoring_at_mention_help_text() -> str:
     m = (MONITORING_MUTE_TRIGGER or "/m").strip()
     c = (MONITORING_CANCELMUTE_TRIGGER or "/c").strip()
     fs = (MONITORING_FREESPIN_TRIGGER or "/freespin").strip()
+    fs9 = (MONITORING_FREESPIN9_TRIGGER or "/freespin9").strip()
     return (
         "Commands:\n"
         f"- `{mo}` — Grafana monitoring summary (all graphs)\n"
@@ -6056,6 +6092,7 @@ def _monitoring_at_mention_help_text() -> str:
         f"- `{m}` — mute alerts (interactive card)\n"
         f"- `{c}` — clear all mutes\n"
         f"- `{fs}` — Freespin Carnival dashboard screenshot (last 30m)\n"
+        f"- `{fs9}` — preview the daily 9pm Freespin send (caption + screenshot card)\n"
         "- `track 2026-06-30 13:30` — why no alert at that time (admin)\n"
         "- `track login 2026-06-30 13:30` — one panel only"
     )
@@ -13554,6 +13591,39 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         return
 
+    if _monitoring_im_matches_freespin9_command(clean or ""):
+        processed_f9 = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        debounce_key_f9 = f"{(chat_id or '').strip()}\n__freespin9__"
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                logger.info("duplicate IM event_id=%s — skip (freespin9)", im_event_id)
+                return
+            if processed_f9 and processed_f9 in _processed_lark_message_ids:
+                logger.info("duplicate freespin9 stick=%r — skip", processed_f9[:96])
+                return
+            if debounce_key_f9 in _monitoring_inflight_keys:
+                logger.info("freespin9 skip — already in flight")
+                return
+            _monitoring_inflight_keys.add(debounce_key_f9)
+            if processed_f9:
+                _processed_lark_message_ids.add(processed_f9)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                    _processed_lark_im_event_ids.clear()
+                    _processed_lark_im_event_ids.add(im_event_id)
+        logger.info("freespin9 command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
+        _lark_react_safe(mid, MONITORING_REACT_GOTIT_EMOJI)
+        _spawn_reacting_worker(
+            mid,
+            _monitoring_freespin9_worker,
+            (chat_id, open_id, debounce_key_f9),
+            "freespin9-demo",
+        )
+        return
+
     if _monitoring_im_matches_freespin_command(clean or ""):
         processed_f = _monitoring_processed_stick(
             mid, im_event_id, chat_id or "", sender_debounce, msg_time
@@ -13598,6 +13668,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _monitoring_im_is_deploy_command(raw_text or "", clean or "")
         and not _monitoring_im_matches_track_command(clean or "")
         and not _monitoring_im_matches_freespin_command(clean or "")
+        and not _monitoring_im_matches_freespin9_command(clean or "")
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
