@@ -5804,6 +5804,56 @@ def _freespin_send_screenshot(receive_id_type: str, receive_id: str) -> None:
     _lark_send_image_message(receive_id_type, receive_id, key)
 
 
+def _freespin_card_dict(note: str, img_key: str) -> Dict[str, Any]:
+    """Single card carrying the daily caption + the freespin screenshot (so they arrive together)."""
+    elements: List[Dict[str, Any]] = []
+    n = (note or "").strip()
+    if n:
+        elements.append({"tag": "markdown", "content": n})
+    ik = (img_key or "").strip()
+    if ik:
+        elements.append(
+            {"tag": "img", "img_key": ik, "alt": {"tag": "plain_text", "content": "Freespin"}}
+        )
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "turquoise",
+            "title": {"tag": "plain_text", "content": "🎰 Free Spin Carnival"[:190]},
+        },
+        "body": {"elements": elements},
+    }
+
+
+def _freespin_send_combined_card(receive_id_type: str, receive_id: str, note: str) -> None:
+    """
+    Render the dashboard once, then post the caption + screenshot as a SINGLE interactive card so
+    they arrive together (no ~30s window where only the caption text shows). Falls back to separate
+    text + image (reusing the already-rendered PNG) if the card can't be sent — e.g. the app lacks
+    the "Send message cards" permission.
+    """
+    png = _freespin_screenshot_png()
+    key = _lark_upload_png_image_key(png)
+    n = (note or "").strip()
+    if MONITORING_MESSAGE_CARD_ENABLE:
+        try:
+            _lark_send_interactive_card(receive_id_type, receive_id, _freespin_card_dict(n, key))
+            return
+        except Exception:
+            logger.warning(
+                'freespin combined card send failed — falling back to text + image; check app '
+                'permission "Send message cards".',
+                exc_info=True,
+            )
+    if n:
+        try:
+            _lark_send_text(receive_id_type, receive_id, n)
+        except Exception:
+            logger.exception("freespin note send failed — still sending screenshot")
+    _lark_send_image_message(receive_id_type, receive_id, key)
+
+
 def _monitoring_freespin_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
     try:
         rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
@@ -5945,11 +5995,7 @@ def _freespin_daily_sender_loop() -> None:
             note = _cfg_str("FREESPIN_DAILY_MESSAGE", "").strip()
             if note:
                 note = note.replace("{time}", _freespin_slot_display_12h(due_t))
-                try:
-                    _lark_send_text("chat_id", chat, note)
-                except Exception:
-                    logger.exception("freespin daily note send failed — still sending screenshot")
-            _freespin_send_screenshot("chat_id", chat)
+            _freespin_send_combined_card("chat_id", chat, note)
             logger.info(
                 "freespin daily screenshot sent slot=%02d:%02d note=%s chat_prefix=%s...",
                 due_t // 3600,
