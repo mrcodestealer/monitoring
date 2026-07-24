@@ -12619,7 +12619,10 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
         elif k == "provider_url_err":
             a2 = _analysis_for_provider_url_err_payload(p2)
             title = GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR
-            series = f"all URL series ({len(a2.get('series_entries') or [])})"
+            series = (
+                f"URL series with error samples in window "
+                f"({len(a2.get('series_entries') or [])})"
+            )
             extra_footer = _format_provider_url_err_extra_analysis_lines(a2)
         elif k == "provider_jili":
             a2 = _analysis_for_provider_jili_payload(p2)
@@ -12659,10 +12662,11 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             err_entries = [
                 e for e in (a2.get("series_entries") or []) if isinstance(e, dict)
             ]
-            if k == "error_req_1m" and _error_req_all_series_mode():
+            if (k == "error_req_1m" and _error_req_all_series_mode()) or k == "provider_url_err":
                 lines.append(
-                    "  (Prometheus omits endpoints with no error samples in the "
-                    "query window — Grafana may list more legends)"
+                    "  (Prometheus omits series with no error samples in the "
+                    "query window — Grafana may list more legends; a missing series "
+                    "is at 0 and still auto-appears once it errors)"
                 )
             compact_tables = len(err_entries) > 8
             if compact_tables:
