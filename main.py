@@ -124,6 +124,12 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ERROR_REQ_SERIES_A_LABEL": "RedeemPlayerLuckyCoins",
     "MONITORING_ERROR_REQ_SERIES_B": "igo-sw-http-main-apisix-pp|POST /refund",
     "MONITORING_ERROR_REQ_SERIES_B_LABEL": "POST /refund",
+    # ---- Provider URL ERROR Request Count (Status NOT 200)：任一 series 任一分钟桶 > 阈值即告警（按 series 静音） ----
+    "GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR": "Provider URL ERROR Request Count (Status NOT 200)",
+    # 任一 series 数值超过该值（严格大于）即触发
+    "MONITORING_PROVIDER_URL_ERR_MAX_VALUE": "40",
+    # 排除的 series（逗号/分号分隔子串，命中任一即忽略该 series；空=全部监控）
+    "MONITORING_PROVIDER_URL_ERR_EXCLUDE": "",
     "GRAFANA_PANEL_TITLE_PROVIDER_JILI": "IGO Distributions of Providers JILI",
     "MONITORING_PROVIDER_JILI_SERIES_KEYWORD": "3201",
     "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL": "IGO Distributions of Providers GENERAL",
@@ -328,6 +334,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ERROR_REQ_ENABLE": "1",
     "MONITORING_ERROR_REQ_ALERT_PCT": 50,
     "MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT": 80,
+    "MONITORING_PROVIDER_URL_ERR_ENABLE": "1",
     "MONITORING_PROVIDER_JILI_ENABLE": "1",
     "MONITORING_PROVIDER_JILI_ALERT_PCT": 25,
     "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 25,
@@ -901,6 +908,53 @@ def _error_req_series_labels_summary(
         return f"all panel series (excluding {ex})"
     labels = [lbl for lbl, _ in _error_req_series_specs()]
     return " + ".join(labels) if labels else "—"
+
+
+# ---- Provider URL ERROR Request Count (Status NOT 200): per-series absolute max threshold ----
+GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR = _cfg_str(
+    "GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR",
+    "Provider URL ERROR Request Count (Status NOT 200)",
+)
+MONITORING_PROVIDER_URL_ERR_MAX_VALUE = max(
+    0.0, _cfg_float("MONITORING_PROVIDER_URL_ERR_MAX_VALUE", 40.0)
+)
+
+
+def _provider_url_err_exclude_parts() -> List[str]:
+    """Substrings from ``MONITORING_PROVIDER_URL_ERR_EXCLUDE`` — a series is skipped when ANY matches."""
+    raw = (_cfg_str("MONITORING_PROVIDER_URL_ERR_EXCLUDE", "") or "").strip()
+    return [p.strip() for p in re.split(r"[,;]+", raw) if p.strip()]
+
+
+def _enumerate_provider_url_err_series(
+    payload: Dict[str, Any],
+) -> List[Tuple[str, List[Tuple[float, float]]]]:
+    """Every distinct series on the panel payload (URL legends), minus excludes; duplicate rows sum by ts."""
+    excludes = _provider_url_err_exclude_parts()
+    by_label: Dict[str, Dict[float, float]] = {}
+    for s in payload.get("series") or []:
+        lg = str(s.get("legendFormat") or "")
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            metric = r.get("metric") or {}
+            md = metric if isinstance(metric, dict) else {}
+            blob = _series_label_blob(lg, md)
+            if excludes and any(p.casefold() in blob.casefold() for p in excludes):
+                continue
+            pts_row = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
+            if not pts_row:
+                continue
+            label = _grafana_resolve_series_legend_label(lg, md) or "series"
+            acc = by_label.setdefault(label, {})
+            for ts, val in pts_row:
+                acc[ts] = acc.get(ts, 0.0) + val
+    out: List[Tuple[str, List[Tuple[float, float]]]] = []
+    for lbl, acc in sorted(by_label.items(), key=lambda x: x[0].casefold()):
+        out.append((lbl, sorted(acc.items(), key=lambda x: x[0])))
+    return out
+
+
 GRAFANA_PANEL_TITLE_PROVIDER_JILI = _cfg_str(
     "GRAFANA_PANEL_TITLE_PROVIDER_JILI", "IGO Distributions of Providers JILI"
 )
@@ -1961,6 +2015,8 @@ def _monitoring_enabled_panel_catalog() -> List[Dict[str, str]]:
         out.append({"kind": "fpms_nt_login", "title": GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN})
     if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
         out.append({"kind": "error_req_1m", "title": GRAFANA_PANEL_TITLE_ERROR_REQ})
+    if _lark_env_truthy("MONITORING_PROVIDER_URL_ERR_ENABLE"):
+        out.append({"kind": "provider_url_err", "title": GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR})
     if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
         out.append({"kind": "provider_jili", "title": GRAFANA_PANEL_TITLE_PROVIDER_JILI})
     if _lark_env_truthy("MONITORING_PROVIDER_GENERAL_ENABLE"):
@@ -4076,6 +4132,17 @@ def fetch_monitoring_payload(
             extra.append({"kind": "error_req_1m", "payload": pe})
         except Exception:
             logger.exception("fetch error-req panel failed (optional monitor)")
+    if _lark_env_truthy("MONITORING_PROVIDER_URL_ERR_ENABLE"):
+        try:
+            pue = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": "provider_url_err", "payload": pue})
+        except Exception:
+            logger.exception("fetch provider-url-err panel failed (optional monitor)")
     if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
         try:
             ppj = _fetch_panel_series_by_title(
@@ -4708,6 +4775,8 @@ def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
         out.append(("fpms_nt_login", f"Login · {GRAFANA_PANEL_TITLE_FPMS_NT_LOGIN}"))
     if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
         out.append(("error_req_1m", f"Error req · {GRAFANA_PANEL_TITLE_ERROR_REQ}"))
+    if _lark_env_truthy("MONITORING_PROVIDER_URL_ERR_ENABLE"):
+        out.append(("provider_url_err", f"URL err · {GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR}"))
     if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
         out.append(("provider_jili", f"Provider JILI"))
     if _lark_env_truthy("MONITORING_PROVIDER_GENERAL_ENABLE"):
@@ -5022,11 +5091,13 @@ def _mute_series_capable_channels() -> List[Tuple[str, str]]:
     """
     (channel_id, display_label) for graphs that alert **per series** (so muting one line
     while others keep alerting is meaningful). Other graphs alert as one aggregate line —
-    use whole-graph mute for those. Currently only ``错误请求数/1m``.
+    use whole-graph mute for those. Currently ``错误请求数/1m`` and ``Provider URL ERROR``.
     """
     out: List[Tuple[str, str]] = []
     if _lark_env_truthy("MONITORING_ERROR_REQ_ENABLE"):
         out.append(("error_req_1m", f"Error req · {GRAFANA_PANEL_TITLE_ERROR_REQ}"))
+    if _lark_env_truthy("MONITORING_PROVIDER_URL_ERR_ENABLE"):
+        out.append(("provider_url_err", f"URL err · {GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR}"))
     return out
 
 
@@ -5040,12 +5111,17 @@ def _mute_alerting_series_for_kind(kind: str, payload: Dict[str, Any]) -> List[s
     muted. Empty for non per-series graphs. ``payload`` is a full monitoring payload.
     """
     k = (kind or "").strip()
-    if k != "error_req_1m" or not isinstance(payload, dict):
+    _series_analyzers: Dict[str, Any] = {
+        "error_req_1m": _analysis_for_error_req_payload,
+        "provider_url_err": _analysis_for_provider_url_err_payload,
+    }
+    analyzer = _series_analyzers.get(k)
+    if analyzer is None or not isinstance(payload, dict):
         return []
     p2 = _panel_payload_for_monitor_kind(payload, k)
     if not isinstance(p2, dict):
         return []
-    analysis = _analysis_for_error_req_payload(p2)
+    analysis = analyzer(p2)
     out: List[str] = []
     seen: Set[str] = set()
     for ent in analysis.get("series_entries") or []:
@@ -5530,6 +5606,8 @@ _TRACK_PANEL_ALIASES: Dict[str, str] = {
     "withdraw": "withdraw",
     "9280": "9280_push",
     "error": "error_req_1m",
+    "urlerr": "provider_url_err",
+    "providerurl": "provider_url_err",
 }
 
 
@@ -5651,6 +5729,16 @@ def _monitoring_track_panel_specs() -> List[Tuple[str, str, Any, float, bool]]:
                 GRAFANA_PANEL_TITLE_ERROR_REQ,
                 _analysis_for_error_req_payload,
                 float(MONITORING_ERROR_REQ_MIN_SPIKE_VALUE),
+                False,
+            )
+        )
+    if _lark_env_truthy("MONITORING_PROVIDER_URL_ERR_ENABLE"):
+        specs.append(
+            (
+                "provider_url_err",
+                GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR,
+                _analysis_for_provider_url_err_payload,
+                float(MONITORING_PROVIDER_URL_ERR_MAX_VALUE),
                 False,
             )
         )
@@ -7946,6 +8034,14 @@ def _monitoring_alert_panel_titles(payload: Optional[Dict[str, Any]]) -> List[st
             _analysis_for_error_req_payload,
             MONITORING_ERROR_REQ_ALERT_PCT,
             MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT,
+        ),
+        (
+            "provider_url_err",
+            GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR,
+            "any URL series",
+            _analysis_for_provider_url_err_payload,
+            MONITORING_PROVIDER_URL_ERR_MAX_VALUE,
+            MONITORING_PROVIDER_URL_ERR_MAX_VALUE,
         ),
         (
             "provider_jili",
@@ -11760,6 +11856,112 @@ def _format_error_req_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str
     return lines
 
 
+def _analysis_for_provider_url_err_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ``Provider URL ERROR Request Count (Status NOT 200)``: alert when **any** series has a minute
+    bucket **strictly above** ``MONITORING_PROVIDER_URL_ERR_MAX_VALUE`` (default 40). Per-series
+    mute (/m → 🎯) removes a muted series from hit_alert / alert text.
+    """
+    thr = float(MONITORING_PROVIDER_URL_ERR_MAX_VALUE)
+    entries: List[Dict[str, Any]] = []
+    total_pts = 0
+    merged_all: List[List[Any]] = []
+    for lbl, raw_pts in _enumerate_provider_url_err_series(payload):
+        pts = _snap_series_to_monitoring_minutes(raw_pts, how="max")
+        pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
+        peak: Optional[Dict[str, Any]] = None
+        for t, v in pts:
+            fv = float(v)
+            if fv > thr and (peak is None or fv > float(peak["val"])):
+                peak = {"ts": float(t), "val": fv}
+        a: Dict[str, Any] = {
+            "point_count": len(pts),
+            "merged_points": [[t, v] for t, v in pts],
+            "label": lbl,
+            "alert_rule": "absolute_value",
+            "max_value_threshold": thr,
+            "peak": peak,
+            "hit_alert": peak is not None,
+        }
+        entries.append({
+            "label": lbl,
+            "spiked": peak is not None,
+            "threshold": thr,
+            "analysis": a,
+        })
+        total_pts += len(pts)
+        merged_all.extend(a["merged_points"])
+    for _e in entries:
+        if _e.get("spiked") and _monitoring_alert_series_muted(
+            "provider_url_err", str(_e.get("label") or "")
+        ):
+            _e["spiked"] = False
+            _e["muted"] = True
+    return {
+        "pointCount": total_pts,
+        "point_count": total_pts,
+        "hit_alert": any(bool(e.get("spiked")) for e in entries),
+        "alert_rule": "absolute_value_per_series",
+        "threshold_pct": thr,
+        "fast_threshold_pct": thr,
+        "continuous_threshold_pct": thr,
+        "max_value_threshold": thr,
+        "series_entries": entries,
+        "merged_points": merged_all,
+        "baseline_median": None,
+        "consecutive_max_drop": None,
+        "consecutive_max_spike": None,
+        "window_max_drop": None,
+        "window_max_spike": None,
+    }
+
+
+def _format_provider_url_err_trigger_lines(analysis: Dict[str, Any]) -> List[str]:
+    """One 📈 alert block per spiked series: peak value vs the absolute threshold."""
+    if not bool(analysis.get("hit_alert")):
+        return []
+    thr = float(analysis.get("max_value_threshold") or MONITORING_PROVIDER_URL_ERR_MAX_VALUE)
+    blocks: List[str] = []
+    for ent in analysis.get("series_entries") or []:
+        if not (isinstance(ent, dict) and ent.get("spiked")):
+            continue
+        sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
+        peak = sub.get("peak") if isinstance(sub.get("peak"), dict) else {}
+        lbl = str(ent.get("label") or sub.get("label") or "series")
+        blocks.append(
+            f"📈 {GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR} — {lbl} ERROR SPIKE\n"
+            f"{_fmt_ts_short(peak.get('ts'))} value of {_fmt_num(peak.get('val'))} "
+            f"exceeds threshold {thr:g}"
+        )
+    return blocks
+
+
+def _format_provider_url_err_extra_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
+    if MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS:
+        return []
+    thr = float(analysis.get("max_value_threshold") or MONITORING_PROVIDER_URL_ERR_MAX_VALUE)
+    entries = [e for e in (analysis.get("series_entries") or []) if isinstance(e, dict)]
+    lines: List[str] = [
+        "",
+        f"[Provider URL err] alert when ANY series minute bucket exceeds {thr:g} "
+        f"(status != 200 request count)",
+    ]
+    if entries:
+        spiked_n = sum(1 for e in entries if e.get("spiked"))
+        lines.append(
+            f"  {len(entries)} series monitored ({spiked_n} spiked, {len(entries) - spiked_n} quiet)"
+        )
+    for ent in entries:
+        if not ent.get("spiked"):
+            continue
+        sub = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
+        peak = sub.get("peak") if isinstance(sub.get("peak"), dict) else {}
+        lines.append(
+            f"  {ent.get('label')}: peak {_fmt_num(peak.get('val'))} @ {_fmt_ts_short(peak.get('ts'))}"
+        )
+    return lines
+
+
 def _analysis_for_keyword_payload(
     payload: Dict[str, Any], keyword: str, fast_threshold_pct: float, continuous_threshold_pct: float
 ) -> Dict[str, Any]:
@@ -12123,6 +12325,12 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 a2 = _analysis_for_error_req_payload(p2)
                 fast2 = MONITORING_ERROR_REQ_ALERT_PCT
                 cont2 = MONITORING_ERROR_REQ_CONTINUOUS_ALERT_PCT
+            elif kind == "provider_url_err":
+                g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR
+                s_lbl = "any URL series"
+                a2 = _analysis_for_provider_url_err_payload(p2)
+                fast2 = MONITORING_PROVIDER_URL_ERR_MAX_VALUE
+                cont2 = MONITORING_PROVIDER_URL_ERR_MAX_VALUE
             elif kind == "provider_jili":
                 g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_JILI
                 s_lbl = MONITORING_PROVIDER_JILI_SERIES_KEYWORD
@@ -12176,6 +12384,8 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                     )
                     if fb2:
                         reasons2.append(fb2)
+            elif kind == "provider_url_err":
+                reasons2 = _format_provider_url_err_trigger_lines(a2)
             else:
                 reasons2 = _format_trigger_lines(
                     g_lbl,
@@ -12239,6 +12449,10 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
             return True
         if k == "error_req_1m" and bool(_analysis_for_error_req_payload(p2).get("hit_alert")):
             return True
+        if k == "provider_url_err" and bool(
+            _analysis_for_provider_url_err_payload(p2).get("hit_alert")
+        ):
+            return True
         if k == "provider_jili" and bool(_analysis_for_provider_jili_payload(p2).get("hit_alert")):
             return True
         if k == "provider_general" and bool(_analysis_for_provider_general_payload(p2).get("hit_alert")):
@@ -12260,6 +12474,7 @@ _MONITORING_EXTRA_PANEL_ANALYZERS: Dict[str, Any] = {
     "withdraw": _analysis_for_withdraw_payload,
     "fpms_nt_login": _analysis_for_fpms_nt_login_payload,
     "error_req_1m": _analysis_for_error_req_payload,
+    "provider_url_err": _analysis_for_provider_url_err_payload,
     "provider_jili": _analysis_for_provider_jili_payload,
     "provider_general": _analysis_for_provider_general_payload,
     "provider_inhouse": _analysis_for_provider_inhouse_payload,
@@ -12401,6 +12616,11 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             title = GRAFANA_PANEL_TITLE_ERROR_REQ
             series = _error_req_series_labels_summary(analysis=a2)
             extra_footer = _format_error_req_extra_analysis_lines(a2)
+        elif k == "provider_url_err":
+            a2 = _analysis_for_provider_url_err_payload(p2)
+            title = GRAFANA_PANEL_TITLE_PROVIDER_URL_ERR
+            series = f"all URL series ({len(a2.get('series_entries') or [])})"
+            extra_footer = _format_provider_url_err_extra_analysis_lines(a2)
         elif k == "provider_jili":
             a2 = _analysis_for_provider_jili_payload(p2)
             title = GRAFANA_PANEL_TITLE_PROVIDER_JILI
@@ -12435,11 +12655,11 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             continue
         lines.append("")
         lines.append(f"[{title}] series: {series}")
-        if k == "error_req_1m":
+        if k in ("error_req_1m", "provider_url_err"):
             err_entries = [
                 e for e in (a2.get("series_entries") or []) if isinstance(e, dict)
             ]
-            if _error_req_all_series_mode():
+            if k == "error_req_1m" and _error_req_all_series_mode():
                 lines.append(
                     "  (Prometheus omits endpoints with no error samples in the "
                     "query window — Grafana may list more legends)"
