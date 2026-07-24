@@ -444,8 +444,8 @@ _CFG: Dict[str, Any] = {
     "FREESPIN_BOOT_WARM": "1",
     # 每日自动发送前 N 秒先预热渲染一次（0=关；让 21:00 等时点的截图更快、更准点）
     "FREESPIN_DAILY_PREWARM_SECONDS": "180",
-    # 最后一个 freespin 时点（默认 21:30）发完后，紧接着自动发一张 core-metrics 主看板整图到同一群。
-    "FREESPIN_CORE_METRICS_AFTER_LAST_ENABLE": "1",
+    # 每个 freespin 时点（9:00/9:15/9:30）发完后，紧接着自动发一张 core-metrics 主看板整图到同一群。
+    "FREESPIN_CORE_METRICS_ENABLE": "1",
     "FREESPIN_CORE_METRICS_TITLE": "📊 Core Metrics",
     # core-metrics 整图时间范围（空 = 用 GRAFANA_DASHBOARD_FROM/TO）
     "FREESPIN_CORE_METRICS_FROM": "now-2h",
@@ -6029,8 +6029,8 @@ def _monitoring_freespin_slot_worker(
         if note:
             note = note.replace("{time}", slot_label)
         _freespin_send_combined_card(rt, rv, note, time_label=slot_label)
-        # Faithfully mirror the auto-send: the LAST slot (9:30) also posts the core-metrics graph.
-        _freespin_send_core_metrics_if_last_slot(int(slot_seconds), rt, rv)
+        # Faithfully mirror the auto-send: every slot also posts the core-metrics graph.
+        _freespin_send_core_metrics_after_slot(int(slot_seconds), rt, rv)
     except Exception:
         logger.exception("freespin demo worker failed (slot_seconds=%s)", slot_seconds)
         try:
@@ -6079,28 +6079,25 @@ def _core_metrics_send_graph(receive_id_type: str, receive_id: str) -> None:
     _lark_send_image_message(receive_id_type, receive_id, key)
 
 
-def _freespin_send_core_metrics_if_last_slot(
+def _freespin_send_core_metrics_after_slot(
     slot_seconds: int, receive_id_type: str, receive_id: str
 ) -> None:
     """
-    After the LAST freespin slot (default 21:30), also post the core-metrics whole graph.
-    Shared by the daily auto-send and the ``/freespin930`` demo so both behave identically.
+    After EACH freespin slot (9:00 / 9:15 / 9:30), also post the core-metrics whole graph.
+    Shared by the daily auto-send and the ``/freespin9|915|930`` demos so both behave identically.
     """
-    send_times = _freespin_daily_send_times()
-    if not (send_times and int(slot_seconds) == max(send_times)):
-        return
-    if not _lark_env_truthy("FREESPIN_CORE_METRICS_AFTER_LAST_ENABLE"):
+    if not _lark_env_truthy("FREESPIN_CORE_METRICS_ENABLE"):
         return
     try:
         _core_metrics_send_graph(receive_id_type, receive_id)
         logger.info(
-            "core metrics graph sent after last freespin slot=%02d:%02d chat_prefix=%s...",
+            "core metrics graph sent after freespin slot=%02d:%02d chat_prefix=%s...",
             int(slot_seconds) // 3600,
             int(slot_seconds) // 60 % 60,
             (receive_id or "")[:16],
         )
     except Exception:
-        logger.exception("core metrics graph send (after last freespin slot) failed")
+        logger.exception("core metrics graph send (after freespin slot) failed")
 
 
 def _monitoring_coremetrics_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
@@ -6255,8 +6252,8 @@ def _freespin_daily_sender_loop() -> None:
                 bool(note),
                 chat[:16],
             )
-            # After the LAST freespin slot (default 21:30), also post the core-metrics whole graph.
-            _freespin_send_core_metrics_if_last_slot(due_t, "chat_id", chat)
+            # After each freespin slot, also post the core-metrics whole graph.
+            _freespin_send_core_metrics_after_slot(due_t, "chat_id", chat)
         except Exception:
             logger.exception("freespin daily send cycle failed")
             time.sleep(30.0)
