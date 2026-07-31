@@ -395,13 +395,19 @@ _CFG: Dict[str, Any] = {
     # ---- AI 异常二次确认（本地 Ollama 视觉模型）----
     # 阈值触发后，先把截图发给本地 Ollama 模型判断是否「真异常」；仅当判为异常才发群，并在正文追加 AI 说明
     # 0=完全停用（不再调用 Ollama/qwen，正文也不再出现「AI review unavailable」提示）；阈值判定照常告警。
-    "MONITORING_AI_GATE_ENABLE": "0",
+    "MONITORING_AI_GATE_ENABLE": "1",
     "MONITORING_AI_OLLAMA_URL": "http://localhost:11434",
     "MONITORING_AI_MODEL": "qwen3.6:35b-a3b",
     # 36B 视觉模型冷加载(~23GB) + 推理常超过 120s → ReadTimeout → fail-open「AI unavailable」。放宽到 300s。
     "MONITORING_AI_TIMEOUT_SECONDS": "300",
     # 让 Ollama 在每次判定后把模型常驻此时长（"30m"/"-1"=永久）；告警稀疏时避免每次都冷加载超时。
     "MONITORING_AI_KEEP_ALIVE": "30m",
+    # 启动时 + 每隔 N 秒空跑一次 /api/chat 把模型预加载并续期常驻（0=关）。
+    # 告警很稀疏时 keep_alive 会过期 → 下次告警又是 23GB 冷加载 → 超时 → 「AI review unavailable」。
+    "MONITORING_AI_WARM_ENABLE": "1",
+    "MONITORING_AI_WARM_INTERVAL_SECONDS": "1200",
+    # fail-open 提示里附带具体原因（no screenshot / model timeout / ollama unreachable …）
+    "MONITORING_AI_FAIL_NOTE_SHOW_REASON": "1",
     # AI 不可达 / 无法判定时：1=照常发送（不漏报），0=抑制不发
     "MONITORING_AI_GATE_FAIL_OPEN": "1",
     # fail-open 时在正文末尾追加的说明（空=不追加）
@@ -13040,13 +13046,15 @@ def _monitoring_ai_parse_verdict(raw: str) -> Tuple[Optional[bool], str]:
 
 def _monitoring_ai_abnormal_verdict(
     png_bytes: bytes, alert_text: str
-) -> Tuple[Optional[bool], str]:
+) -> Tuple[Optional[bool], str, str]:
     """
     Ask the local Ollama model whether a Grafana alert screenshot shows a genuine
     abnormality worth paging the group.
 
-    Returns ``(is_abnormal, explanation)``. ``is_abnormal`` is ``None`` when the AI
-    could not be reached / its answer could not be parsed (caller decides fail-open).
+    Returns ``(is_abnormal, explanation, fail_reason)``. ``is_abnormal`` is ``None`` when the AI
+    could not be reached / its answer could not be parsed (caller decides fail-open); ``fail_reason``
+    is a short human tag (``model timeout after 300s``, ``empty response``, …) surfaced in the alert
+    so the cause is visible without digging through logs.
     """
     import base64
 
@@ -13091,34 +13099,59 @@ def _monitoring_ai_abnormal_verdict(
     # Qwen3 reasoning models: prefer direct answer in ``content`` (not only ``thinking``).
     if "qwen3" in model.casefold():
         body["think"] = False
+    t0 = time.monotonic()
     try:
         r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
         r.raise_for_status()
         data = r.json()
-    except Exception:
-        logger.exception(
-            "monitoring AI gate: Ollama request failed (model=%s url=%s)", model, url
+    except Exception as e:
+        took = time.monotonic() - t0
+        etype = type(e).__name__
+        code = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
+        if "Timeout" in etype:
+            reason = f"model timeout after {took:.0f}s (limit {timeout:.0f}s)"
+        elif code:
+            reason = f"ollama HTTP {code}"
+        elif "ConnectionError" in etype:
+            reason = "ollama unreachable"
+        else:
+            reason = f"{etype}"
+        logger.error(
+            "monitoring AI gate: Ollama request failed after %.1fs — %s (model=%s url=%s): %r",
+            took,
+            reason,
+            model,
+            url,
+            e,
         )
-        return None, ""
+        return None, "", reason
 
+    took = time.monotonic() - t0
     raw = _monitoring_ai_extract_ollama_text(data)
     if not raw:
-        logger.warning("monitoring AI gate: empty response from model=%s payload=%r", model, data)
-        return None, ""
+        logger.warning(
+            "monitoring AI gate: empty response after %.1fs from model=%s payload=%r",
+            took,
+            model,
+            data,
+        )
+        return None, "", "empty model response"
 
     verdict, explanation = _monitoring_ai_parse_verdict(raw)
     if verdict is None:
         logger.warning(
-            "monitoring AI gate: could not parse verdict from response=%r",
+            "monitoring AI gate: could not parse verdict after %.1fs from response=%r",
+            took,
             raw[:300],
         )
-    else:
-        logger.info(
-            "monitoring AI gate: parsed verdict=%s explanation_len=%s",
-            "ABNORMAL" if verdict else "NORMAL",
-            len(explanation or ""),
-        )
-    return verdict, explanation
+        return None, explanation, "unreadable verdict"
+    logger.info(
+        "monitoring AI gate: parsed verdict=%s in %.1fs explanation_len=%s",
+        "ABNORMAL" if verdict else "NORMAL",
+        took,
+        len(explanation or ""),
+    )
+    return verdict, explanation, ""
 
 
 def _monitoring_ai_parse_alert_move(line: str) -> Tuple[Optional[float], Optional[float], str]:
@@ -13205,11 +13238,80 @@ def _monitoring_ai_deposit_withdraw_routine_volatility(alert_text: str) -> Optio
     )
 
 
-def _monitoring_ai_fail_open_note() -> str:
-    return _cfg_str(
+def _monitoring_ai_preload_model(reason: str) -> bool:
+    """
+    Load the vision model into Ollama (empty ``messages`` + ``keep_alive``) so a real alert never
+    pays the ~23GB cold-load cost. Cheap no-op when the model is already resident.
+    """
+    url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+    model = _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
+    if not url or not model:
+        return False
+    keep_alive = _cfg_str("MONITORING_AI_KEEP_ALIVE", "30m").strip() or "30m"
+    body: Dict[str, Any] = {"model": model, "messages": [], "keep_alive": keep_alive}
+    budget = max(30.0, _cfg_float("MONITORING_AI_TIMEOUT_SECONDS", 300.0))
+    t0 = time.monotonic()
+    try:
+        r = requests.post(f"{url}/api/chat", json=body, timeout=budget)
+        r.raise_for_status()
+        logger.info(
+            "monitoring AI warm (%s): model=%s resident (keep_alive=%s) in %.1fs",
+            reason,
+            model,
+            keep_alive,
+            time.monotonic() - t0,
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "monitoring AI warm (%s) failed after %.1fs (model=%s url=%s): %s",
+            reason,
+            time.monotonic() - t0,
+            model,
+            url,
+            e,
+        )
+        return False
+
+
+def _monitoring_ai_warm_loop() -> None:
+    interval = max(60.0, _cfg_float("MONITORING_AI_WARM_INTERVAL_SECONDS", 1200.0))
+    _monitoring_ai_preload_model("boot")
+    while True:
+        time.sleep(interval)
+        try:
+            _monitoring_ai_preload_model("keep-alive refresh")
+        except Exception:
+            logger.exception("monitoring AI warm loop cycle failed")
+
+
+def _start_monitoring_ai_warm_if_enabled() -> None:
+    """Keep the AI-gate model loaded so verdicts return in seconds instead of timing out."""
+    if not _lark_env_truthy_or_default("MONITORING_AI_GATE_ENABLE", default=True):
+        logger.info("monitoring AI warm: skipped — AI gate disabled")
+        return
+    if not _lark_env_truthy_or_default("MONITORING_AI_WARM_ENABLE", default=True):
+        logger.info("monitoring AI warm: disabled (MONITORING_AI_WARM_ENABLE=0)")
+        return
+    if _cfg_float("MONITORING_AI_WARM_INTERVAL_SECONDS", 1200.0) <= 0:
+        logger.info("monitoring AI warm: disabled (interval <= 0)")
+        return
+    threading.Thread(target=_monitoring_ai_warm_loop, daemon=True, name="ai-warm").start()
+
+
+def _monitoring_ai_fail_open_note(reason: str = "") -> str:
+    """
+    Fail-open note, with the concrete cause appended when known — the same note used to appear for
+    *both* "no screenshot" and "model failed", which made the real cause invisible.
+    """
+    note = _cfg_str(
         "MONITORING_AI_FAIL_OPEN_NOTE",
         "🤖 AI review unavailable — alert sent without AI explanation.",
     ).strip()
+    r = (reason or "").strip()
+    if note and r and _lark_env_truthy_or_default("MONITORING_AI_FAIL_NOTE_SHOW_REASON", default=True):
+        return f"{note} (cause: {r})"
+    return note
 
 
 def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[bool, str]:
@@ -13221,14 +13323,14 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
     if not _lark_env_truthy_or_default("MONITORING_AI_GATE_ENABLE", default=True):
         return True, reply
     fail_open = _lark_env_truthy_or_default("MONITORING_AI_GATE_FAIL_OPEN", default=True)
-    fail_note = _monitoring_ai_fail_open_note()
     if not alert_pngs:
         logger.warning(
-            "monitoring AI gate: no screenshot available — %s",
+            "monitoring AI gate: no screenshot available (nothing for the model to review) — %s",
             "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
         )
-        if fail_open and fail_note:
-            reply = f"{reply}\n\n{fail_note}"
+        note_ns = _monitoring_ai_fail_open_note("no screenshot to review")
+        if fail_open and note_ns:
+            reply = f"{reply}\n\n{note_ns}"
         return fail_open, reply
     routine = _monitoring_ai_deposit_withdraw_routine_volatility(reply)
     if routine:
@@ -13236,14 +13338,16 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
             "monitoring AI gate: deposit/withdraw routine volatility — alert suppressed"
         )
         return False, reply
-    verdict, explanation = _monitoring_ai_abnormal_verdict(alert_pngs[0], reply)
+    verdict, explanation, fail_reason = _monitoring_ai_abnormal_verdict(alert_pngs[0], reply)
     if verdict is None:
         logger.warning(
-            "monitoring AI gate: undecided verdict — %s",
+            "monitoring AI gate: undecided verdict (%s) — %s",
+            fail_reason or "unknown",
             "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
         )
-        if fail_open and fail_note:
-            reply = f"{reply}\n\n{fail_note}"
+        note_uv = _monitoring_ai_fail_open_note(fail_reason)
+        if fail_open and note_uv:
+            reply = f"{reply}\n\n{note_uv}"
         return fail_open, reply
     if not verdict:
         logger.info(
@@ -15035,6 +15139,7 @@ def run_monitoring_bot() -> None:
         os.getpid(),
     )
     _start_grafana_playwright_keeper_if_enabled()
+    _start_monitoring_ai_warm_if_enabled()
     _start_monitoring_watchdog_if_enabled()
     _start_freespin_daily_sender_if_enabled()
     _start_freespin_boot_warm_if_enabled()
