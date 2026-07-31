@@ -366,6 +366,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_SIMPLE_ALERT_TEXT": "0",
     # 1=告警卡片附带快捷静音按钮（Mute 30min / 1hour / 6hours）；只静音本次告警涉及的面板。
     "MONITORING_ALERT_QUICK_MUTE_ENABLE": "1",
+    # 1=一个告警一张卡片：每个触发的面板单独发一张卡（截图内嵌其中）。两个面板同时告警 → 两张卡。
+    # 0=旧行为：所有面板合并成一条正文 + 截图分开发。
+    "MONITORING_ALERT_ONE_CARD_PER_PANEL": "1",
     # 1=/mo hides extra-panel ``within Xm drop/spike`` footer lines; tables only.
     "MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS": "0",
     "MONITORING_WATCH_ENABLE": "1",
@@ -6754,15 +6757,22 @@ def _monitoring_interactive_card_dict(
     receive_id: str,
     lark_img_key: Optional[str] = None,
     alert_kinds: Optional[List[str]] = None,
+    lark_img_keys: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Feishu card JSON v2 — markdown card, optional embedded PNG, optional alert quick-mute row."""
+    """
+    Feishu card JSON v2 — markdown card, embedded PNG(s), optional alert quick-mute row.
+    ``lark_img_keys`` embeds several screenshots in one card (e.g. a panel with per-series captures);
+    ``lark_img_key`` stays supported for single-image callers.
+    """
     title = "📊 GRAFANA PLATFORM GRAPH"
     is_alert_card = (reply or "").lstrip().startswith("[ALERT]")
     elements: List[Dict[str, Any]] = [
         {"tag": "markdown", "content": _monitoring_card_body_md_strip_title(reply)},
     ]
-    ik = (lark_img_key or "").strip()
-    if ik:
+    keys: List[str] = [k.strip() for k in (lark_img_keys or []) if (k or "").strip()]
+    if not keys and (lark_img_key or "").strip():
+        keys = [lark_img_key.strip()]
+    for ik in keys:
         elements.append(_lark_card_full_image_element(ik, "Grafana"))
     if alert_kinds and _lark_env_truthy("MONITORING_ALERT_QUICK_MUTE_ENABLE"):
         elements.extend(
@@ -10410,42 +10420,7 @@ def _grafana_headless_screenshot_png_list(
         timezone_param=timezone_param,
     )
     if solo_jobs:
-        pngs: List[bytes] = []
-        for job in solo_jobs:
-            url = str(job.get("url") or "")
-            solo_title = str(job.get("solo_title") or "")
-            panel_id = int(job.get("panel_id") or 0)
-            isolate_series = (job.get("isolate_series") or "").strip() or None
-            isolate_candidates = job.get("isolate_series_candidates")
-            if not isinstance(isolate_candidates, list):
-                isolate_candidates = [isolate_series] if isolate_series else []
-            dense_isolate = bool(job.get("dense_legend_isolate"))
-            highlight_for_render = (
-                [solo_title] if solo_title and GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT else None
-            )
-            logger.info(
-                "Grafana screenshot: relative_range=%s alert solo panelId=%s title=%r "
-                "isolate_series=%r candidates=%s dense=%s url=%s",
-                rel_eff,
-                panel_id,
-                solo_title,
-                (isolate_series or "")[:100] or None,
-                [str(c)[:40] for c in isolate_candidates[:6]],
-                dense_isolate,
-                url[:300] + ("…" if len(url) > 300 else ""),
-            )
-            pngs.append(
-                _grafana_headless_screenshot_png_at_url(
-                    session,
-                    url,
-                    highlight_panel_titles=highlight_for_render,
-                    solo_primary_title=solo_title,
-                    isolate_series_label=isolate_series,
-                    isolate_series_candidates=isolate_candidates,
-                    dense_legend_isolate=dense_isolate,
-                )
-            )
-        return pngs
+        return [png for _title, png in _grafana_capture_solo_jobs(session, solo_jobs, rel_eff)]
 
     url = _grafana_build_screenshot_dashboard_url(
         start_unix,
@@ -10563,6 +10538,94 @@ def _grafana_ephemeral_playwright_screenshot_png(
             browser.close()
 
 
+def _grafana_capture_solo_jobs(
+    session: requests.Session, solo_jobs: List[Dict[str, Any]], rel_eff: bool
+) -> List[Tuple[str, bytes]]:
+    """
+    Capture each solo alert job, keeping its **panel title** alongside the PNG so callers can pair a
+    screenshot with the panel that alerted (needed for one-card-per-alert sends).
+    """
+    out: List[Tuple[str, bytes]] = []
+    for job in solo_jobs:
+        url = str(job.get("url") or "")
+        solo_title = str(job.get("solo_title") or "")
+        panel_id = int(job.get("panel_id") or 0)
+        isolate_series = (job.get("isolate_series") or "").strip() or None
+        isolate_candidates = job.get("isolate_series_candidates")
+        if not isinstance(isolate_candidates, list):
+            isolate_candidates = [isolate_series] if isolate_series else []
+        dense_isolate = bool(job.get("dense_legend_isolate"))
+        highlight_for_render = (
+            [solo_title] if solo_title and GRAFANA_SCREENSHOT_ALERT_HIGHLIGHT else None
+        )
+        logger.info(
+            "Grafana screenshot: relative_range=%s alert solo panelId=%s title=%r "
+            "isolate_series=%r candidates=%s dense=%s url=%s",
+            rel_eff,
+            panel_id,
+            solo_title,
+            (isolate_series or "")[:100] or None,
+            [str(c)[:40] for c in isolate_candidates[:6]],
+            dense_isolate,
+            url[:300] + ("…" if len(url) > 300 else ""),
+        )
+        try:
+            png = _grafana_headless_screenshot_png_at_url(
+                session,
+                url,
+                highlight_panel_titles=highlight_for_render,
+                solo_primary_title=solo_title,
+                isolate_series_label=isolate_series,
+                isolate_series_candidates=isolate_candidates,
+                dense_legend_isolate=dense_isolate,
+            )
+        except Exception:
+            # One failed panel capture must not drop the other panels' alert cards.
+            logger.exception("Grafana alert solo capture failed title=%r", solo_title)
+            continue
+        out.append((solo_title, png))
+    return out
+
+
+def _grafana_alert_screenshot_pairs(
+    session: requests.Session, payload: Optional[Dict[str, Any]] = None
+) -> List[Tuple[str, bytes]]:
+    """
+    ``(panel_title, png)`` for the current alert. Title is ``""`` for a whole-dashboard fallback
+    capture (no solo jobs resolved). Same time range as :func:`_grafana_watchdog_alert_screenshot_png_list`.
+    """
+    w = payload.get("window") if isinstance(payload, dict) else {}
+    su = int((w or {}).get("startUnix") or 0)
+    eu = int((w or {}).get("endUnix") or 0)
+    if su <= 0 or eu <= su:
+        su, eu = _monitoring_watch_eval_window_unix()
+    rf, rt = _grafana_watchdog_alert_screenshot_time_range(payload)
+    tz = _cfg_str("MONITORING_WATCH_SCREENSHOT_TIMEZONE", "browser").strip()
+    highlight = _monitoring_alert_panel_titles(payload) if payload else []
+    solo_jobs = _grafana_build_alert_screenshot_jobs(
+        session,
+        highlight or None,
+        payload,
+        relative_from=rf,
+        relative_to=rt,
+        timezone_param=tz or None,
+    )
+    if solo_jobs:
+        rel_eff = GRAFANA_SCREENSHOT_RELATIVE_RANGE or bool(rf or rt)
+        return _grafana_capture_solo_jobs(session, solo_jobs, rel_eff)
+    pngs = _grafana_headless_screenshot_png_list(
+        session,
+        su,
+        eu,
+        relative_from=rf,
+        relative_to=rt,
+        timezone_param=tz or None,
+        highlight_panel_titles=highlight or None,
+        alert_payload=payload,
+    )
+    return [("", p) for p in pngs]
+
+
 def _grafana_watchdog_alert_screenshot_png_list(
     session: requests.Session,
     payload: Optional[Dict[str, Any]] = None,
@@ -10652,6 +10715,94 @@ def _lark_send_monitoring_alert_pngs(
     key = _lark_upload_png_image_key(pngs[0])
     _lark_send_image_message(receive_id_type, rid, key)
     return 1
+
+
+def _monitoring_kind_for_panel_title(title: str) -> str:
+    """Reverse of :func:`_monitoring_panel_title_for_kind` (tolerant title compare); ``""`` if unknown."""
+    t = (title or "").strip()
+    if not t:
+        return ""
+    for e in _monitoring_enabled_panel_catalog():
+        pt = str(e.get("title") or "").strip()
+        if pt and (pt == t or _grafana_panel_titles_equivalent(pt, t)):
+            return str(e.get("kind") or "").strip()
+    return ""
+
+
+def _lark_send_alert_cards_per_panel(
+    receive_id_type: str,
+    receive_id: str,
+    payload: Dict[str, Any],
+    pairs: List[Tuple[str, bytes]],
+    extra_suffix: str = "",
+) -> int:
+    """
+    Send **one interactive card per alerting panel**, each with that panel's own screenshot(s)
+    embedded and its own quick-mute buttons. Two alerting panels → two cards.
+
+    Returns the number of cards sent (0 = nothing to group, caller should fall back to the
+    combined single-card send).
+    """
+    rid = (receive_id or "").strip()
+    if not rid:
+        return 0
+    blocks_by_kind = _format_alert_trigger_blocks(payload)
+    if not blocks_by_kind:
+        return 0
+
+    pngs_by_kind: Dict[str, List[bytes]] = {}
+    unmatched: List[bytes] = []
+    for title, png in pairs or []:
+        k = _monitoring_kind_for_panel_title(title)
+        if k:
+            pngs_by_kind.setdefault(k, []).append(png)
+        else:
+            unmatched.append(png)
+    # Whole-dashboard fallback capture (no per-panel title): only safe to attach when a single
+    # panel is alerting, otherwise it would imply the image belongs to that one panel.
+    if unmatched and len(blocks_by_kind) == 1:
+        pngs_by_kind.setdefault(blocks_by_kind[0][0], []).extend(unmatched)
+        unmatched = []
+
+    sent = 0
+    for kind, blocks in blocks_by_kind:
+        body = _format_alert_trigger_body_for_kind(kind, blocks)
+        if extra_suffix:
+            body = f"{body}{extra_suffix}"
+        keys: List[str] = []
+        for png in pngs_by_kind.get(kind, []):
+            try:
+                keys.append(_lark_upload_png_image_key(png))
+            except Exception:
+                logger.exception("alert card: image upload failed kind=%r", kind)
+        try:
+            card = _monitoring_interactive_card_dict(
+                body,
+                receive_id_type,
+                rid,
+                None,
+                alert_kinds=[kind],
+                lark_img_keys=keys,
+            )
+            _lark_send_interactive_card(receive_id_type, rid, card)
+            sent += 1
+            logger.info(
+                "alert card sent kind=%r images=%s chat_prefix=%s...", kind, len(keys), rid[:16]
+            )
+        except Exception:
+            logger.exception("alert card send failed kind=%r — falling back to text", kind)
+            try:
+                _lark_send_text_auto(receive_id_type, rid, body, max_chars=3200)
+                sent += 1
+            except Exception:
+                logger.exception("alert card text fallback failed kind=%r", kind)
+    # Never silently drop captures we could not attribute to a panel.
+    for png in unmatched:
+        try:
+            _lark_send_image_message(receive_id_type, rid, _lark_upload_png_image_key(png))
+        except Exception:
+            logger.exception("alert card: unattributed image send failed")
+    return sent
 
 
 def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
@@ -12328,12 +12479,37 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     Alert-only concise content:
     which graph/series, spike or drop, from value/time -> to value/time.
     """
-    _mute_purge_expired()
     lines: List[str] = [
         "[ALERT] Monitoring thresholds exceeded",
         "",
     ]
     reason_blocks: List[str] = []
+    for _kind, blocks in _format_alert_trigger_blocks(payload):
+        reason_blocks.extend(blocks)
+    if not reason_blocks:
+        lines.append("Alert fired but no panel matched text details (no analyzable points).")
+    else:
+        lines.append("\n\n".join(reason_blocks))
+    _append_monitoring_alert_target_user_mention(lines)
+    return "\n".join(lines)
+
+
+def _format_alert_trigger_body_for_kind(kind: str, blocks: List[str]) -> str:
+    """One alert card's body: the ``[ALERT]`` header + just this panel's blocks (+ optional @mention)."""
+    lines: List[str] = ["[ALERT] Monitoring thresholds exceeded", ""]
+    lines.append("\n\n".join(blocks) if blocks else f"[{kind}] alert fired (no text details).")
+    _append_monitoring_alert_target_user_mention(lines)
+    return "\n".join(lines)
+
+
+def _format_alert_trigger_blocks(payload: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
+    """
+    Alert text grouped **per panel**: ``[(kind, [block, …]), …]`` in display order, skipping muted
+    panels and panels with nothing to report. Used both for the combined reply and for
+    one-card-per-alert sends.
+    """
+    _mute_purge_expired()
+    per_kind: List[Tuple[str, List[str]]] = []
     mo_only = (payload.get("moPanelOnlyKind") or "").strip()
     show_http = not mo_only or mo_only == "http"
     show_extra = not mo_only or mo_only != "http"
@@ -12361,7 +12537,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(a_http.get("hit_alert"))):
             reasons = [_format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "HTTP", a_http)]
         if reasons:
-            reason_blocks.extend(reasons)
+            per_kind.append(("http", list(reasons)))
     if show_extra:
         for ex in payload.get("extraPanels") or []:
             if not isinstance(ex, dict):
@@ -12488,13 +12664,8 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or bool(a2.get("hit_alert"))):
                     reasons2 = [_format_simple_series_alert_block(g_lbl, s_lbl, a2)]
             if reasons2:
-                reason_blocks.extend(reasons2)
-    if not reason_blocks:
-        lines.append("Alert fired but no panel matched text details (no analyzable points).")
-    else:
-        lines.append("\n\n".join(reason_blocks))
-    _append_monitoring_alert_target_user_mention(lines)
-    return "\n".join(lines)
+                per_kind.append((kind, list(reasons2)))
+    return per_kind
 
 
 def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
@@ -13361,6 +13532,93 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
     return True, reply
 
 
+def _monitoring_watchdog_deliver_alert(
+    session: requests.Session, payload: Dict[str, Any], alert_chat: str, ctx: str
+) -> bool:
+    """
+    Screenshot → AI gate → send. Returns ``False`` when the AI gate suppressed the alert.
+
+    Default (``MONITORING_ALERT_ONE_CARD_PER_PANEL=1``): **one card per alerting panel**, each with
+    its own screenshot(s) embedded — two alerting panels produce two cards. Set to 0 for the legacy
+    single combined card plus separately-sent images.
+    """
+    reply = _format_alert_trigger_reply(payload)
+    pairs: List[Tuple[str, bytes]] = []
+    if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+        try:
+            pairs = _grafana_alert_screenshot_pairs(session, payload)
+        except Exception:
+            logger.exception("monitoring watchdog pre-screenshot failed (%s)", ctx)
+    alert_pngs = [p for _t, p in pairs]
+
+    ai_ok, reply_after = _monitoring_ai_gate_decide(alert_pngs, reply)
+    if not ai_ok:
+        logger.info(
+            "monitoring watchdog: alert suppressed by AI gate (%s) chat_prefix=%s...",
+            ctx,
+            alert_chat[:16],
+        )
+        return False
+    # The gate only ever appends (AI assessment / fail-open note) — carry that tail onto each card.
+    suffix = reply_after[len(reply):] if reply_after.startswith(reply) else ""
+
+    if _lark_env_truthy_or_default("MONITORING_ALERT_ONE_CARD_PER_PANEL", default=True):
+        n_cards = _lark_send_alert_cards_per_panel(
+            "chat_id", alert_chat, payload, pairs, suffix
+        )
+        if n_cards > 0:
+            logger.info(
+                "monitoring watchdog alert sent (%s) cards=%s panels_with_png=%s chat_prefix=%s...",
+                ctx,
+                n_cards,
+                len(pairs),
+                alert_chat[:16],
+            )
+            return True
+        logger.warning(
+            "monitoring watchdog: no per-panel blocks (%s) — falling back to combined card", ctx
+        )
+
+    pre_key: Optional[str] = None
+    if alert_pngs and len(alert_pngs) == 1 and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT"):
+        try:
+            pre_key = _lark_upload_png_image_key(alert_pngs[0])
+        except Exception:
+            logger.exception("monitoring watchdog pre-screenshot upload failed (%s)", ctx)
+    used_card, embedded = _lark_send_monitoring_user_message(
+        "chat_id",
+        alert_chat,
+        reply_after,
+        pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
+        alert_kinds=_monitoring_alerting_channel_kinds(payload),
+    )
+    logger.info(
+        "monitoring watchdog alert sent (%s) chat_prefix=%s... card=%s embedded_png=%s",
+        ctx,
+        alert_chat[:16],
+        used_card,
+        embedded,
+    )
+    if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+        try:
+            n_img = _lark_send_monitoring_alert_pngs(
+                "chat_id",
+                alert_chat,
+                alert_pngs,
+                embedded_in_card=embedded,
+                pre_key=pre_key,
+            )
+            logger.info(
+                "monitoring watchdog screenshot(s) sent count=%s panels=%s embedded=%s",
+                n_img,
+                len(alert_pngs),
+                embedded,
+            )
+        except Exception:
+            logger.exception("monitoring watchdog screenshot send failed (%s)", ctx)
+    return True
+
+
 def _monitoring_watchdog_loop() -> None:
     """Periodic Grafana check; alert chat on >= threshold drop/spike."""
     global _monitoring_watch_last_alert_at, _monitoring_watch_pending_confirm
@@ -13470,67 +13728,9 @@ def _monitoring_watchdog_loop() -> None:
                     time.sleep(sec)
                     continue
 
-                reply = _format_alert_trigger_reply(payload_c)
-                pre_key: Optional[str] = None
-                alert_pngs: List[bytes] = []
-                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-                    try:
-                        alert_pngs = _grafana_watchdog_alert_screenshot_png_list(sess_c, payload_c)
-                    except Exception:
-                        logger.exception("monitoring watchdog pre-screenshot failed")
-
-                ai_ok, reply = _monitoring_ai_gate_decide(alert_pngs, reply)
-                if not ai_ok:
-                    logger.info(
-                        "monitoring watchdog: alert suppressed by AI gate (after confirm) chat_prefix=%s...",
-                        alert_chat[:16],
-                    )
-                    time.sleep(sec)
-                    continue
-
-                if (
-                    alert_pngs
-                    and len(alert_pngs) == 1
-                    and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
-                ):
-                    try:
-                        pre_key = _lark_upload_png_image_key(alert_pngs[0])
-                    except Exception:
-                        logger.exception("monitoring watchdog pre-screenshot upload failed")
-
-                used_card, embedded = _lark_send_monitoring_user_message(
-                    "chat_id",
-                    alert_chat,
-                    reply,
-                    pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
-                    alert_kinds=_monitoring_alerting_channel_kinds(payload_c),
+                _monitoring_watchdog_deliver_alert(
+                    sess_c, payload_c, alert_chat, "after confirm"
                 )
-                logger.info(
-                    "monitoring watchdog alert sent (after confirm) chat_prefix=%s... card=%s embedded_png=%s",
-                    alert_chat[:16],
-                    used_card,
-                    embedded,
-                )
-
-                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-                    try:
-                        if not alert_pngs:
-                            alert_pngs = _grafana_watchdog_alert_screenshot_png_list(sess_c, payload_c)
-                        n_img = _lark_send_monitoring_alert_pngs(
-                            "chat_id",
-                            alert_chat,
-                            alert_pngs,
-                            embedded_in_card=embedded,
-                            pre_key=pre_key,
-                        )
-                        logger.info(
-                            "monitoring watchdog screenshot(s) sent count=%s panels=%s embedded=%s",
-                            n_img,
-                            len(alert_pngs),
-                            embedded,
-                        )
-                    except Exception:
-                        logger.exception("monitoring watchdog screenshot send failed")
                 time.sleep(sec)
                 continue
 
@@ -13589,67 +13789,7 @@ def _monitoring_watchdog_loop() -> None:
                 with _monitoring_reply_dispatch_lock:
                     _monitoring_watch_last_alert_at = now_m
 
-                reply = _format_alert_trigger_reply(payload)
-                pre_key = None
-                alert_pngs = []
-                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-                    try:
-                        alert_pngs = _grafana_watchdog_alert_screenshot_png_list(sess, payload)
-                    except Exception:
-                        logger.exception("monitoring watchdog pre-screenshot failed")
-
-                ai_ok, reply = _monitoring_ai_gate_decide(alert_pngs, reply)
-                if not ai_ok:
-                    logger.info(
-                        "monitoring watchdog: alert suppressed by AI gate chat_prefix=%s...",
-                        alert_chat[:16],
-                    )
-                    time.sleep(sec)
-                    continue
-
-                if (
-                    alert_pngs
-                    and len(alert_pngs) == 1
-                    and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
-                ):
-                    try:
-                        pre_key = _lark_upload_png_image_key(alert_pngs[0])
-                    except Exception:
-                        logger.exception("monitoring watchdog pre-screenshot upload failed")
-
-                used_card, embedded = _lark_send_monitoring_user_message(
-                    "chat_id",
-                    alert_chat,
-                    reply,
-                    pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
-                    alert_kinds=_monitoring_alerting_channel_kinds(payload),
-                )
-                logger.info(
-                    "monitoring watchdog alert sent chat_prefix=%s... card=%s embedded_png=%s",
-                    alert_chat[:16],
-                    used_card,
-                    embedded,
-                )
-
-                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-                    try:
-                        if not alert_pngs:
-                            alert_pngs = _grafana_watchdog_alert_screenshot_png_list(sess, payload)
-                        n_img = _lark_send_monitoring_alert_pngs(
-                            "chat_id",
-                            alert_chat,
-                            alert_pngs,
-                            embedded_in_card=embedded,
-                            pre_key=pre_key,
-                        )
-                        logger.info(
-                            "monitoring watchdog screenshot(s) sent count=%s panels=%s embedded=%s",
-                            n_img,
-                            len(alert_pngs),
-                            embedded,
-                        )
-                    except Exception:
-                        logger.exception("monitoring watchdog screenshot send failed")
+                _monitoring_watchdog_deliver_alert(sess, payload, alert_chat, "direct")
             finally:
                 _tls_analysis_drop.watchdog = False
         except Exception:
