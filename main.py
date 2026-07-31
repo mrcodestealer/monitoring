@@ -251,6 +251,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DEPLOY_ALLOWED_OPEN_ID": "ou_039809aab3d6df17028dfe4bdfc568cd",
     "MONITORING_DEPLOY_REPO_DIR": "",
     "MONITORING_DEPLOY_RESTART_CMD": "systemctl restart grafanaplatformbot",
+    # @bot + ``who am i`` — 回复发问者的 open_id 等身份信息（便于填 TARGET_USER_OPEN_ID /
+    # MONITORING_DEPLOY_ALLOWED_OPEN_ID）。逗号分隔的可接受说法（规范化后精确匹配）。
+    "MONITORING_WHOAMI_TRIGGERS": "who am i,whoami,who am i?,my open id,my openid",
     # @bot + ``track 2026-06-30 13:30`` — replay watchdog eval windows (admin only)
     "MONITORING_TRACK_ENABLE": "1",
     # 1=仅 @ 机器人且无其它正文也触发（与 MONITORING_TRIGGER 默认 /mo 同）；1+ANY=1 时 @ 且任意正文也跑监控（非命令且带字会先收到命令说明）
@@ -391,7 +394,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_SCREENSHOT_TIMEZONE": "browser",
     # ---- AI 异常二次确认（本地 Ollama 视觉模型）----
     # 阈值触发后，先把截图发给本地 Ollama 模型判断是否「真异常」；仅当判为异常才发群，并在正文追加 AI 说明
-    "MONITORING_AI_GATE_ENABLE": "1",
+    # 0=完全停用（不再调用 Ollama/qwen，正文也不再出现「AI review unavailable」提示）；阈值判定照常告警。
+    "MONITORING_AI_GATE_ENABLE": "0",
     "MONITORING_AI_OLLAMA_URL": "http://localhost:11434",
     "MONITORING_AI_MODEL": "qwen3.6:35b-a3b",
     # 36B 视觉模型冷加载(~23GB) + 推理常超过 120s → ReadTimeout → fail-open「AI unavailable」。放宽到 300s。
@@ -6401,9 +6405,76 @@ def _monitoring_at_mention_help_text() -> str:
         f"- `{fs}` — Freespin Carnival dashboard screenshot (last 30m)\n"
         f"- `{fs9}` / `{fs915}` / `{fs930}` — preview the daily 9pm / 9:15pm / 9:30pm Freespin send\n"
         f"- `{(MONITORING_COREMETRICS_TRIGGER or '/coremetrics').strip()}` — send the core-metrics whole graph now (same as the 9:30 auto-send)\n"
+        "- `who am i` — show your own open_id / user_id (for config keys)\n"
         "- `track 2026-06-30 13:30` — why no alert at that time (admin)\n"
         "- `track login 2026-06-30 13:30` — one panel only"
     )
+
+
+def _monitoring_im_matches_whoami_command(clean: str) -> bool:
+    """
+    ``who am i`` (and configured variants) — exact match after normalizing case/spaces/trailing
+    punctuation, so ordinary chatter containing the phrase does not trigger it.
+    """
+    cn = re.sub(r"\s+", " ", (clean or "").strip().lower()).strip(" ?？!！.。,，")
+    if not cn:
+        return False
+    raw = _cfg_str(
+        "MONITORING_WHOAMI_TRIGGERS", "who am i,whoami,who am i?,my open id,my openid"
+    )
+    for part in re.split(r"[,;]+", raw):
+        t = re.sub(r"\s+", " ", part.strip().lower()).strip(" ?？!！.。,，")
+        if t and cn == t:
+            return True
+    return False
+
+
+def _monitoring_whoami_text(
+    sender: Dict[str, Any], chat_id: str, chat_type: str, sender_name: str = ""
+) -> str:
+    """Identity card for ``who am i``: the ids needed to fill the bot's open_id config keys."""
+    sd = sender if isinstance(sender, dict) else {}
+    open_id = _lark_dict_pick_str(sd, "open_id", "openId")
+    user_id = _lark_dict_pick_str(sd, "user_id", "userId")
+    union_id = _lark_dict_pick_str(sd, "union_id", "unionId")
+    lines: List[str] = ["**Who am I**", ""]
+    if sender_name:
+        lines.append(f"- name: {sender_name}")
+    lines.append(f"- open_id: `{open_id or '(unavailable)'}`")
+    if user_id and user_id != open_id:
+        lines.append(f"- user_id: `{user_id}`")
+    if union_id:
+        lines.append(f"- union_id: `{union_id}`")
+    cid = (chat_id or "").strip()
+    if cid:
+        lines.append(f"- chat_id: `{cid}`" + (f" ({chat_type})" if chat_type else ""))
+    roles: List[str] = []
+    if open_id and _monitoring_deploy_open_id_allowed(open_id):
+        roles.append("deploy admin")
+    if open_id and open_id == (TARGET_USER_OPEN_ID or "").strip():
+        roles.append("alert @-target")
+    lines.append(f"- roles: {', '.join(roles) if roles else 'none'}")
+    return "\n".join(lines)
+
+
+def _monitoring_whoami_worker(
+    chat_id: str,
+    open_id: str,
+    debounce_key: str,
+    sender: Dict[str, Any],
+    chat_type: str,
+    sender_name: str,
+) -> None:
+    try:
+        rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
+        if not rv:
+            return
+        _lark_send_text(rt, rv, _monitoring_whoami_text(sender, chat_id, chat_type, sender_name))
+    except Exception:
+        logger.exception("whoami send failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
 
 
 def _monitoring_at_mention_help_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
@@ -14150,6 +14221,47 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         return
 
+    if _monitoring_im_matches_whoami_command(clean or ""):
+        if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
+            raw_text,
+            mentions,
+            content_at_entity_ids=content_at_entity_ids,
+            msg=msg,
+            chat_type=im_chat_type,
+        ):
+            logger.info("whoami skip — not addressed to this bot")
+            return
+        processed_w = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        debounce_key_w = f"{(chat_id or '').strip()}\n__whoami__{(open_id or '').strip()}"
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                logger.info("duplicate IM event_id=%s — skip (whoami)", im_event_id)
+                return
+            if processed_w and processed_w in _processed_lark_message_ids:
+                logger.info("duplicate whoami stick=%r — skip", processed_w[:96])
+                return
+            if debounce_key_w in _monitoring_inflight_keys:
+                logger.info("whoami skip — already in flight")
+                return
+            _monitoring_inflight_keys.add(debounce_key_w)
+            if processed_w:
+                _processed_lark_message_ids.add(processed_w)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                    _processed_lark_im_event_ids.clear()
+                    _processed_lark_im_event_ids.add(im_event_id)
+        logger.info("whoami command accepted chat=%r open_id_prefix=%r", bool(chat_id), (open_id or "")[:12])
+        _spawn_reacting_worker(
+            mid,
+            _monitoring_whoami_worker,
+            (chat_id, open_id, debounce_key_w, dict(sender), im_chat_type, ""),
+            "whoami",
+        )
+        return
+
     cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
     if (
         _lark_effective_bot_open_id()
@@ -14163,6 +14275,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _monitoring_im_matches_freespin_command(clean or "")
         and _monitoring_freespin_demo_slot(clean or "") is None
         and not _monitoring_im_matches_coremetrics_command(clean or "")
+        and not _monitoring_im_matches_whoami_command(clean or "")
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
