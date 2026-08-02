@@ -5794,6 +5794,46 @@ def _monitoring_track_panel_lines(
     hit = bool(analysis.get("hit_alert"))
     baseline = analysis.get("baseline_median")
     thr = float(threshold_pct)
+
+    # Per-series absolute-value panels (Provider URL err) have no median baseline — the generic
+    # renderer below would wrongly report "median baseline is zero/empty".
+    if (analysis.get("alert_rule") or "") == "absolute_value_per_series":
+        ents = [e for e in (analysis.get("series_entries") or []) if isinstance(e, dict)]
+        spiked = [e for e in ents if e.get("spiked")]
+        out = [
+            f"  [{title}] muted={muted} hit_alert={hit} rule=any series > {thr:g} "
+            f"series_in_window={len(ents)} spiked={len(spiked)}"
+        ]
+        for e in ents[:12]:
+            sub = e.get("analysis") if isinstance(e.get("analysis"), dict) else {}
+            pts = sub.get("merged_points") or []
+            peak_v = max((float(p[1]) for p in pts), default=0.0)
+            peak_t = ""
+            for p in pts:
+                if float(p[1]) == peak_v:
+                    peak_t = _fmt_ts_short(p[0])
+                    break
+            mark = " *SPIKED" if e.get("spiked") else (" (muted series)" if e.get("muted") else "")
+            out.append(
+                f"    {e.get('label')}: max {_fmt_num(peak_v)}"
+                + (f" @ {peak_t}" if peak_t else "")
+                + f" (buckets={len(pts)}){mark}"
+            )
+        if len(ents) > 12:
+            out.append(f"    … (+{len(ents) - 12} more series)")
+        if hit:
+            out.append("    → WOULD alert (then AI gate / cooldown may still block send)")
+        elif muted:
+            out.append("    → no alert: panel is muted (/m)")
+        elif not ents:
+            out.append(
+                "    → no alert: no series had samples in this eval window "
+                "(Prometheus omits series with zero errors)"
+            )
+        else:
+            out.append(f"    → no alert: no series exceeded {thr:g} in this eval window")
+        return out
+
     lines = [f"  [{title}] muted={muted} hit_alert={hit} threshold={thr:g}% median={_fmt_num(baseline) if baseline is not None else 'n/a'}"]
     ws = analysis.get("window_max_spike")
     wd = analysis.get("window_max_drop")
