@@ -451,8 +451,8 @@ _CFG: Dict[str, Any] = {
     "FREESPIN_DASHBOARD_TIMEZONE": "browser",
     # 原样追加到 dashboard URL 的 query（模板变量等）
     "FREESPIN_DASHBOARD_EXTRA_QUERY": "var-env=prod",
-    # 0=停用每日 21:00/21:15/21:30 自动发送（freespin 卡片与其后的 core-metrics 图都不再发；手动命令不受影响）
-    "FREESPIN_DAILY_SEND_ENABLE": "0",
+    # 1=启用每日 21:00/21:15/21:30 自动发送（每个时点：freespin 卡片 + 紧随其后的 core-metrics 整图）
+    "FREESPIN_DAILY_SEND_ENABLE": "1",
     # 每日自动发送时刻（服务器本地时间 HH:MM，逗号分隔）
     "FREESPIN_DAILY_SEND_TIMES": "21:00,21:15,21:30",
     # 每日自动发送的目标群（空 = 回退到 MONITORING_ALERT_CHAT_ID）
