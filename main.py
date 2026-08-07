@@ -166,6 +166,9 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_FULL_PAGE": "1",
     # 截图前点 Grafana「Dock menu」收起左侧导航（Grafana 12 mega-menu）；0=跳过
     "GRAFANA_SCREENSHOT_DOCK_NAV": "1",
+    # 1=截图前用 CSS 直接隐藏左侧导航栏（比点 Dock 按钮可靠：不受动画/时序影响，截图永远不带侧栏）。
+    # 若注入后主区变空会自动撤销该样式，故不会造成空白截图。
+    "GRAFANA_SCREENSHOT_HIDE_NAV_CSS": "1",
     # kiosk=tv 在部分 Grafana+无头环境下主区空白；默认不附带 kiosk（需旧行为可设 tv）
     "GRAFANA_SCREENSHOT_KIOSK": "",
     # 截图前先打开站点根路径再进 dashboard，利于 session 与 SPA bootstrap
@@ -8371,6 +8374,56 @@ def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
         pass
 
 
+# Hide only the left mega-menu (keeps the breadcrumb/title). Narrow, documented selectors — a broad
+# class match risks hiding a wrapper that contains the dashboard itself.
+_GRAFANA_JS_HIDE_LEFT_NAV = """() => {
+  const id = 'bot-hide-left-nav';
+  if (!document.getElementById(id)) {
+    const st = document.createElement('style');
+    st.id = id;
+    st.textContent = [
+      '[data-testid="data-testid navigation mega-menu"],',
+      '[data-testid="data-testid Nav menu"],',
+      'nav[aria-label="Main menu"],',
+      'nav[aria-label="Navigation"],',
+      '.sidemenu, #navbar { display: none !important; }'
+    ].join('\\n');
+    document.head.appendChild(st);
+  }
+  try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+  return true;
+}"""
+
+_GRAFANA_JS_UNHIDE_LEFT_NAV = """() => {
+  const e = document.getElementById('bot-hide-left-nav');
+  if (e) { e.remove(); }
+  try { window.dispatchEvent(new Event('resize')); } catch (err) {}
+  return true;
+}"""
+
+
+def _grafana_playwright_hide_left_nav(page: Any) -> None:
+    """
+    Remove Grafana's left sidebar from the capture via CSS. More reliable than clicking «Dock menu»
+    (no animation/timing race, so the sidebar never sneaks into a screenshot) and avoids ``kiosk``,
+    which blanks the main area in this headless setup. Fires a ``resize`` so uPlot charts re-layout
+    to the wider area, and self-reverts if hiding ever empties the dashboard.
+    """
+    if not _lark_env_truthy_or_default("GRAFANA_SCREENSHOT_HIDE_NAV_CSS", default=True):
+        return
+    try:
+        page.evaluate(_GRAFANA_JS_HIDE_LEFT_NAV)
+        page.wait_for_timeout(200)
+        if not _grafana_dashboard_has_visual_content(page):
+            logger.warning(
+                "Grafana screenshot: hide-left-nav CSS emptied the dashboard — reverting style"
+            )
+            page.evaluate(_GRAFANA_JS_UNHIDE_LEFT_NAV)
+            page.wait_for_timeout(200)
+    except Exception as e:
+        logger.warning("Grafana screenshot: hide-left-nav skipped (%s)", e)
+
+
 def _grafana_playwright_ensure_dashboard_charts_visible(
     page: Any, timeout_ms: int, url: str
 ) -> bool:
@@ -8490,6 +8543,8 @@ def _grafana_playwright_render_dashboard_and_png(
         page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
     _grafana_close_open_menus(page)
     _grafana_playwright_dock_nav_only(page, timeout_ms)
+    # CSS-hide the left sidebar after the dock attempt: deterministic, so it can never sneak in.
+    _grafana_playwright_hide_left_nav(page)
     _grafana_playwright_pre_screenshot_paint_flush(page)
     if not _grafana_playwright_ensure_dashboard_charts_visible(page, timeout_ms, url):
         logger.error(
