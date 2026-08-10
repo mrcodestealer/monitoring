@@ -410,8 +410,9 @@ _CFG: Dict[str, Any] = {
     # 生成长度上限。只需 "ABNORMAL/NORMAL" + 1~3 句说明；不限长时 qwen3 可能持续输出（thinking 未被抑制），
     # 单次判定就能跑满超时 → 「model timeout」。256 tokens 足够且把最坏耗时钉死。
     "MONITORING_AI_NUM_PREDICT": "256",
-    # 让 Ollama 在每次判定后把模型常驻此时长（"30m"/"-1"=永久）；告警稀疏时避免每次都冷加载超时。
-    "MONITORING_AI_KEEP_ALIVE": "30m",
+    # 让 Ollama 把模型常驻此时长（"-1"=永久 / "30m"=30 分钟）。本机 100% CPU 推理，冷加载 23GB 极慢，
+    # 故用 -1 永久常驻（ollama ps 的 UNTIL 会显示 Forever）；代价是常占约 23GB 内存。
+    "MONITORING_AI_KEEP_ALIVE": "-1",
     # 启动时 + 每隔 N 秒空跑一次 /api/chat 把模型预加载并续期常驻（0=关）。
     # 告警很稀疏时 keep_alive 会过期 → 下次告警又是 23GB 冷加载 → 超时 → 「AI review unavailable」。
     "MONITORING_AI_WARM_ENABLE": "1",
@@ -13369,8 +13370,8 @@ def _monitoring_ai_abnormal_verdict(
         "options": opts,
     }
     # Keep the (large) model resident between sporadic alerts so the next one isn't a cold load.
-    keep_alive = _cfg_str("MONITORING_AI_KEEP_ALIVE", "30m").strip()
-    if keep_alive:
+    keep_alive = _monitoring_ai_keep_alive_value()
+    if keep_alive is not None:
         body["keep_alive"] = keep_alive
     # Qwen3 reasoning models: prefer direct answer in ``content`` (not only ``thinking``).
     if "qwen3" in model.casefold():
@@ -13514,6 +13515,22 @@ def _monitoring_ai_deposit_withdraw_routine_volatility(alert_text: str) -> Optio
     )
 
 
+def _monitoring_ai_keep_alive_value() -> Any:
+    """
+    ``MONITORING_AI_KEEP_ALIVE`` for the Ollama payload. Numeric values (``-1`` = never unload,
+    ``600`` = seconds) are sent as **int**; duration strings (``30m``) stay strings.
+    """
+    raw = _cfg_str("MONITORING_AI_KEEP_ALIVE", "-1").strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"-?\d+", raw):
+        try:
+            return int(raw)
+        except ValueError:
+            return raw
+    return raw
+
+
 def _monitoring_ai_preload_model(reason: str) -> bool:
     """
     Load the vision model into Ollama (empty ``messages`` + ``keep_alive``) so a real alert never
@@ -13523,7 +13540,7 @@ def _monitoring_ai_preload_model(reason: str) -> bool:
     model = _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
     if not url or not model:
         return False
-    keep_alive = _cfg_str("MONITORING_AI_KEEP_ALIVE", "30m").strip() or "30m"
+    keep_alive = _monitoring_ai_keep_alive_value()
     body: Dict[str, Any] = {"model": model, "messages": [], "keep_alive": keep_alive}
     budget = max(30.0, _cfg_float("MONITORING_AI_TIMEOUT_SECONDS", 300.0))
     t0 = time.monotonic()
