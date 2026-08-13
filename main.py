@@ -511,6 +511,10 @@ _CFG: Dict[str, Any] = {
     "CHAT_MENU_RETURN_TO_CHAT": "0",
     # applink 域名（空 = 按 LARK_HOST 推断：larksuite → applink.larksuite.com，否则 applink.feishu.cn）
     "CHAT_MENU_APPLINK_HOST": "",
+    # 这些群**永不**接收「菜单点击」触发的 core-metrics（逗号分隔）。菜单链接里的 HMAC 在客户端缓存里
+    # 仍然有效，删掉群菜单**不能**阻止已缓存的按钮再次触发，故用这份服务端黑名单兜底；
+    # ``op=install|sync`` 也会拒绝往这些群装菜单。不影响卡片按钮与每日定时播报。
+    "CHAT_MENU_BLOCK_CHAT_IDS": "oc_7713b00dc15c884caf5ee615ef948ef3",
 }
 
 
@@ -15497,6 +15501,18 @@ def _chat_menu_check_sig(
     return None
 
 
+def _chat_menu_blocked_chat_ids() -> Set[str]:
+    """
+    Groups that must never receive a **menu-triggered** graph (``CHAT_MENU_BLOCK_CHAT_IDS``).
+
+    Deleting a group's menu does not revoke anything: the link's HMAC stays valid, and a client
+    that still shows a cached menu (or anyone who copied the URL) can keep firing it. This is the
+    server-side backstop. Card buttons and the daily auto-send are unaffected.
+    """
+    raw = _cfg_str("CHAT_MENU_BLOCK_CHAT_IDS", "")
+    return {x.strip() for x in re.split(r"[\s,;]+", raw) if x.strip()}
+
+
 def _chat_menu_public_base() -> str:
     """Public ``scheme://host[:port]`` the Lark client will open (menu links must be reachable)."""
     base = _cfg_str("CHAT_MENU_PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -15577,6 +15593,14 @@ def menu_coremetrics():
     err = _chat_menu_check_sig("coremetrics", chat_id, request.args.get("sig") or "")
     if err:
         return err
+    if chat_id in _chat_menu_blocked_chat_ids():
+        logger.info("group-menu blocked chat=%s... (CHAT_MENU_BLOCK_CHAT_IDS)", chat_id[:16])
+        blocked = _chat_menu_html(
+            "Not enabled here",
+            "Core Metrics is not sent to this group from the menu.",
+        )
+        blocked.status_code = 403
+        return blocked
     cooldown = _cfg_int("CHAT_MENU_TRIGGER_COOLDOWN", 45)
     now = time.time()
     with _chat_menu_last_fire_lock:
@@ -15787,6 +15811,17 @@ def menu_admin():
     base = _chat_menu_public_base()
     if op in ("install", "sync", "groups") and not base.startswith("http"):
         return jsonify({"error": "set CHAT_MENU_PUBLIC_BASE_URL to a public http(s) base URL"}), 400
+    blocked_ids = _chat_menu_blocked_chat_ids()
+    if op in ("install", "sync") and chat_id in blocked_ids:
+        return (
+            jsonify(
+                {
+                    "error": "chat is listed in CHAT_MENU_BLOCK_CHAT_IDS — refusing to install a menu there",
+                    "chat_id": chat_id,
+                }
+            ),
+            400,
+        )
     try:
         if op == "groups":
             groups = _chat_menu_list_groups()
@@ -15797,6 +15832,7 @@ def menu_admin():
                         {
                             "chat_id": g["chat_id"],
                             "name": g["name"],
+                            "blocked": g["chat_id"] in blocked_ids,
                             "menu_url": _chat_menu_coremetrics_url(g["chat_id"]),
                             "sync_url": f"{base}/menu/admin?"
                             + urlencode(
