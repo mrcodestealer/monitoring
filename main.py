@@ -165,6 +165,11 @@ _CFG: Dict[str, Any] = {
     # 缓存 Grafana 登录 cookie 的秒数（0=每次都重新 POST /login）。截图/告警/菜单点击都走
     # ``grafana_login_session()``，缓存后每次省一个登录往返；仍每次新建 Session（线程安全）。
     "GRAFANA_LOGIN_CACHE_SECONDS": 600,
+    # 复用最近一次 core-metrics 截图的 image_key 的秒数（0=每次都重新渲染+上传）。
+    # 命中时一次点击只剩「发卡片」，从 ~15s 降到 ~1s；按精确 URL 缓存，绝不会串到 /mo、告警或 freespin。
+    "CORE_METRICS_CACHE_SECONDS": 90,
+    # tenant_access_token 缓存上限秒数（实际取 min(expire-120, 本值)）
+    "LARK_TOKEN_CACHE_MAX_SECONDS": 1500,
     # 二者均 >0 且 START>END 时：不用 LOOKBACK+LAG，改用对齐窗口（见 MONITORING_TIME_BUCKET_TZ）
     # start = 当前日历分钟起点 − START 分钟，end = 当前日历分钟起点 − END 分钟（均为 …:00）。
     # 例 NOW=5:35:23 → cur_min=5:35:00，START=6 END=1 → start=5:29:00 end=5:34:00（最后一桶 5:34:00 非 5:34:23）
@@ -182,7 +187,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_TIMEOUT_MS": 90000,
     "GRAFANA_SCREENSHOT_FULL_PAGE": "1",
     # 截图前点 Grafana「Dock menu」收起左侧导航（Grafana 12 mega-menu）；0=跳过
-    "GRAFANA_SCREENSHOT_DOCK_NAV": "1",
+    # 0=不再点 Grafana「Dock menu」收侧栏（HIDE_NAV_CSS 已经用 CSS 隐藏+收掉占位，这步纯属重复，省 1.8~4.2s）
+    "GRAFANA_SCREENSHOT_DOCK_NAV": "0",
     # 1=截图前用 CSS 直接隐藏左侧导航栏（比点 Dock 按钮可靠：不受动画/时序影响，截图永远不带侧栏）。
     # 同时会**收掉侧栏外层容器的宽度**（只 display:none 掉 <nav> 时，Grafana 的 docked 外层/网格列
     # 仍占位，截图左边就留一条黑边）；与 dashboard 同一个父节点时改为把该网格压成单列。
@@ -193,7 +199,9 @@ _CFG: Dict[str, Any] = {
     # 截图前先打开站点根路径再进 dashboard，利于 session 与 SPA bootstrap
     "GRAFANA_SCREENSHOT_BOOT_WARM": "1",
     # 1=尝试点 Grafana 时间栏「Refresh」触发拉数；找不到按钮则整页 reload 一次
-    "GRAFANA_SCREENSHOT_REFRESH": "1",
+    # 0=不再点 Refresh。首次 goto 已经查过一次；再点会让各面板在**不同时刻**重查（x 轴对不齐的元凶之一），省 ~2.3s。
+    # 若出现 No data，先把这项调回 1。
+    "GRAFANA_SCREENSHOT_REFRESH": "0",
     # Refresh 后等 Spinner 的最长毫秒（过大会拖慢整条截图）
     "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": 1600,
     # 1=点击折叠的 dashboard 行（如只显示 KPI 标题无图时）
@@ -214,16 +222,16 @@ _CFG: Dict[str, Any] = {
     # 常驻浏览器每次截图前：不清空全部 cookie，只追加/覆盖新登录（减轻 SPA 主区闪空白）
     "GRAFANA_PERSISTENT_BROWSER_SOFT_COOKIE": "1",
     # 按快门前几毫秒：置顶滚动 + 等字体 + rAF，缓解 headless「已 ready 但 PNG 仍空壳」
-    "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "1200",
+    "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "250",
     # 1=快门前再跑一轮整页滚动刷 canvas（更慢但更稳）；0=默认，避免快门前滚到底再回顶导致 KPI/IGG 右侧假断崖
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL": "0",
     # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
-    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 8000,
+    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 4500,
     # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
     "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 1,
     "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 100,
-    "GRAFANA_SCREENSHOT_SETTLE_MS": 300,
-    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 7000,
+    "GRAFANA_SCREENSHOT_SETTLE_MS": 0,
+    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 2500,
     # 至少等到 N 个 .react-grid-item（0=不等待；经典大屏可设 4–8；Scenes 布局可能为 0）
     "GRAFANA_SCREENSHOT_MIN_GRID_ITEMS": 0,
     # 截图前“全面板加载”门槛：已加载面板占比（含图或明确 No data）
@@ -231,7 +239,7 @@ _CFG: Dict[str, Any] = {
     # 截图前“全面板加载”最少面板数（防小屏/过滤时占比误判）
     "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 8,
     # 全面板加载等待预算（毫秒）。上限而非固定等待（快的看板画完即返回）。
-    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 18000,
+    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 9000,
     # 这些看板（URL 子串匹配）截图时不展开折叠行。Freespin 展开后多出的 ~20 个 SigNoz 面板永远画不完
     # （卡在 36/46），既拖满超时又导致顶部空白；折叠状态下 26/26 秒开且完整。逗号分隔。
     "GRAFANA_SCREENSHOT_SKIP_ROW_EXPAND_PATHS": "freespin-carnival-v2",
@@ -4648,10 +4656,31 @@ def _lark_send_text_auto(receive_id_type: str, receive_id: str, text: str, max_c
         _lark_send_text(receive_id_type, receive_id, body)
 
 
+_lark_tenant_token_cache: Optional[Tuple[str, float]] = None  # (token, expires_at)
+_lark_tenant_token_lock = threading.Lock()
+
+
+def lark_tenant_token_cache_clear() -> None:
+    """Force the next call to re-fetch (use when Lark answers 99991663 / 401)."""
+    global _lark_tenant_token_cache
+    with _lark_tenant_token_lock:
+        _lark_tenant_token_cache = None
+
+
 def _lark_tenant_access_token_string() -> str:
-    """Same tenant token as SDK; used for multipart image upload (``requests``)."""
+    """
+    Same tenant token as SDK; used for multipart image upload (``requests``).
+
+    Cached until shortly before Lark's own ``expire`` — this used to be fetched twice per send
+    (upload + card), on the hot path of every menu tap, alert and daily post.
+    """
+    global _lark_tenant_token_cache
     if not APP_ID or not APP_SECRET:
         raise ValueError("APP_ID and APP_SECRET required")
+    with _lark_tenant_token_lock:
+        cached = _lark_tenant_token_cache
+    if cached and time.time() < cached[1]:
+        return cached[0]
     url = f"{_lark_api_domain()}/open-apis/auth/v3/tenant_access_token/internal"
     r = requests.post(
         url,
@@ -4666,6 +4695,16 @@ def _lark_tenant_access_token_string() -> str:
     tok = j.get("tenant_access_token")
     if not tok:
         raise RuntimeError(f"no tenant_access_token: {j}")
+    # Lark returns ``expire`` in seconds (typically 7200). Renew early so a token can never expire
+    # mid-request, and cap it so a surprising ``expire`` can't pin a stale token for hours.
+    try:
+        expire = int(j.get("expire") or 0)
+    except (TypeError, ValueError):
+        expire = 0
+    lifetime = min(max(expire - 120, 60), _cfg_int("LARK_TOKEN_CACHE_MAX_SECONDS", 1500))
+    with _lark_tenant_token_lock:
+        _lark_tenant_token_cache = (str(tok), time.time() + lifetime)
+    logger.info("Lark tenant token cached for %ss (expire=%ss)", lifetime, expire or "?")
     return str(tok)
 
 
@@ -6285,20 +6324,60 @@ def _monitoring_freespin_slot_worker(
             _monitoring_inflight_keys.discard(debounce_key)
 
 
-def _core_metrics_screenshot_png() -> bytes:
-    """Full-page PNG of the main core-metrics dashboard (same capture pipeline as /mo / freespin)."""
-    session = grafana_login_session()
+def _core_metrics_screenshot_url() -> str:
+    """The dashboard URL both the capture and the result cache key off."""
     rf = _cfg_str("FREESPIN_CORE_METRICS_FROM", "").strip() or (GRAFANA_DASHBOARD_FROM or "now-1h").strip()
     rt = _cfg_str("FREESPIN_CORE_METRICS_TO", "").strip() or (GRAFANA_DASHBOARD_TO or "now").strip()
-    url = _grafana_build_screenshot_dashboard_url(0, 0, relative_from=rf, relative_to=rt)
-    logger.info("core metrics screenshot: url=%s", url[:300])
-    return _grafana_headless_screenshot_png_at_url(session, url)
+    return _grafana_build_screenshot_dashboard_url(0, 0, relative_from=rf, relative_to=rt)
+
+
+def _core_metrics_screenshot_png(url: Optional[str] = None) -> bytes:
+    """Full-page PNG of the main core-metrics dashboard (same capture pipeline as /mo / freespin)."""
+    session = grafana_login_session()
+    u = (url or "").strip() or _core_metrics_screenshot_url()
+    logger.info("core metrics screenshot: url=%s", u[:300])
+    return _grafana_headless_screenshot_png_at_url(session, u)
+
+
+# url -> (captured_at, lark image_key). Rendering a ~30-panel dashboard is the whole cost of a send,
+# so a tap seconds after the last one reuses that render — and the ``image_key`` with it, skipping
+# the upload too (an image_key stays valid for later messages). Keyed on the exact core-metrics URL
+# so it can never serve a /mo, alert or freespin capture.
+_core_metrics_image_cache: Dict[str, Tuple[float, str]] = {}
+_core_metrics_image_cache_lock = threading.Lock()
+
+
+def _core_metrics_cached_image_key(url: str) -> Optional[str]:
+    ttl = max(0, _cfg_int("CORE_METRICS_CACHE_SECONDS", 90))
+    if ttl <= 0:
+        return None
+    now = time.time()
+    with _core_metrics_image_cache_lock:
+        hit = _core_metrics_image_cache.get(url)
+        if hit and (now - hit[0]) < ttl:
+            logger.info("core metrics: reusing image_key from %.1fs ago (cache hit)", now - hit[0])
+            return hit[1]
+        # Drop this and any other stale entry (the dict is keyed by URL, so it stays tiny).
+        for k in [k for k, v in _core_metrics_image_cache.items() if (now - v[0]) >= ttl]:
+            _core_metrics_image_cache.pop(k, None)
+    return None
+
+
+def _core_metrics_store_image_key(url: str, image_key: str) -> None:
+    if max(0, _cfg_int("CORE_METRICS_CACHE_SECONDS", 90)) <= 0:
+        return
+    with _core_metrics_image_cache_lock:
+        _core_metrics_image_cache[url] = (time.time(), image_key)
 
 
 def _core_metrics_send_graph(receive_id_type: str, receive_id: str) -> None:
     """Send the whole core-metrics dashboard as one card (title + full screenshot); image on fallback."""
-    png = _core_metrics_screenshot_png()
-    key = _lark_upload_png_image_key(png)
+    url = _core_metrics_screenshot_url()
+    key = _core_metrics_cached_image_key(url)
+    if not key:
+        png = _core_metrics_screenshot_png(url)
+        key = _lark_upload_png_image_key(png)
+        _core_metrics_store_image_key(url, key)
     title = _cfg_str("FREESPIN_CORE_METRICS_TITLE", "📊 Core Metrics") or "📊 Core Metrics"
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
