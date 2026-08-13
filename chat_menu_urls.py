@@ -70,6 +70,9 @@ def main(argv: list[str]) -> int:
     for op in ("sync", "list", "install", "delete"):
         q = urlencode({"op": op, "chat": chat_id, "sig": admin_sig})
         print(f"{op}:\n  curl -sS '{base}/menu/admin?{q}'")
+    q = urlencode({"chat": chat_id, "sig": admin_sig})
+    print("\npanel (no-webview card button — post it, then pin it in the group):")
+    print(f"  curl -sS '{base}/menu/panel?{q}'")
     return 0
 
 

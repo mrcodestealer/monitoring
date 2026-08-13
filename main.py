@@ -37,6 +37,9 @@ HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额�
 签进 ``sig`` 的 ``/menu/coremetrics`` 链接（点哪个群的菜单就发到那个群 —— 链接决定去向，与点击位置无关）。
 管理用 ``GET /menu/admin?op=groups|list|sync|install|delete``（``sync`` 幂等：先删本服务旧链接再装正确的），
 本地生成签名链接用 ``python3 chat_menu_urls.py [oc_…]``。
+菜单点击**必然**打开 webview（``action_type`` 只有 ``NONE`` / ``REDIRECT_LINK``，无 ``Event`` 之类的回调类型；
+带事件的「机器人自定义菜单」**只支持单聊**）。要**完全不开网页**就用卡片按钮：``GET /menu/panel?chat=…`` 发一张
+可置顶的卡片，点按钮走 ``card.action.trigger`` → 由 ``open_chat_id`` 判定**点哪个群发哪个群**（无需每群配链接）。
 """
 
 import base64
@@ -498,6 +501,8 @@ _CFG: Dict[str, Any] = {
     "CHAT_MENU_PUBLIC_BASE_URL": "http://47.84.112.211:5002",
     # 一级菜单名称（点了就发图）
     "CHAT_MENU_COREMETRICS_NAME": "📊 Core Metrics",
+    # 无 webview 方案：可置顶的卡片按钮文字（``GET /menu/panel`` 发到群，点击走 card.action.trigger）
+    "CHAT_MENU_PANEL_BUTTON_TEXT": "Send Core Metrics",
 }
 
 
@@ -13221,11 +13226,37 @@ def _monitoring_send_screenshot_on_card_click(chat_id: str, open_id: str) -> Non
             logger.exception("monitoring card-action error text send failed")
 
 
+def _coremetrics_card_click_worker(chat_id: str, open_id: str) -> None:
+    """
+    Card-button click → post the core-metrics graph into the chat the click came from.
+
+    Unlike a group menu (a plain link, so its destination is fixed at install time), a card
+    callback carries ``open_chat_id`` — so one card works in every group and always answers
+    in the group it was tapped in.
+    """
+    try:
+        _set_reply_to_mid("")  # standalone card, same shape as ``/coremetrics``
+        rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
+        if not rv:
+            logger.warning("coremetrics card click: callback had no chat_id/open_id")
+            return
+        _core_metrics_send_graph(rt, rv)
+        logger.info("card-button core metrics sent %s=%s...", rt, rv[:16])
+    except Exception:
+        logger.exception("card-button core metrics send failed")
+        try:
+            _monitoring_deploy_send_ack(
+                chat_id, open_id, "**Core metrics graph failed** — see server logs."
+            )
+        except Exception:
+            logger.exception("coremetrics card-click failure notify send failed")
+
+
 def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
     val = _lark_card_action_value(data)
     k = _lark_dict_pick_str(val, "k")
     v = _lark_dict_pick_str(val, "v")
-    if not (k == "monitoring_btn" and v == "refresh"):
+    if k != "monitoring_btn" or v not in ("refresh", "coremetrics"):
         return
     ev_id = _lark_im_payload_event_id(data)
     with _card_action_dedup_lock:
@@ -13247,6 +13278,20 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
         open_id = ""
     elif rid_t == "open_id" and rid:
         open_id = rid
+    if v == "coremetrics":
+        logger.info(
+            "card.action coremetrics accepted chat=%r open=%r event_id=%r",
+            bool(chat_id),
+            bool(open_id),
+            ev_id or None,
+        )
+        threading.Thread(
+            target=_coremetrics_card_click_worker,
+            args=(chat_id, open_id),
+            daemon=True,
+            name="coremetrics-card-action",
+        ).start()
+        return
     logger.info("card.action refresh accepted chat=%r open=%r event_id=%r", bool(chat_id), bool(open_id), ev_id or None)
     threading.Thread(
         target=_monitoring_send_screenshot_on_card_click,
@@ -15598,6 +15643,65 @@ def _chat_menu_install_payload(chat_id: str) -> Dict[str, Any]:
             ]
         }
     }
+
+
+def _coremetrics_panel_card_dict() -> Dict[str, Any]:
+    """
+    Pinnable one-button panel — the **no-webview** alternative to a group menu.
+
+    Deliberately carries no ``rid``: with the target absent, ``_handle_monitoring_card_action``
+    falls back to ``open_chat_id`` from the click payload, so the same card posts into whichever
+    group it was tapped in. Chat menus cannot do this — they only open a URL (``REDIRECT_LINK``),
+    and Lark pushes no event for a menu tap.
+    """
+    title = _cfg_str("CHAT_MENU_COREMETRICS_NAME", "📊 Core Metrics") or "📊 Core Metrics"
+    label = _cfg_str("CHAT_MENU_PANEL_BUTTON_TEXT", "Send Core Metrics") or "Send Core Metrics"
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": title[:190]}},
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "Tap below to post the current Core Metrics dashboard **in this group**.",
+                },
+                _monitoring_card_v2_callback_button(
+                    label[:40],
+                    "primary",
+                    {"k": "monitoring_btn", "v": "coremetrics"},
+                    element_id="mon_cm",
+                ),
+            ]
+        },
+    }
+
+
+@app.route("/menu/panel", methods=["GET"])
+def menu_panel():
+    """
+    Post the pinnable「📊 Core Metrics」button card into ``?chat=`` (signed like ``/menu/admin``).
+
+    Tapping that button opens **no** webview and posts into the group it was tapped in — pin the
+    card once per group so it stays reachable.
+    """
+    chat_id = (request.args.get("chat") or "").strip()
+    err = _chat_menu_check_sig("admin", chat_id, request.args.get("sig") or "")
+    if err:
+        return err
+    try:
+        _set_reply_to_mid("")
+        _lark_send_interactive_card("chat_id", chat_id, _coremetrics_panel_card_dict())
+        return jsonify(
+            {
+                "posted": True,
+                "chat_id": chat_id,
+                "next": "pin the card in the group (long-press / ⋯ → Pin) so it stays reachable",
+            }
+        )
+    except Exception as e:
+        logger.exception("menu panel post failed")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/menu/admin", methods=["GET"])
