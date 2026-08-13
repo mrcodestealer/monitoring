@@ -38,10 +38,10 @@ HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额�
 管理用 ``GET /menu/admin?op=groups|list|sync|install|delete``（``sync`` 幂等：先删本服务旧链接再装正确的），
 本地生成签名链接用 ``python3 chat_menu_urls.py [oc_…]``。
 菜单点击**必然**打开 webview（``action_type`` 只有 ``NONE`` / ``REDIRECT_LINK``，无 ``Event`` 之类的回调类型；
-带事件的「机器人自定义菜单」**只支持单聊**）。故落地页默认 ``CHAT_MENU_RETURN_TO_CHAT=1``：立刻用 applink
-``client/chat/open?openChatId=…`` 跳回本群，webview 只闪一下（域名见 ``CHAT_MENU_APPLINK_HOST``）。
-要**彻底**不开网页就用卡片按钮：``GET /menu/panel?chat=…`` 发一张可置顶的卡片，点按钮走 ``card.action.trigger``
-→ 由 ``open_chat_id`` 判定**点哪个群发哪个群**（无需每群配链接）。
+带事件的「机器人自定义菜单」**只支持单聊**）。``CHAT_MENU_RETURN_TO_CHAT=1`` 可让落地页用 applink 立刻跳回本群，
+但**只对手机端内置 webview 有效**；桌面端把菜单链接交给系统浏览器，applink 会变成「Open Lark?」弹窗，故默认关。
+**要彻底不开网页只有卡片按钮**：``GET /menu/panel?chat=…`` 发一张可置顶的卡片，点按钮走 ``card.action.trigger``
+→ 由 ``open_chat_id`` 判定**点哪个群发哪个群**（无需每群配链接）；或直接 ``@bot /coremetrics``。
 """
 
 import base64
@@ -505,8 +505,10 @@ _CFG: Dict[str, Any] = {
     "CHAT_MENU_COREMETRICS_NAME": "📊 Core Metrics",
     # 无 webview 方案：可置顶的卡片按钮文字（``GET /menu/panel`` 发到群，点击走 card.action.trigger）
     "CHAT_MENU_PANEL_BUTTON_TEXT": "Send Core Metrics",
-    # 1=菜单落地页立刻用 applink 跳回该群会话（webview 只闪一下，最接近「不开网页」）；0=停在提示页
-    "CHAT_MENU_RETURN_TO_CHAT": "1",
+    # 1=菜单落地页立刻用 applink 跳回该群会话。**仅在客户端内置 webview（手机端）里有用**：
+    # 桌面端常把菜单链接交给系统浏览器打开，此时 applink 会变成浏览器的「Open Lark?」弹窗，比原来的提示页更糟。
+    # 故默认 0（只显示提示页）。彻底不开网页请用卡片按钮 ``GET /menu/panel``。
+    "CHAT_MENU_RETURN_TO_CHAT": "0",
     # applink 域名（空 = 按 LARK_HOST 推断：larksuite → applink.larksuite.com，否则 applink.feishu.cn）
     "CHAT_MENU_APPLINK_HOST": "",
 }
@@ -15581,10 +15583,12 @@ def menu_coremetrics():
         fresh = cooldown <= 0 or (now - _chat_menu_last_fire.get(chat_id, 0.0)) >= cooldown
         if fresh:
             _chat_menu_last_fire[chat_id] = now
-    # ``CHAT_MENU_RETURN_TO_CHAT=1``: bounce back to the group so the webview only flashes.
+    # ``CHAT_MENU_RETURN_TO_CHAT=1``: bounce back to the group so the webview only flashes. Off by
+    # default — desktop clients hand menu links to the system browser, where the applink degrades
+    # into a browser "Open Lark?" permission prompt (observed on macOS Chrome).
     back = (
         _chat_menu_return_applink(chat_id)
-        if _lark_env_truthy_or_default("CHAT_MENU_RETURN_TO_CHAT", default=True)
+        if _lark_env_truthy_or_default("CHAT_MENU_RETURN_TO_CHAT", default=False)
         else ""
     )
     if not fresh:
