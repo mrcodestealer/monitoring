@@ -40,6 +40,9 @@ HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额�
 菜单点击**必然**打开 webview（``action_type`` 只有 ``NONE`` / ``REDIRECT_LINK``，无 ``Event`` 之类的回调类型；
 带事件的「机器人自定义菜单」**只支持单聊**）。``CHAT_MENU_RETURN_TO_CHAT=1`` 可让落地页用 applink 立刻跳回本群，
 但**只对手机端内置 webview 有效**；桌面端把菜单链接交给系统浏览器，applink 会变成「Open Lark?」弹窗，故默认关。
+桌面端默认 ``CHAT_MENU_PC_SIDEBAR=1``：装菜单时同时设 ``pc_url`` = applink
+``client/web_url/open?mode=sidebar-semi&url=…``（官方 ``pc_url`` 字段说明的写法），点菜单在 **Lark 侧边栏**里打开，
+不再甩给系统浏览器；改动后需重新 ``op=sync``。
 **要彻底不开网页只有卡片按钮**：``GET /menu/panel?chat=…`` 发一张可置顶的卡片，点按钮走 ``card.action.trigger``
 → 由 ``open_chat_id`` 判定**点哪个群发哪个群**（无需每群配链接）；或直接 ``@bot /coremetrics``。
 """
@@ -511,6 +514,10 @@ _CFG: Dict[str, Any] = {
     "CHAT_MENU_RETURN_TO_CHAT": "0",
     # applink 域名（空 = 按 LARK_HOST 推断：larksuite → applink.larksuite.com，否则 applink.feishu.cn）
     "CHAT_MENU_APPLINK_HOST": "",
+    # 1=装菜单时额外设 ``pc_url`` = applink ``client/web_url/open?mode=sidebar-semi&url=…``，
+    # 让**桌面端**点菜单在 Lark 侧边栏里打开（而不是甩给系统浏览器）；官方 ``pc_url`` 字段说明即此写法。
+    # 改这个值后需要重新 ``op=sync`` 才生效。
+    "CHAT_MENU_PC_SIDEBAR": "1",
     # 这些群**永不**接收「菜单点击」触发的 core-metrics（逗号分隔）。菜单链接里的 HMAC 在客户端缓存里
     # 仍然有效，删掉群菜单**不能**阻止已缓存的按钮再次触发，故用这份服务端黑名单兜底；
     # ``op=install|sync`` 也会拒绝往这些群装菜单。不影响卡片按钮与每日定时播报。
@@ -15527,6 +15534,19 @@ def _chat_menu_coremetrics_url(chat_id: str) -> str:
     return f"{_chat_menu_public_base()}/menu/coremetrics?{q}"
 
 
+def _chat_menu_pc_sidebar_url(url: str) -> str:
+    """
+    Wrap a menu link so the **desktop** client opens it in Lark's own sidebar panel instead of
+    handing it to the system browser. Documented on the ``pc_url`` field of the create API:
+    「在PC端点击群菜单后，如果需要 url 对应的页面在 Lark 侧边栏展开，可以在 url 前加上
+    ``https://applink.larksuite.com/client/web_url/open?mode=sidebar-semi&url=``」.
+    """
+    return (
+        f"https://{_chat_menu_applink_host()}/client/web_url/open"
+        f"?mode=sidebar-semi&url={quote(url, safe='')}"
+    )
+
+
 def _chat_menu_applink_host() -> str:
     """``applink`` host for this tenant — international Lark and Feishu use different domains."""
     h = _cfg_str("CHAT_MENU_APPLINK_HOST", "").strip().strip("/")
@@ -15708,6 +15728,13 @@ def _chat_menu_own_top_level_ids(levels: List[Dict[str, Any]]) -> List[str]:
 
 def _chat_menu_install_payload(chat_id: str) -> Dict[str, Any]:
     name = (_cfg_str("CHAT_MENU_COREMETRICS_NAME", "📊 Core Metrics") or "📊 Core Metrics")[:120]
+    link = _chat_menu_coremetrics_url(chat_id)
+    # ``common_url`` stays the plain endpoint (mobile/web open it in the client's own webview and
+    # ``_chat_menu_own_top_level_ids`` matches on it). ``pc_url`` overrides desktop only, where the
+    # bare link is handed to the system browser — the applink wrapper keeps it in Lark's sidebar.
+    redirect: Dict[str, str] = {"common_url": link}
+    if _lark_env_truthy_or_default("CHAT_MENU_PC_SIDEBAR", default=True):
+        redirect["pc_url"] = _chat_menu_pc_sidebar_url(link)
     return {
         "menu_tree": {
             "chat_menu_top_levels": [
@@ -15716,7 +15743,7 @@ def _chat_menu_install_payload(chat_id: str) -> Dict[str, Any]:
                         "action_type": "REDIRECT_LINK",
                         "name": name,
                         "i18n_names": {"en_us": name, "zh_cn": name},
-                        "redirect_link": {"common_url": _chat_menu_coremetrics_url(chat_id)},
+                        "redirect_link": redirect,
                     }
                 }
             ]
