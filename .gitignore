@@ -1,0 +1,5 @@
+# Python bytecode — regenerated on every run. Tracking these made `git pull` abort on the server,
+# because the deploy host generates the same __pycache__/main.cpython-3xx.pyc as an untracked file
+# and git refuses to overwrite it with the tracked copy.
+__pycache__/
+*.py[cod]
