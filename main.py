@@ -37,6 +37,7 @@ HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额�
 import base64
 import copy
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -481,6 +482,17 @@ _CFG: Dict[str, Any] = {
     "FREESPIN_CORE_METRICS_TO": "now",
     # 手动即时发送 core-metrics 整图（方便测试，不必等 21:30）
     "MONITORING_COREMETRICS_TRIGGER": "/coremetrics",
+    # ── 群菜单（chat menu）─────────────────────────────────────────────────
+    # Lark 群菜单只有 ``NONE`` / ``REDIRECT_LINK`` 两种 action，点击**不产生回调事件**，
+    # 所以菜单项指向本服务的 ``GET /menu/coremetrics``，由本端把 core-metrics 整图发回该群。
+    # 该链接群成员都看得到、能复制，故用 HMAC 把 chat_id 签进 ``sig``（换密钥即让所有旧链接失效）。
+    "CHAT_MENU_TRIGGER_SECRET": "rG8yL3AtqZMJUgs9oSrkaZWuU4dQAMt0nbOlQLHVyTw",
+    # 同一群 N 秒内只发一次（webview 重载 / 连点两次不会重复发图）；0=关
+    "CHAT_MENU_TRIGGER_COOLDOWN": "45",
+    # 菜单链接的公网前缀（空 = 取 LARK_WEBHOOK_PUBLIC_URL 的 scheme+host）。手机端 webview 建议上 HTTPS。
+    "CHAT_MENU_PUBLIC_BASE_URL": "http://47.84.112.211:5002",
+    # 一级菜单名称（点了就发图）
+    "CHAT_MENU_COREMETRICS_NAME": "📊 Core Metrics",
 }
 
 
@@ -15388,6 +15400,188 @@ def metrics_request_total_1m():
         return jsonify(data)
     except Exception as e:
         logger.exception("request-total-1m failed")
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# 群菜单（chat menu）— 菜单项只能「打开链接」（``REDIRECT_LINK``），点击**不会**回调，
+# 所以菜单指向 ``GET /menu/coremetrics``，本端后台把 core-metrics 整图发回该群
+# （与 ``/coremetrics`` 命令走同一个 :func:`_core_metrics_send_graph`）。
+# 注册 / 查看 / 删除菜单见 ``GET /menu/admin``，两者共用 ``CHAT_MENU_TRIGGER_SECRET``。
+# ---------------------------------------------------------------------------
+_chat_menu_last_fire: Dict[str, float] = {}
+_chat_menu_last_fire_lock = threading.Lock()
+
+
+def _chat_menu_sign(op: str, chat_id: str) -> str:
+    """HMAC for one ``(op, chat_id)`` pair — a leaked link can't be retargeted at another group."""
+    secret = _cfg_str("CHAT_MENU_TRIGGER_SECRET", "").strip()
+    return hmac.new(
+        secret.encode("utf-8"), f"{op}:{chat_id}".encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:32]
+
+
+def _chat_menu_check_sig(op: str, chat_id: str, sig: str) -> Optional[Tuple[str, int]]:
+    """``None`` when authentic, else a ``(body, status)`` tuple to return straight to Flask."""
+    if not _cfg_str("CHAT_MENU_TRIGGER_SECRET", "").strip():
+        return ("chat menu disabled — set CHAT_MENU_TRIGGER_SECRET", 503)
+    if not chat_id.startswith("oc_"):
+        return ("missing or invalid ?chat=oc_...", 400)
+    if not hmac.compare_digest((sig or "").strip(), _chat_menu_sign(op, chat_id)):
+        return ("bad signature", 403)
+    return None
+
+
+def _chat_menu_public_base() -> str:
+    """Public ``scheme://host[:port]`` the Lark client will open (menu links must be reachable)."""
+    base = _cfg_str("CHAT_MENU_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return base
+    m = re.match(r"^(https?://[^/]+)", _cfg_str("LARK_WEBHOOK_PUBLIC_URL", "").strip())
+    return m.group(1) if m else ""
+
+
+def _chat_menu_coremetrics_url(chat_id: str) -> str:
+    q = urlencode({"chat": chat_id, "sig": _chat_menu_sign("coremetrics", chat_id)})
+    return f"{_chat_menu_public_base()}/menu/coremetrics?{q}"
+
+
+def _chat_menu_html(title: str, sub: str) -> Response:
+    """Tiny page for the Lark webview — the graph itself lands in the chat, not here."""
+    return Response(
+        "<!doctype html><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Core Metrics</title>"
+        "<body style=\"margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+        'color:#1f2329;background:#f5f6f7">'
+        "<div style='max-width:26rem;margin:22vh auto;padding:2rem;text-align:center;"
+        "background:#fff;border-radius:12px'>"
+        f"<div style='font-size:1.35rem;font-weight:600'>{title}</div>"
+        f"<div style='margin-top:.6rem;color:#646a73'>{sub}</div>"
+        "</div></body>",
+        mimetype="text/html; charset=utf-8",
+    )
+
+
+def _chat_menu_coremetrics_worker(chat_id: str) -> None:
+    try:
+        _set_reply_to_mid("")  # standalone card, same shape as ``/coremetrics``
+        _core_metrics_send_graph("chat_id", chat_id)
+        logger.info("group-menu core metrics sent chat=%s...", chat_id[:16])
+    except Exception:
+        logger.exception("group-menu core metrics send failed chat=%s...", chat_id[:16])
+
+
+@app.route("/menu/coremetrics", methods=["GET"])
+def menu_coremetrics():
+    """Group-menu target: post the core-metrics whole graph into ``?chat=``, then show a tiny page."""
+    chat_id = (request.args.get("chat") or "").strip()
+    err = _chat_menu_check_sig("coremetrics", chat_id, request.args.get("sig") or "")
+    if err:
+        return err
+    cooldown = _cfg_int("CHAT_MENU_TRIGGER_COOLDOWN", 45)
+    now = time.time()
+    with _chat_menu_last_fire_lock:
+        fresh = cooldown <= 0 or (now - _chat_menu_last_fire.get(chat_id, 0.0)) >= cooldown
+        if fresh:
+            _chat_menu_last_fire[chat_id] = now
+    if not fresh:
+        return _chat_menu_html(
+            "⏳ Already sent",
+            f"Triggered less than {cooldown}s ago — check the group chat.",
+        )
+    # Screenshot takes seconds; answer the webview now and send in the background.
+    threading.Thread(
+        target=_chat_menu_coremetrics_worker,
+        args=(chat_id,),
+        name="menu-coremetrics",
+        daemon=True,
+    ).start()
+    return _chat_menu_html("📊 Core Metrics", "Rendering now — the graph will appear in the group chat.")
+
+
+def _chat_menu_api(
+    method: str, chat_id: str, payload: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """``im/v1/chats/{chat_id}/menu_tree`` — tenant token only; bot must already be in the group."""
+    tok = _lark_tenant_access_token_string()
+    r = requests.request(
+        method,
+        f"{_lark_api_domain()}/open-apis/im/v1/chats/{chat_id}/menu_tree",
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        json=payload,
+        timeout=30,
+    )
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"menu_tree {method} HTTP {r.status_code}: {r.text[:300]}")
+    return j if isinstance(j, dict) else {"raw": j}
+
+
+@app.route("/menu/admin", methods=["GET"])
+def menu_admin():
+    """
+    One-off group-menu management, signed with ``CHAT_MENU_TRIGGER_SECRET`` (``op=admin``):
+
+    * ``?op=list``    — current menus of the group
+    * ``?op=install`` — append the「📊 Core Metrics」link menu (POST appends; don't run twice)
+    * ``?op=delete``  — remove **every** top-level menu (only first level is deletable)
+
+    Needs ``im:chat`` or ``im:chat.menu_tree:write_only``, bot in the group, ``chat_mode=group``;
+    if the group restricts「谁可以管理标签页/小组件/会话菜单」to owner+admin, make the bot an admin.
+    """
+    op = (request.args.get("op") or "list").strip().lower()
+    chat_id = (request.args.get("chat") or "").strip()
+    err = _chat_menu_check_sig("admin", chat_id, request.args.get("sig") or "")
+    if err:
+        return err
+    try:
+        if op == "list":
+            return jsonify(_chat_menu_api("GET", chat_id))
+        if op == "install":
+            base = _chat_menu_public_base()
+            if not base.startswith("http"):
+                return (
+                    jsonify({"error": "set CHAT_MENU_PUBLIC_BASE_URL to a public http(s) base URL"}),
+                    400,
+                )
+            link = _chat_menu_coremetrics_url(chat_id)
+            name = (_cfg_str("CHAT_MENU_COREMETRICS_NAME", "📊 Core Metrics") or "📊 Core Metrics")[:120]
+            payload = {
+                "menu_tree": {
+                    "chat_menu_top_levels": [
+                        {
+                            "chat_menu_item": {
+                                "action_type": "REDIRECT_LINK",
+                                "name": name,
+                                "i18n_names": {"en_us": name, "zh_cn": name},
+                                "redirect_link": {"common_url": link},
+                            }
+                        }
+                    ]
+                }
+            }
+            return jsonify({"menu_url": link, "result": _chat_menu_api("POST", chat_id, payload)})
+        if op == "delete":
+            cur = _chat_menu_api("GET", chat_id)
+            levels = ((cur.get("data") or {}).get("menu_tree") or {}).get("chat_menu_top_levels") or []
+            ids = [str(lvl.get("chat_menu_top_level_id") or "") for lvl in levels]
+            ids = [i for i in ids if i]
+            if not ids:
+                return jsonify({"deleted": [], "note": "no top-level menu found", "current": cur})
+            return jsonify(
+                {
+                    "deleted": ids,
+                    "result": _chat_menu_api("DELETE", chat_id, {"chat_menu_top_level_ids": ids}),
+                }
+            )
+        return jsonify({"error": f"unknown op={op!r} — use list|install|delete"}), 400
+    except Exception as e:
+        logger.exception("menu admin op=%s failed", op)
         return jsonify({"error": str(e)}), 500
 
 
