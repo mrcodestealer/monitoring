@@ -181,7 +181,9 @@ _CFG: Dict[str, Any] = {
     # 截图前点 Grafana「Dock menu」收起左侧导航（Grafana 12 mega-menu）；0=跳过
     "GRAFANA_SCREENSHOT_DOCK_NAV": "1",
     # 1=截图前用 CSS 直接隐藏左侧导航栏（比点 Dock 按钮可靠：不受动画/时序影响，截图永远不带侧栏）。
-    # 若注入后主区变空会自动撤销该样式，故不会造成空白截图。
+    # 同时会**收掉侧栏外层容器的宽度**（只 display:none 掉 <nav> 时，Grafana 的 docked 外层/网格列
+    # 仍占位，截图左边就留一条黑边）；与 dashboard 同一个父节点时改为把该网格压成单列。
+    # 若注入后主区变空会自动撤销全部改动（含内联样式），故不会造成空白截图。
     "GRAFANA_SCREENSHOT_HIDE_NAV_CSS": "1",
     # kiosk=tv 在部分 Grafana+无头环境下主区空白；默认不附带 kiosk（需旧行为可设 tv）
     "GRAFANA_SCREENSHOT_KIOSK": "",
@@ -8422,27 +8424,81 @@ def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
 
 # Hide only the left mega-menu (keeps the breadcrumb/title). Narrow, documented selectors — a broad
 # class match risks hiding a wrapper that contains the dashboard itself.
-_GRAFANA_JS_HIDE_LEFT_NAV = """() => {
+#
+# ``display:none`` on the ``<nav>`` alone is not enough: Grafana docks the mega-menu inside a
+# fixed-width wrapper, and in the app-chrome grid the nav's column is sized by the container, so the
+# space survives its occupant and captures as an empty black band down the left of the PNG. So also
+# collapse the wrapper — and where the nav shares a grid container with the dashboard, flatten that
+# container to a single column instead of hiding it. Everything touched is tagged
+# ``data-bot-navfix`` so :data:`_GRAFANA_JS_UNHIDE_LEFT_NAV` can put it all back if hiding ever
+# empties the dashboard.
+_GRAFANA_NAV_SELECTORS = (
+    '[data-testid="data-testid navigation mega-menu"],'
+    '[data-testid="data-testid Nav menu"],'
+    'nav[aria-label="Main menu"],'
+    'nav[aria-label="Navigation"],'
+    ".sidemenu,#navbar"
+)
+
+# Anything that means "the dashboard itself lives in here" — never hide such an element.
+_GRAFANA_CONTENT_SELECTORS = (
+    "main,"
+    '[data-testid="data-testid dashboard container"],'
+    ".react-grid-layout,.dashboard-container,.panel-container"
+)
+
+_GRAFANA_JS_HIDE_LEFT_NAV = (
+    """() => {
+  const NAV = '"""
+    + _GRAFANA_NAV_SELECTORS
+    + """';
+  const CONTENT = '"""
+    + _GRAFANA_CONTENT_SELECTORS
+    + """';
   const id = 'bot-hide-left-nav';
   if (!document.getElementById(id)) {
     const st = document.createElement('style');
     st.id = id;
-    st.textContent = [
-      '[data-testid="data-testid navigation mega-menu"],',
-      '[data-testid="data-testid Nav menu"],',
-      'nav[aria-label="Main menu"],',
-      'nav[aria-label="Navigation"],',
-      '.sidemenu, #navbar { display: none !important; }'
-    ].join('\\n');
+    st.textContent = NAV + ' { display: none !important; }';
     document.head.appendChild(st);
   }
+  let collapsed = 0, flattened = 0;
+  document.querySelectorAll(NAV).forEach((nav) => {
+    let el = nav.parentElement;
+    for (let i = 0; i < 4 && el && el !== document.body; i++) {
+      if (el.querySelector(CONTENT)) {
+        // Shared ancestor: the dashboard is in here too, so only drop the nav's grid column.
+        const cs = getComputedStyle(el);
+        if (cs.display === 'grid' || cs.display === 'inline-grid') {
+          el.setAttribute('data-bot-navfix', 'grid');
+          el.style.setProperty('grid-template-columns', 'minmax(0, 1fr)', 'important');
+          el.style.setProperty('grid-template-areas', 'none', 'important');
+          flattened++;
+        }
+        break;
+      }
+      if (el.getBoundingClientRect().width > 0) {
+        el.setAttribute('data-bot-navfix', 'hide');
+        el.style.setProperty('display', 'none', 'important');
+        collapsed++;
+      }
+      el = el.parentElement;
+    }
+  });
   try { window.dispatchEvent(new Event('resize')); } catch (e) {}
-  return true;
+  return { collapsed: collapsed, flattened: flattened };
 }"""
+)
 
 _GRAFANA_JS_UNHIDE_LEFT_NAV = """() => {
   const e = document.getElementById('bot-hide-left-nav');
   if (e) { e.remove(); }
+  document.querySelectorAll('[data-bot-navfix]').forEach((el) => {
+    el.style.removeProperty('display');
+    el.style.removeProperty('grid-template-columns');
+    el.style.removeProperty('grid-template-areas');
+    el.removeAttribute('data-bot-navfix');
+  });
   try { window.dispatchEvent(new Event('resize')); } catch (err) {}
   return true;
 }"""
@@ -8458,7 +8514,13 @@ def _grafana_playwright_hide_left_nav(page: Any) -> None:
     if not _lark_env_truthy_or_default("GRAFANA_SCREENSHOT_HIDE_NAV_CSS", default=True):
         return
     try:
-        page.evaluate(_GRAFANA_JS_HIDE_LEFT_NAV)
+        res = page.evaluate(_GRAFANA_JS_HIDE_LEFT_NAV)
+        if isinstance(res, dict):
+            logger.info(
+                "Grafana screenshot: left nav hidden (wrappers collapsed=%s, grids flattened=%s)",
+                res.get("collapsed"),
+                res.get("flattened"),
+            )
         page.wait_for_timeout(200)
         if not _grafana_dashboard_has_visual_content(page):
             logger.warning(
