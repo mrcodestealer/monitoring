@@ -38,8 +38,10 @@ HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额�
 管理用 ``GET /menu/admin?op=groups|list|sync|install|delete``（``sync`` 幂等：先删本服务旧链接再装正确的），
 本地生成签名链接用 ``python3 chat_menu_urls.py [oc_…]``。
 菜单点击**必然**打开 webview（``action_type`` 只有 ``NONE`` / ``REDIRECT_LINK``，无 ``Event`` 之类的回调类型；
-带事件的「机器人自定义菜单」**只支持单聊**）。要**完全不开网页**就用卡片按钮：``GET /menu/panel?chat=…`` 发一张
-可置顶的卡片，点按钮走 ``card.action.trigger`` → 由 ``open_chat_id`` 判定**点哪个群发哪个群**（无需每群配链接）。
+带事件的「机器人自定义菜单」**只支持单聊**）。故落地页默认 ``CHAT_MENU_RETURN_TO_CHAT=1``：立刻用 applink
+``client/chat/open?openChatId=…`` 跳回本群，webview 只闪一下（域名见 ``CHAT_MENU_APPLINK_HOST``）。
+要**彻底**不开网页就用卡片按钮：``GET /menu/panel?chat=…`` 发一张可置顶的卡片，点按钮走 ``card.action.trigger``
+→ 由 ``open_chat_id`` 判定**点哪个群发哪个群**（无需每群配链接）。
 """
 
 import base64
@@ -52,7 +54,7 @@ import math
 import os
 import platform
 import queue
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from datetime import datetime
 import re
 import subprocess
@@ -503,6 +505,10 @@ _CFG: Dict[str, Any] = {
     "CHAT_MENU_COREMETRICS_NAME": "📊 Core Metrics",
     # 无 webview 方案：可置顶的卡片按钮文字（``GET /menu/panel`` 发到群，点击走 card.action.trigger）
     "CHAT_MENU_PANEL_BUTTON_TEXT": "Send Core Metrics",
+    # 1=菜单落地页立刻用 applink 跳回该群会话（webview 只闪一下，最接近「不开网页」）；0=停在提示页
+    "CHAT_MENU_RETURN_TO_CHAT": "1",
+    # applink 域名（空 = 按 LARK_HOST 推断：larksuite → applink.larksuite.com，否则 applink.feishu.cn）
+    "CHAT_MENU_APPLINK_HOST": "",
 }
 
 
@@ -15503,14 +15509,47 @@ def _chat_menu_coremetrics_url(chat_id: str) -> str:
     return f"{_chat_menu_public_base()}/menu/coremetrics?{q}"
 
 
-def _chat_menu_html(title: str, sub: str) -> Response:
-    """Tiny page for the Lark webview — the graph itself lands in the chat, not here."""
+def _chat_menu_applink_host() -> str:
+    """``applink`` host for this tenant — international Lark and Feishu use different domains."""
+    h = _cfg_str("CHAT_MENU_APPLINK_HOST", "").strip().strip("/")
+    if h:
+        return h
+    return "applink.larksuite.com" if "larksuite" in (LARK_HOST or "") else "applink.feishu.cn"
+
+
+def _chat_menu_return_applink(chat_id: str) -> str:
+    """
+    AppLink that sends the client back to the group (client ≥ 3.9.0, member-only).
+
+    A menu tap **always** opens a webview — ``REDIRECT_LINK`` is the only clickable action type
+    and Lark pushes no event — so the landing page bounces straight back to the chat instead.
+    """
+    return f"https://{_chat_menu_applink_host()}/client/chat/open?openChatId={quote(chat_id)}"
+
+
+def _chat_menu_html(title: str, sub: str, *, return_to: str = "") -> Response:
+    """
+    Tiny landing page — the graph lands in the chat, not here.
+
+    With ``return_to`` set, the page immediately navigates to that AppLink, which the client
+    intercepts and turns into "open this chat", dismissing the webview. Feishu documents
+    ``window.location.href = <applink>`` as the supported call from an in-client H5 page
+    (client ≥ 3.41.0), so that exact form is used; ``tt.closeWindow`` is tried first when the
+    webview happens to inject it. The text below stays as the fallback if neither fires.
+    """
+    jump = ""
+    if return_to:
+        jump = (
+            "<script>(function(){try{if(window.tt&&tt.closeWindow){tt.closeWindow();}}catch(e){}"
+            f"try{{window.location.href={json.dumps(return_to)};}}catch(e){{}}}})();</script>"
+        )
     return Response(
         "<!doctype html><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
         "<title>Core Metrics</title>"
         "<body style=\"margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
         'color:#1f2329;background:#f5f6f7">'
+        f"{jump}"
         "<div style='max-width:26rem;margin:22vh auto;padding:2rem;text-align:center;"
         "background:#fff;border-radius:12px'>"
         f"<div style='font-size:1.35rem;font-weight:600'>{title}</div>"
@@ -15542,19 +15581,31 @@ def menu_coremetrics():
         fresh = cooldown <= 0 or (now - _chat_menu_last_fire.get(chat_id, 0.0)) >= cooldown
         if fresh:
             _chat_menu_last_fire[chat_id] = now
+    # ``CHAT_MENU_RETURN_TO_CHAT=1``: bounce back to the group so the webview only flashes.
+    back = (
+        _chat_menu_return_applink(chat_id)
+        if _lark_env_truthy_or_default("CHAT_MENU_RETURN_TO_CHAT", default=True)
+        else ""
+    )
     if not fresh:
         return _chat_menu_html(
             "⏳ Already sent",
             f"Triggered less than {cooldown}s ago — check the group chat.",
+            return_to=back,
         )
-    # Screenshot takes seconds; answer the webview now and send in the background.
+    # Screenshot takes seconds; answer the webview now and send in the background. The send runs
+    # in a daemon thread, so it completes even though the page navigates away immediately.
     threading.Thread(
         target=_chat_menu_coremetrics_worker,
         args=(chat_id,),
         name="menu-coremetrics",
         daemon=True,
     ).start()
-    return _chat_menu_html("📊 Core Metrics", "Rendering now — the graph will appear in the group chat.")
+    return _chat_menu_html(
+        "📊 Core Metrics",
+        "Rendering now — the graph will appear in the group chat.",
+        return_to=back,
+    )
 
 
 def _chat_menu_api(
