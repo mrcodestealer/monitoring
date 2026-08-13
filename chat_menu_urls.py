@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Print the signed group-menu URLs for one ``chat_id`` (see ``/menu/coremetrics`` in ``main.py``).
+Print the signed group-menu URLs (see ``/menu/coremetrics`` and ``/menu/admin`` in ``main.py``).
 
-    python3 chat_menu_urls.py oc_51b6fbf2636525acfb4ead3afa3c93ce
+    python3 chat_menu_urls.py                                     # list every group + its links
+    python3 chat_menu_urls.py oc_51b6fbf2636525acfb4ead3afa3c93ce  # one group
+
+Each group needs a link carrying **its own** ``chat_id``: a menu tap tells the server nothing
+about where it happened, so the link alone decides which group the graph is posted to.
 
 ``CHAT_MENU_TRIGGER_SECRET`` / ``CHAT_MENU_PUBLIC_BASE_URL`` come from the environment, else from
 the ``_CFG`` defaults in ``main.py`` — read by regex, not import, so this stays runnable on a
@@ -39,10 +43,9 @@ def sign(op: str, chat_id: str, secret: str) -> str:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or not argv[1].startswith("oc_"):
+    if len(argv) > 2 or (len(argv) == 2 and not argv[1].startswith("oc_")):
         print((__doc__ or "").strip())
         return 2
-    chat_id = argv[1]
     secret = _cfg("CHAT_MENU_TRIGGER_SECRET")
     base = _cfg("CHAT_MENU_PUBLIC_BASE_URL").rstrip("/")
     if not secret:
@@ -52,11 +55,19 @@ def main(argv: list[str]) -> int:
         print("CHAT_MENU_PUBLIC_BASE_URL is not a http(s) base URL")
         return 1
 
+    if len(argv) == 1:
+        q = urlencode({"op": "groups", "sig": sign("groups", "all", secret)})
+        print("every group the bot is in, with each group's own menu link + sync command:")
+        print(f"  curl -sS 'http://127.0.0.1:5002/menu/admin?{q}'")
+        print("\n(run it on the server — the box can't reach its own public IP)")
+        return 0
+
+    chat_id = argv[1]
     trigger_q = urlencode({"chat": chat_id, "sig": sign("coremetrics", chat_id, secret)})
-    print("menu link (what the group menu opens — clicking it posts the graph):")
+    print("menu link for this group (paste into the group's own menu — posts the graph here):")
     print(f"  {base}/menu/coremetrics?{trigger_q}\n")
     admin_sig = sign("admin", chat_id, secret)
-    for op in ("install", "list", "delete"):
+    for op in ("sync", "list", "install", "delete"):
         q = urlencode({"op": op, "chat": chat_id, "sig": admin_sig})
         print(f"{op}:\n  curl -sS '{base}/menu/admin?{q}'")
     return 0

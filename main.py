@@ -32,6 +32,11 @@ HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额�
 可选 ``/freespin``（``MONITORING_FREESPIN_ENABLE=1`` 默认开）：Freespin Carnival V2 dashboard 整页截图（等全部面板加载完再截，复用 /mo 截图管线）；
 每日 ``FREESPIN_DAILY_SEND_TIMES``（默认 21:00/21:15/21:30 服务器本地时间）自动发送到 ``FREESPIN_DAILY_CHAT_ID``（空 = ``MONITORING_ALERT_CHAT_ID``），
 发送前先发 ``FREESPIN_DAILY_MESSAGE`` 文字。``FREESPIN_BOOT_WARM=1`` 启动预渲染 + ``FREESPIN_DAILY_PREWARM_SECONDS``（默认 180）定时发送前预热，让截图更快。
+
+**群菜单**（``CHAT_MENU_*``）：Lark 菜单项只能「打开链接」且**无点击回调**，所以每个群的菜单各带一条把自己 ``chat_id``
+签进 ``sig`` 的 ``/menu/coremetrics`` 链接（点哪个群的菜单就发到那个群 —— 链接决定去向，与点击位置无关）。
+管理用 ``GET /menu/admin?op=groups|list|sync|install|delete``（``sync`` 幂等：先删本服务旧链接再装正确的），
+本地生成签名链接用 ``python3 chat_menu_urls.py [oc_…]``。
 """
 
 import base64
@@ -15421,13 +15426,20 @@ def _chat_menu_sign(op: str, chat_id: str) -> str:
     ).hexdigest()[:32]
 
 
-def _chat_menu_check_sig(op: str, chat_id: str, sig: str) -> Optional[Tuple[str, int]]:
-    """``None`` when authentic, else a ``(body, status)`` tuple to return straight to Flask."""
+def _chat_menu_check_sig(
+    op: str, subject: str, sig: str, *, require_chat: bool = True
+) -> Optional[Tuple[str, int]]:
+    """
+    ``None`` when authentic, else a ``(body, status)`` tuple to return straight to Flask.
+
+    ``subject`` is the signed scope — a ``chat_id`` for per-group ops, or ``"all"`` for
+    ``op=groups`` (``require_chat=False``), which isn't tied to one group.
+    """
     if not _cfg_str("CHAT_MENU_TRIGGER_SECRET", "").strip():
         return ("chat menu disabled — set CHAT_MENU_TRIGGER_SECRET", 503)
-    if not chat_id.startswith("oc_"):
+    if require_chat and not subject.startswith("oc_"):
         return ("missing or invalid ?chat=oc_...", 400)
-    if not hmac.compare_digest((sig or "").strip(), _chat_menu_sign(op, chat_id)):
+    if not hmac.compare_digest((sig or "").strip(), _chat_menu_sign(op, subject)):
         return ("bad signature", 403)
     return None
 
@@ -15522,64 +15534,163 @@ def _chat_menu_api(
     return j if isinstance(j, dict) else {"raw": j}
 
 
+def _chat_menu_list_groups(limit: int = 200) -> List[Dict[str, str]]:
+    """Groups this bot belongs to (``im/v1/chats``) — needs ``im:chat`` or ``im:chat:readonly``."""
+    tok = _lark_tenant_access_token_string()
+    out: List[Dict[str, str]] = []
+    page_token = ""
+    while len(out) < limit:
+        params: Dict[str, Any] = {"page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        r = requests.get(
+            f"{_lark_api_domain()}/open-apis/im/v1/chats",
+            headers={"Authorization": f"Bearer {tok}"},
+            params=params,
+            timeout=30,
+        )
+        j = r.json() if r.content else {}
+        if int(j.get("code", -1)) != 0:
+            raise RuntimeError(f"list chats: {j}")
+        data = j.get("data") or {}
+        for it in data.get("items") or []:
+            cid = str(it.get("chat_id") or "").strip()
+            if cid:
+                out.append({"chat_id": cid, "name": str(it.get("name") or "")})
+        page_token = str(data.get("page_token") or "").strip()
+        if not data.get("has_more") or not page_token:
+            break
+    return out
+
+
+def _chat_menu_top_levels(chat_id: str) -> List[Dict[str, Any]]:
+    cur = _chat_menu_api("GET", chat_id)
+    levels = ((cur.get("data") or {}).get("menu_tree") or {}).get("chat_menu_top_levels") or []
+    return [lvl for lvl in levels if isinstance(lvl, dict)]
+
+
+def _chat_menu_own_top_level_ids(levels: List[Dict[str, Any]]) -> List[str]:
+    """Top-level ids whose link points at **our** ``/menu/coremetrics`` (ours to replace)."""
+    ids: List[str] = []
+    for lvl in levels:
+        item = lvl.get("chat_menu_item") or {}
+        url = str((item.get("redirect_link") or {}).get("common_url") or "")
+        if "/menu/coremetrics" in url:
+            mid = str(lvl.get("chat_menu_top_level_id") or "").strip()
+            if mid:
+                ids.append(mid)
+    return ids
+
+
+def _chat_menu_install_payload(chat_id: str) -> Dict[str, Any]:
+    name = (_cfg_str("CHAT_MENU_COREMETRICS_NAME", "📊 Core Metrics") or "📊 Core Metrics")[:120]
+    return {
+        "menu_tree": {
+            "chat_menu_top_levels": [
+                {
+                    "chat_menu_item": {
+                        "action_type": "REDIRECT_LINK",
+                        "name": name,
+                        "i18n_names": {"en_us": name, "zh_cn": name},
+                        "redirect_link": {"common_url": _chat_menu_coremetrics_url(chat_id)},
+                    }
+                }
+            ]
+        }
+    }
+
+
 @app.route("/menu/admin", methods=["GET"])
 def menu_admin():
     """
-    One-off group-menu management, signed with ``CHAT_MENU_TRIGGER_SECRET`` (``op=admin``):
+    Group-menu management, signed with ``CHAT_MENU_TRIGGER_SECRET``:
 
-    * ``?op=list``    — current menus of the group
-    * ``?op=install`` — append the「📊 Core Metrics」link menu (POST appends; don't run twice)
-    * ``?op=delete``  — remove **every** top-level menu (only first level is deletable)
+    * ``?op=groups``  — every group the bot is in, each with its own menu link (``sig`` over ``groups:all``)
+    * ``?op=list``    — current menus of one group
+    * ``?op=sync``    — **idempotent**: drop our stale ``/menu/coremetrics`` menus, then install the
+      correct per-group link. Use this to fix a menu pointing at the wrong group.
+    * ``?op=install`` — plain append (POST appends, so re-running duplicates — prefer ``sync``)
+    * ``?op=delete``  — remove **every** top-level menu of the group (only first level is deletable)
 
-    Needs ``im:chat`` or ``im:chat.menu_tree:write_only``, bot in the group, ``chat_mode=group``;
-    if the group restricts「谁可以管理标签页/小组件/会话菜单」to owner+admin, make the bot an admin.
+    Needs ``im:chat`` or ``im:chat.menu_tree:write_only`` (``op=groups`` also needs chat read),
+    bot in the group, ``chat_mode=group``; if the group restricts
+    「谁可以管理标签页/小组件/会话菜单」to owner+admin, make the bot a group admin.
     """
     op = (request.args.get("op") or "list").strip().lower()
     chat_id = (request.args.get("chat") or "").strip()
-    err = _chat_menu_check_sig("admin", chat_id, request.args.get("sig") or "")
+    sig = request.args.get("sig") or ""
+    if op == "groups":
+        err = _chat_menu_check_sig("groups", "all", sig, require_chat=False)
+    else:
+        err = _chat_menu_check_sig("admin", chat_id, sig)
     if err:
         return err
+    base = _chat_menu_public_base()
+    if op in ("install", "sync", "groups") and not base.startswith("http"):
+        return jsonify({"error": "set CHAT_MENU_PUBLIC_BASE_URL to a public http(s) base URL"}), 400
     try:
+        if op == "groups":
+            groups = _chat_menu_list_groups()
+            return jsonify(
+                {
+                    "count": len(groups),
+                    "groups": [
+                        {
+                            "chat_id": g["chat_id"],
+                            "name": g["name"],
+                            "menu_url": _chat_menu_coremetrics_url(g["chat_id"]),
+                            "sync_url": f"{base}/menu/admin?"
+                            + urlencode(
+                                {
+                                    "op": "sync",
+                                    "chat": g["chat_id"],
+                                    "sig": _chat_menu_sign("admin", g["chat_id"]),
+                                }
+                            ),
+                        }
+                        for g in groups
+                    ],
+                }
+            )
         if op == "list":
             return jsonify(_chat_menu_api("GET", chat_id))
-        if op == "install":
-            base = _chat_menu_public_base()
-            if not base.startswith("http"):
-                return (
-                    jsonify({"error": "set CHAT_MENU_PUBLIC_BASE_URL to a public http(s) base URL"}),
-                    400,
-                )
+        if op == "sync":
+            stale = _chat_menu_own_top_level_ids(_chat_menu_top_levels(chat_id))
+            removed: Dict[str, Any] = {}
+            if stale:
+                removed = _chat_menu_api("DELETE", chat_id, {"chat_menu_top_level_ids": stale})
             link = _chat_menu_coremetrics_url(chat_id)
-            name = (_cfg_str("CHAT_MENU_COREMETRICS_NAME", "📊 Core Metrics") or "📊 Core Metrics")[:120]
-            payload = {
-                "menu_tree": {
-                    "chat_menu_top_levels": [
-                        {
-                            "chat_menu_item": {
-                                "action_type": "REDIRECT_LINK",
-                                "name": name,
-                                "i18n_names": {"en_us": name, "zh_cn": name},
-                                "redirect_link": {"common_url": link},
-                            }
-                        }
-                    ]
+            return jsonify(
+                {
+                    "menu_url": link,
+                    "replaced": stale,
+                    "delete_result": removed or "nothing to remove",
+                    "result": _chat_menu_api("POST", chat_id, _chat_menu_install_payload(chat_id)),
                 }
-            }
-            return jsonify({"menu_url": link, "result": _chat_menu_api("POST", chat_id, payload)})
+            )
+        if op == "install":
+            link = _chat_menu_coremetrics_url(chat_id)
+            return jsonify(
+                {
+                    "menu_url": link,
+                    "result": _chat_menu_api("POST", chat_id, _chat_menu_install_payload(chat_id)),
+                }
+            )
         if op == "delete":
-            cur = _chat_menu_api("GET", chat_id)
-            levels = ((cur.get("data") or {}).get("menu_tree") or {}).get("chat_menu_top_levels") or []
-            ids = [str(lvl.get("chat_menu_top_level_id") or "") for lvl in levels]
+            ids = [
+                str(lvl.get("chat_menu_top_level_id") or "")
+                for lvl in _chat_menu_top_levels(chat_id)
+            ]
             ids = [i for i in ids if i]
             if not ids:
-                return jsonify({"deleted": [], "note": "no top-level menu found", "current": cur})
+                return jsonify({"deleted": [], "note": "no top-level menu found"})
             return jsonify(
                 {
                     "deleted": ids,
                     "result": _chat_menu_api("DELETE", chat_id, {"chat_menu_top_level_ids": ids}),
                 }
             )
-        return jsonify({"error": f"unknown op={op!r} — use list|install|delete"}), 400
+        return jsonify({"error": f"unknown op={op!r} — use groups|list|sync|install|delete"}), 400
     except Exception as e:
         logger.exception("menu admin op=%s failed", op)
         return jsonify({"error": str(e)}), 500
