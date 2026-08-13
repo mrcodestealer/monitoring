@@ -63,9 +63,11 @@ def main(argv: list[str]) -> int:
         return 0
 
     chat_id = argv[1]
-    trigger_q = urlencode({"chat": chat_id, "sig": sign("coremetrics", chat_id, secret)})
-    print("menu link for this group (paste into the group's own menu — posts the graph here):")
-    print(f"  {base}/menu/coremetrics?{trigger_q}\n")
+    print("menu links for this group (paste into the group's own menu — each posts here):")
+    for slug in ("coremetrics", "freespin"):
+        q = urlencode({"chat": chat_id, "sig": sign(slug, chat_id, secret)})
+        print(f"  {slug:12s} {base}/menu/{slug}?{q}")
+    print()
     admin_sig = sign("admin", chat_id, secret)
     for op in ("sync", "list", "install", "delete"):
         q = urlencode({"op": op, "chat": chat_id, "sig": admin_sig})

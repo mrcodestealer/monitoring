@@ -527,8 +527,17 @@ _CFG: Dict[str, Any] = {
     "CHAT_MENU_PUBLIC_BASE_URL": "http://47.84.112.211:5002",
     # 一级菜单名称（点了就发图）
     "CHAT_MENU_COREMETRICS_NAME": "📊 Core Metrics",
+    "CHAT_MENU_COREMETRICS_ENABLE": "1",
+    # 第二个一级菜单：freespin 看板（点了就发图）。Lark 上限 3 个一级菜单。
+    "CHAT_MENU_FREESPIN_NAME": "🎰 Free Spin",
+    "CHAT_MENU_FREESPIN_ENABLE": "1",
+    # 菜单用的 freespin 时间窗（与 /freespin 命令、每日定时的 FREESPIN_DASHBOARD_FROM/TO 互不影响）
+    "CHAT_MENU_FREESPIN_FROM": "now-30m",
+    "CHAT_MENU_FREESPIN_TO": "now",
     # 无 webview 方案：可置顶的卡片按钮文字（``GET /menu/panel`` 发到群，点击走 card.action.trigger）
     "CHAT_MENU_PANEL_BUTTON_TEXT": "Send Core Metrics",
+    # 可置顶卡片的标题（卡片内每个看板一个按钮）
+    "CHAT_MENU_PANEL_TITLE": "📈 Dashboards",
     # 1=菜单落地页立刻用 applink 跳回该群会话。**仅在客户端内置 webview（手机端）里有用**：
     # 桌面端常把菜单链接交给系统浏览器打开，此时 applink 会变成浏览器的「Open Lark?」弹窗，比原来的提示页更糟。
     # 故默认 0（只显示提示页）。彻底不开网页请用卡片按钮 ``GET /menu/panel``。
@@ -6176,11 +6185,19 @@ def _monitoring_im_matches_coremetrics_command(clean: str) -> bool:
     return _im_command_matches(clean or "", MONITORING_COREMETRICS_TRIGGER)
 
 
-def _freespin_dashboard_url() -> str:
-    """Freespin Carnival V2 dashboard URL (same kiosk handling as the /mo screenshot URL)."""
+def _freespin_dashboard_url(
+    *, relative_from: Optional[str] = None, relative_to: Optional[str] = None
+) -> str:
+    """
+    Freespin Carnival V2 dashboard URL (same kiosk handling as the /mo screenshot URL).
+
+    ``relative_from`` / ``relative_to`` override the range for one caller without touching
+    ``FREESPIN_DASHBOARD_FROM/TO`` — the chat menu wants a wider window than ``/freespin`` and the
+    daily sender.
+    """
     params: List[Tuple[str, str]] = [("orgId", "1")]
-    rf = (FREESPIN_DASHBOARD_FROM or "now-30m").strip() or "now-30m"
-    rt = (FREESPIN_DASHBOARD_TO or "now").strip() or "now"
+    rf = (relative_from or "").strip() or (FREESPIN_DASHBOARD_FROM or "now-30m").strip() or "now-30m"
+    rt = (relative_to or "").strip() or (FREESPIN_DASHBOARD_TO or "now").strip() or "now"
     params.extend([("from", rf), ("to", rt)])
     tz = (FREESPIN_DASHBOARD_TIMEZONE or "").strip()
     if tz and tz.lower() not in ("none", "-", "off", "0", "false", "no"):
@@ -6339,54 +6356,59 @@ def _core_metrics_screenshot_url() -> str:
     return _grafana_build_screenshot_dashboard_url(0, 0, relative_from=rf, relative_to=rt)
 
 
-def _core_metrics_screenshot_png(url: Optional[str] = None) -> bytes:
-    """Full-page PNG of the main core-metrics dashboard (same capture pipeline as /mo / freespin)."""
-    session = grafana_login_session()
-    u = (url or "").strip() or _core_metrics_screenshot_url()
-    logger.info("core metrics screenshot: url=%s", u[:300])
-    return _grafana_headless_screenshot_png_at_url(session, u)
-
-
 # url -> (captured_at, lark image_key). Rendering a ~30-panel dashboard is the whole cost of a send,
 # so a tap seconds after the last one reuses that render — and the ``image_key`` with it, skipping
-# the upload too (an image_key stays valid for later messages). Keyed on the exact core-metrics URL
-# so it can never serve a /mo, alert or freespin capture.
-_core_metrics_image_cache: Dict[str, Tuple[float, str]] = {}
-_core_metrics_image_cache_lock = threading.Lock()
+# the upload too (an image_key stays valid for later messages). Keyed on the exact dashboard URL, so
+# core-metrics, freespin, /mo and alert captures can never serve each other.
+_graph_image_cache: Dict[str, Tuple[float, str]] = {}
+_graph_image_cache_lock = threading.Lock()
 
 
-def _core_metrics_cached_image_key(url: str) -> Optional[str]:
+def _graph_cached_image_key(url: str, label: str = "graph") -> Optional[str]:
     ttl = max(0, _cfg_int("CORE_METRICS_CACHE_SECONDS", 90))
     if ttl <= 0:
         return None
     now = time.time()
-    with _core_metrics_image_cache_lock:
-        hit = _core_metrics_image_cache.get(url)
+    with _graph_image_cache_lock:
+        hit = _graph_image_cache.get(url)
         if hit and (now - hit[0]) < ttl:
-            logger.info("core metrics: reusing image_key from %.1fs ago (cache hit)", now - hit[0])
+            logger.info("%s: reusing image_key from %.1fs ago (cache hit)", label, now - hit[0])
             return hit[1]
         # Drop this and any other stale entry (the dict is keyed by URL, so it stays tiny).
-        for k in [k for k, v in _core_metrics_image_cache.items() if (now - v[0]) >= ttl]:
-            _core_metrics_image_cache.pop(k, None)
+        for k in [k for k, v in _graph_image_cache.items() if (now - v[0]) >= ttl]:
+            _graph_image_cache.pop(k, None)
     return None
 
 
-def _core_metrics_store_image_key(url: str, image_key: str) -> None:
+def _graph_store_image_key(url: str, image_key: str) -> None:
     if max(0, _cfg_int("CORE_METRICS_CACHE_SECONDS", 90)) <= 0:
         return
-    with _core_metrics_image_cache_lock:
-        _core_metrics_image_cache[url] = (time.time(), image_key)
+    with _graph_image_cache_lock:
+        _graph_image_cache[url] = (time.time(), image_key)
 
 
-def _core_metrics_send_graph(receive_id_type: str, receive_id: str) -> None:
-    """Send the whole core-metrics dashboard as one card (title + full screenshot); image on fallback."""
-    url = _core_metrics_screenshot_url()
-    key = _core_metrics_cached_image_key(url)
+def _dashboard_send_graph_card(
+    receive_id_type: str,
+    receive_id: str,
+    *,
+    url: str,
+    title: str,
+    alt: str,
+    label: str,
+) -> None:
+    """
+    Screenshot ``url`` and post it as one card (title + full image); plain image on card failure.
+
+    Shared by every dashboard the bot can send on demand, so they all get the same result cache,
+    the same card shape and the same fallback.
+    """
+    key = _graph_cached_image_key(url, label)
     if not key:
-        png = _core_metrics_screenshot_png(url)
+        session = grafana_login_session()
+        logger.info("%s screenshot: url=%s", label, url[:300])
+        png = _grafana_headless_screenshot_png_at_url(session, url)
         key = _lark_upload_png_image_key(png)
-        _core_metrics_store_image_key(url, key)
-    title = _cfg_str("FREESPIN_CORE_METRICS_TITLE", "📊 Core Metrics") or "📊 Core Metrics"
+        _graph_store_image_key(url, key)
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
             card = {
@@ -6396,15 +6418,45 @@ def _core_metrics_send_graph(receive_id_type: str, receive_id: str) -> None:
                     "template": "blue",
                     "title": {"tag": "plain_text", "content": title[:190]},
                 },
-                "body": {"elements": [_lark_card_full_image_element(key, "Core Metrics")]},
+                "body": {"elements": [_lark_card_full_image_element(key, alt)]},
             }
             _lark_send_interactive_card(receive_id_type, receive_id, card)
             return
         except Exception:
-            logger.warning(
-                "core metrics card send failed — falling back to plain image", exc_info=True
-            )
+            logger.warning("%s card send failed — falling back to plain image", label, exc_info=True)
     _lark_send_image_message(receive_id_type, receive_id, key)
+
+
+def _core_metrics_send_graph(receive_id_type: str, receive_id: str) -> None:
+    """Send the whole core-metrics dashboard as one card (title + full screenshot); image on fallback."""
+    _dashboard_send_graph_card(
+        receive_id_type,
+        receive_id,
+        url=_core_metrics_screenshot_url(),
+        title=_cfg_str("FREESPIN_CORE_METRICS_TITLE", "📊 Core Metrics") or "📊 Core Metrics",
+        alt="Core Metrics",
+        label="core metrics",
+    )
+
+
+def _chat_menu_freespin_url() -> str:
+    """Freespin dashboard URL for the chat menu — its own window, wider than ``/freespin``."""
+    return _freespin_dashboard_url(
+        relative_from=_cfg_str("CHAT_MENU_FREESPIN_FROM", "now-30m"),
+        relative_to=_cfg_str("CHAT_MENU_FREESPIN_TO", "now"),
+    )
+
+
+def _freespin_menu_send_graph(receive_id_type: str, receive_id: str) -> None:
+    """Send the freespin dashboard as one card — the chat-menu / card-button counterpart."""
+    _dashboard_send_graph_card(
+        receive_id_type,
+        receive_id,
+        url=_chat_menu_freespin_url(),
+        title=_cfg_str("CHAT_MENU_FREESPIN_NAME", "🎰 Free Spin") or "🎰 Free Spin",
+        alt="Free Spin",
+        label="freespin menu",
+    )
 
 
 def _freespin_send_core_metrics_after_slot(
@@ -13508,37 +13560,56 @@ def _monitoring_send_screenshot_on_card_click(chat_id: str, open_id: str) -> Non
             logger.exception("monitoring card-action error text send failed")
 
 
-def _coremetrics_card_click_worker(chat_id: str, open_id: str) -> None:
+_DASHBOARD_SEND_LABELS = {"coremetrics": "core metrics", "freespin": "freespin"}
+
+
+def _dashboard_sender(kind: str) -> Any:
     """
-    Card-button click → post the core-metrics graph into the chat the click came from.
+    The send function for one dashboard kind, resolved **at call time**.
+
+    Looked up on each call rather than stored in :data:`_CHAT_MENU_GRAPHS` so the name stays late
+    bound — a registry holding direct references would freeze whatever these names pointed at when
+    the module was imported.
+    """
+    return {"coremetrics": _core_metrics_send_graph, "freespin": _freespin_menu_send_graph}.get(kind)
+
+
+def _dashboard_card_click_worker(kind: str, chat_id: str, open_id: str) -> None:
+    """
+    Card-button click → post that dashboard into the chat the click came from.
 
     Unlike a group menu (a plain link, so its destination is fixed at install time), a card
     callback carries ``open_chat_id`` — so one card works in every group and always answers
     in the group it was tapped in.
     """
+    send = _dashboard_sender(kind)
+    label = _DASHBOARD_SEND_LABELS.get(kind, kind)
+    if send is None:
+        logger.warning("card click: unknown dashboard kind=%r", kind)
+        return
     try:
-        _set_reply_to_mid("")  # standalone card, same shape as ``/coremetrics``
+        _set_reply_to_mid("")  # standalone card, same shape as the slash commands
         rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
         if not rv:
-            logger.warning("coremetrics card click: callback had no chat_id/open_id")
+            logger.warning("%s card click: callback had no chat_id/open_id", label)
             return
-        _core_metrics_send_graph(rt, rv)
-        logger.info("card-button core metrics sent %s=%s...", rt, rv[:16])
+        send(rt, rv)
+        logger.info("card-button %s sent %s=%s...", label, rt, rv[:16])
     except Exception:
-        logger.exception("card-button core metrics send failed")
+        logger.exception("card-button %s send failed", label)
         try:
             _monitoring_deploy_send_ack(
-                chat_id, open_id, "**Core metrics graph failed** — see server logs."
+                chat_id, open_id, f"**{label.title()} graph failed** — see server logs."
             )
         except Exception:
-            logger.exception("coremetrics card-click failure notify send failed")
+            logger.exception("%s card-click failure notify send failed", label)
 
 
 def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
     val = _lark_card_action_value(data)
     k = _lark_dict_pick_str(val, "k")
     v = _lark_dict_pick_str(val, "v")
-    if k != "monitoring_btn" or v not in ("refresh", "coremetrics"):
+    if k != "monitoring_btn" or v not in ("refresh", "coremetrics", "freespin"):
         return
     ev_id = _lark_im_payload_event_id(data)
     with _card_action_dedup_lock:
@@ -13560,18 +13631,19 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
         open_id = ""
     elif rid_t == "open_id" and rid:
         open_id = rid
-    if v == "coremetrics":
+    if v in ("coremetrics", "freespin"):
         logger.info(
-            "card.action coremetrics accepted chat=%r open=%r event_id=%r",
+            "card.action %s accepted chat=%r open=%r event_id=%r",
+            v,
             bool(chat_id),
             bool(open_id),
             ev_id or None,
         )
         threading.Thread(
-            target=_coremetrics_card_click_worker,
-            args=(chat_id, open_id),
+            target=_dashboard_card_click_worker,
+            args=(v, chat_id, open_id),
             daemon=True,
-            name="coremetrics-card-action",
+            name=f"{v}-card-action",
         ).start()
         return
     logger.info("card.action refresh accepted chat=%r open=%r event_id=%r", bool(chat_id), bool(open_id), ev_id or None)
@@ -15792,9 +15864,14 @@ def _chat_menu_public_base() -> str:
     return m.group(1) if m else ""
 
 
+def _chat_menu_graph_url(slug: str, chat_id: str) -> str:
+    """Signed ``/menu/<slug>`` link for one group — the destination lives in the link itself."""
+    q = urlencode({"chat": chat_id, "sig": _chat_menu_sign(slug, chat_id)})
+    return f"{_chat_menu_public_base()}/menu/{slug}?{q}"
+
+
 def _chat_menu_coremetrics_url(chat_id: str) -> str:
-    q = urlencode({"chat": chat_id, "sig": _chat_menu_sign("coremetrics", chat_id)})
-    return f"{_chat_menu_public_base()}/menu/coremetrics?{q}"
+    return _chat_menu_graph_url("coremetrics", chat_id)
 
 
 def _chat_menu_pc_sidebar_url(url: str) -> str:
@@ -15860,36 +15937,76 @@ def _chat_menu_html(title: str, sub: str, *, return_to: str = "") -> Response:
     )
 
 
-def _chat_menu_coremetrics_worker(chat_id: str) -> None:
+# One entry per dashboard reachable from a group menu / pinned card button. ``slug`` is both the
+# URL segment (``/menu/<slug>``) and the HMAC scope, so each graph's links are independently signed.
+_CHAT_MENU_GRAPHS: Dict[str, Dict[str, Any]] = {
+    "coremetrics": {
+        "name_key": "CHAT_MENU_COREMETRICS_NAME",
+        "name_default": "📊 Core Metrics",
+        "enable_key": "CHAT_MENU_COREMETRICS_ENABLE",
+        "card_action": "coremetrics",
+        "element_id": "mon_cm",
+    },
+    "freespin": {
+        "name_key": "CHAT_MENU_FREESPIN_NAME",
+        "name_default": "🎰 Free Spin",
+        "enable_key": "CHAT_MENU_FREESPIN_ENABLE",
+        "card_action": "freespin",
+        "element_id": "mon_fs",
+    },
+}
+
+
+def _chat_menu_graph_name(slug: str) -> str:
+    g = _CHAT_MENU_GRAPHS[slug]
+    return (_cfg_str(g["name_key"], g["name_default"]) or g["name_default"])[:120]
+
+
+def _chat_menu_enabled_graphs() -> List[str]:
+    return [
+        slug
+        for slug, g in _CHAT_MENU_GRAPHS.items()
+        if _lark_env_truthy_or_default(g["enable_key"], default=True)
+    ]
+
+
+def _chat_menu_graph_worker(slug: str, chat_id: str) -> None:
     try:
-        _set_reply_to_mid("")  # standalone card, same shape as ``/coremetrics``
-        _core_metrics_send_graph("chat_id", chat_id)
-        logger.info("group-menu core metrics sent chat=%s...", chat_id[:16])
+        _set_reply_to_mid("")  # standalone card, same shape as the slash commands
+        send = _dashboard_sender(slug)
+        if send is None:
+            logger.warning("group-menu: no sender for %r", slug)
+            return
+        send("chat_id", chat_id)
+        logger.info("group-menu %s sent chat=%s...", slug, chat_id[:16])
     except Exception:
-        logger.exception("group-menu core metrics send failed chat=%s...", chat_id[:16])
+        logger.exception("group-menu %s send failed chat=%s...", slug, chat_id[:16])
 
 
-@app.route("/menu/coremetrics", methods=["GET"])
-def menu_coremetrics():
-    """Group-menu target: post the core-metrics whole graph into ``?chat=``, then show a tiny page."""
+def _chat_menu_trigger(slug: str) -> Any:
+    """Shared handler for every ``/menu/<slug>`` target: verify, rate-limit, send in the background."""
     chat_id = (request.args.get("chat") or "").strip()
-    err = _chat_menu_check_sig("coremetrics", chat_id, request.args.get("sig") or "")
+    err = _chat_menu_check_sig(slug, chat_id, request.args.get("sig") or "")
     if err:
         return err
+    name = _chat_menu_graph_name(slug)
     if chat_id in _chat_menu_blocked_chat_ids():
-        logger.info("group-menu blocked chat=%s... (CHAT_MENU_BLOCK_CHAT_IDS)", chat_id[:16])
+        logger.info(
+            "group-menu %s blocked chat=%s... (CHAT_MENU_BLOCK_CHAT_IDS)", slug, chat_id[:16]
+        )
         blocked = _chat_menu_html(
-            "Not enabled here",
-            "Core Metrics is not sent to this group from the menu.",
+            "Not enabled here", f"{name} is not sent to this group from the menu."
         )
         blocked.status_code = 403
         return blocked
     cooldown = _cfg_int("CHAT_MENU_TRIGGER_COOLDOWN", 45)
     now = time.time()
+    # Cooldown is per graph per chat, so tapping Core Metrics never blocks a Free Spin tap.
+    fire_key = f"{slug}\n{chat_id}"
     with _chat_menu_last_fire_lock:
-        fresh = cooldown <= 0 or (now - _chat_menu_last_fire.get(chat_id, 0.0)) >= cooldown
+        fresh = cooldown <= 0 or (now - _chat_menu_last_fire.get(fire_key, 0.0)) >= cooldown
         if fresh:
-            _chat_menu_last_fire[chat_id] = now
+            _chat_menu_last_fire[fire_key] = now
     # ``CHAT_MENU_RETURN_TO_CHAT=1``: bounce back to the group so the webview only flashes. Off by
     # default — desktop clients hand menu links to the system browser, where the applink degrades
     # into a browser "Open Lark?" permission prompt (observed on macOS Chrome).
@@ -15907,16 +16024,26 @@ def menu_coremetrics():
     # Screenshot takes seconds; answer the webview now and send in the background. The send runs
     # in a daemon thread, so it completes even though the page navigates away immediately.
     threading.Thread(
-        target=_chat_menu_coremetrics_worker,
-        args=(chat_id,),
-        name="menu-coremetrics",
+        target=_chat_menu_graph_worker,
+        args=(slug, chat_id),
+        name=f"menu-{slug}",
         daemon=True,
     ).start()
     return _chat_menu_html(
-        "📊 Core Metrics",
-        "Rendering now — the graph will appear in the group chat.",
-        return_to=back,
+        name, "Rendering now — the graph will appear in the group chat.", return_to=back
     )
+
+
+@app.route("/menu/coremetrics", methods=["GET"])
+def menu_coremetrics():
+    """Group-menu target: post the core-metrics whole graph into ``?chat=``, then show a tiny page."""
+    return _chat_menu_trigger("coremetrics")
+
+
+@app.route("/menu/freespin", methods=["GET"])
+def menu_freespin():
+    """Group-menu target: post the freespin dashboard into ``?chat=``, then show a tiny page."""
+    return _chat_menu_trigger("freespin")
 
 
 def _chat_menu_api(
@@ -15977,21 +16104,24 @@ def _chat_menu_top_levels(chat_id: str) -> List[Dict[str, Any]]:
 
 
 def _chat_menu_own_top_level_ids(levels: List[Dict[str, Any]]) -> List[str]:
-    """Top-level ids whose link points at **our** ``/menu/coremetrics`` (ours to replace)."""
+    """Top-level ids linking to any of **our** ``/menu/<slug>`` endpoints (ours to replace)."""
+    ours = tuple(f"/menu/{slug}" for slug in _CHAT_MENU_GRAPHS)
     ids: List[str] = []
     for lvl in levels:
         item = lvl.get("chat_menu_item") or {}
-        url = str((item.get("redirect_link") or {}).get("common_url") or "")
-        if "/menu/coremetrics" in url:
+        link = item.get("redirect_link") or {}
+        # Check every platform URL: a desktop-only ``pc_url`` still makes the item ours.
+        urls = " ".join(str(link.get(k) or "") for k in ("common_url", "pc_url", "web_url", "ios_url", "android_url"))
+        if any(path in urls for path in ours):
             mid = str(lvl.get("chat_menu_top_level_id") or "").strip()
             if mid:
                 ids.append(mid)
     return ids
 
 
-def _chat_menu_install_payload(chat_id: str) -> Dict[str, Any]:
-    name = (_cfg_str("CHAT_MENU_COREMETRICS_NAME", "📊 Core Metrics") or "📊 Core Metrics")[:120]
-    link = _chat_menu_coremetrics_url(chat_id)
+def _chat_menu_top_level_for(slug: str, chat_id: str) -> Dict[str, Any]:
+    name = _chat_menu_graph_name(slug)
+    link = _chat_menu_graph_url(slug, chat_id)
     # ``common_url`` stays the plain endpoint (mobile/web open it in the client's own webview and
     # ``_chat_menu_own_top_level_ids`` matches on it). ``pc_url`` overrides desktop only, where the
     # bare link is handed to the system browser — the applink wrapper keeps it in Lark's sidebar.
@@ -15999,16 +16129,21 @@ def _chat_menu_install_payload(chat_id: str) -> Dict[str, Any]:
     if _lark_env_truthy_or_default("CHAT_MENU_PC_SIDEBAR", default=True):
         redirect["pc_url"] = _chat_menu_pc_sidebar_url(link)
     return {
+        "chat_menu_item": {
+            "action_type": "REDIRECT_LINK",
+            "name": name,
+            "i18n_names": {"en_us": name, "zh_cn": name},
+            "redirect_link": redirect,
+        }
+    }
+
+
+def _chat_menu_install_payload(chat_id: str) -> Dict[str, Any]:
+    """One top-level menu per enabled graph (Lark allows at most 3)."""
+    return {
         "menu_tree": {
             "chat_menu_top_levels": [
-                {
-                    "chat_menu_item": {
-                        "action_type": "REDIRECT_LINK",
-                        "name": name,
-                        "i18n_names": {"en_us": name, "zh_cn": name},
-                        "redirect_link": redirect,
-                    }
-                }
+                _chat_menu_top_level_for(slug, chat_id) for slug in _chat_menu_enabled_graphs()
             ]
         }
     }
@@ -16016,33 +16151,36 @@ def _chat_menu_install_payload(chat_id: str) -> Dict[str, Any]:
 
 def _coremetrics_panel_card_dict() -> Dict[str, Any]:
     """
-    Pinnable one-button panel — the **no-webview** alternative to a group menu.
+    Pinnable button panel — the **no-webview** alternative to a group menu, one button per graph.
 
     Deliberately carries no ``rid``: with the target absent, ``_handle_monitoring_card_action``
     falls back to ``open_chat_id`` from the click payload, so the same card posts into whichever
     group it was tapped in. Chat menus cannot do this — they only open a URL (``REDIRECT_LINK``),
     and Lark pushes no event for a menu tap.
     """
-    title = _cfg_str("CHAT_MENU_COREMETRICS_NAME", "📊 Core Metrics") or "📊 Core Metrics"
-    label = _cfg_str("CHAT_MENU_PANEL_BUTTON_TEXT", "Send Core Metrics") or "Send Core Metrics"
+    slugs = _chat_menu_enabled_graphs()
+    elements: List[Dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": "Tap a button to post that dashboard **in this group**.",
+        }
+    ]
+    for slug in slugs:
+        g = _CHAT_MENU_GRAPHS[slug]
+        elements.append(
+            _monitoring_card_v2_callback_button(
+                _chat_menu_graph_name(slug)[:40],
+                "primary" if slug == "coremetrics" else "default",
+                {"k": "monitoring_btn", "v": g["card_action"]},
+                element_id=str(g["element_id"]),
+            )
+        )
+    title = _cfg_str("CHAT_MENU_PANEL_TITLE", "📈 Dashboards") or "📈 Dashboards"
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "wide_screen_mode": True},
         "header": {"template": "blue", "title": {"tag": "plain_text", "content": title[:190]}},
-        "body": {
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": "Tap below to post the current Core Metrics dashboard **in this group**.",
-                },
-                _monitoring_card_v2_callback_button(
-                    label[:40],
-                    "primary",
-                    {"k": "monitoring_btn", "v": "coremetrics"},
-                    element_id="mon_cm",
-                ),
-            ]
-        },
+        "body": {"elements": elements},
     }
 
 
@@ -16124,6 +16262,10 @@ def menu_admin():
                             "name": g["name"],
                             "blocked": g["chat_id"] in blocked_ids,
                             "menu_url": _chat_menu_coremetrics_url(g["chat_id"]),
+                            "menu_urls": {
+                                slug: _chat_menu_graph_url(slug, g["chat_id"])
+                                for slug in _chat_menu_enabled_graphs()
+                            },
                             "sync_url": f"{base}/menu/admin?"
                             + urlencode(
                                 {
