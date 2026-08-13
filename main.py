@@ -162,6 +162,9 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 900,
     # Prometheus 最近分钟桶常未跑完；query_range 的 end 用「现在 − 该秒数」，最新点落在「约前两分钟」
     "GRAFANA_QUERY_END_LAG_SECONDS": 60,
+    # 缓存 Grafana 登录 cookie 的秒数（0=每次都重新 POST /login）。截图/告警/菜单点击都走
+    # ``grafana_login_session()``，缓存后每次省一个登录往返；仍每次新建 Session（线程安全）。
+    "GRAFANA_LOGIN_CACHE_SECONDS": 600,
     # 二者均 >0 且 START>END 时：不用 LOOKBACK+LAG，改用对齐窗口（见 MONITORING_TIME_BUCKET_TZ）
     # start = 当前日历分钟起点 − START 分钟，end = 当前日历分钟起点 − END 分钟（均为 …:00）。
     # 例 NOW=5:35:23 → cur_min=5:35:00，START=6 END=1 → start=5:29:00 end=5:34:00（最后一桶 5:34:00 非 5:34:23）
@@ -3366,9 +3369,47 @@ def _monitoring_dispatch_body_key(clean: str, raw_text: str, mentions: Any) -> s
     return cl[:320] or "__body__"
 
 
+_grafana_login_cookie_cache: Dict[str, str] = {}
+_grafana_login_cookie_expiry: float = 0.0
+_grafana_login_cookie_lock = threading.Lock()
+
+
+def grafana_login_cache_clear() -> None:
+    """Drop cached Grafana cookies so the next call logs in again (use on 401/403)."""
+    global _grafana_login_cookie_expiry
+    with _grafana_login_cookie_lock:
+        _grafana_login_cookie_cache.clear()
+        _grafana_login_cookie_expiry = 0.0
+
+
 def grafana_login_session() -> requests.Session:
+    """
+    Session carrying a valid ``grafana_session`` cookie.
+
+    Every screenshot used to pay a fresh ``POST /login`` round trip — on the hot path of a group-menu
+    tap, an alert, ``/mo`` and the daily sender. Cookies are cached for
+    ``GRAFANA_LOGIN_CACHE_SECONDS`` instead. A **new** ``requests.Session`` is still returned per
+    call (only the cookie values are shared) because a Session is not thread-safe and these callers
+    run in separate daemon threads.
+    """
+    global _grafana_login_cookie_expiry
     if not GRAFANA_USER or not GRAFANA_PASSWORD:
         raise ValueError("Set GRAFANA_USER and GRAFANA_PASSWORD in .env")
+
+    ttl = max(0, _cfg_int("GRAFANA_LOGIN_CACHE_SECONDS", 600))
+    now = time.time()
+    if ttl:
+        with _grafana_login_cookie_lock:
+            cached = (
+                dict(_grafana_login_cookie_cache)
+                if _grafana_login_cookie_cache and now < _grafana_login_cookie_expiry
+                else {}
+            )
+        if cached:
+            session = requests.Session()
+            for name, value in cached.items():
+                session.cookies.set(name, value)
+            return session
 
     session = requests.Session()
     login_url = f"{GRAFANA_BASE_URL}/login"
@@ -3380,8 +3421,15 @@ def grafana_login_session() -> requests.Session:
     )
     resp.raise_for_status()
     # Grafana sets grafana_session cookie on success
-    if "grafana_session" not in session.cookies.get_dict():
+    jar = session.cookies.get_dict()
+    if "grafana_session" not in jar:
         logger.warning("Login returned 200 but no grafana_session cookie; check credentials / SSO")
+    elif ttl:
+        with _grafana_login_cookie_lock:
+            _grafana_login_cookie_cache.clear()
+            _grafana_login_cookie_cache.update(jar)
+            _grafana_login_cookie_expiry = time.time() + ttl
+        logger.info("Grafana login cached for %ss", ttl)
     return session
 
 
