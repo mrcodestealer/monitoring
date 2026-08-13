@@ -194,6 +194,14 @@ _CFG: Dict[str, Any] = {
     # 仍占位，截图左边就留一条黑边）；与 dashboard 同一个父节点时改为把该网格压成单列。
     # 若注入后主区变空会自动撤销全部改动（含内联样式），故不会造成空白截图。
     "GRAFANA_SCREENSHOT_HIDE_NAV_CSS": "1",
+    # 1=截图前量一下「最左侧面板」的实际左边距，把左边多余的死区直接裁掉（兜底：不同 Grafana 版本的
+    # chrome 结构不同，HIDE_NAV_CSS 收不掉占位时就会留一条黑边）。裁剪与 full_page 兼容，高度不受影响；
+    # 没有死区时不裁，截图与原来完全一致。
+    "GRAFANA_SCREENSHOT_CROP_LEFT_BAND": "1",
+    # 小于该像素数不算死区（避免把面板正常内边距裁掉）
+    "GRAFANA_SCREENSHOT_CROP_LEFT_MIN_PX": 8,
+    # 裁剪时在左侧保留的间距（面板本身的 margin），让左右两边看起来对称
+    "GRAFANA_SCREENSHOT_CROP_LEFT_GUTTER_PX": 8,
     # kiosk=tv 在部分 Grafana+无头环境下主区空白；默认不附带 kiosk（需旧行为可设 tv）
     "GRAFANA_SCREENSHOT_KIOSK": "",
     # 截图前先打开站点根路径再进 dashboard，利于 session 与 SPA bootstrap
@@ -7852,11 +7860,77 @@ def _grafana_playwright_capture_dashboard_png(page: Any) -> bytes:
     except Exception:
         pass
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
-    logger.info("Grafana screenshot: page capture scrollY=0 full_page=%s", full_page)
+    clip = _grafana_left_band_clip(page) if full_page else None
+    logger.info(
+        "Grafana screenshot: page capture scrollY=0 full_page=%s clip=%s", full_page, clip or "none"
+    )
+    kwargs: Dict[str, Any] = {"type": "png", "full_page": full_page}
+    if clip:
+        kwargs["clip"] = clip
     try:
-        return page.screenshot(type="png", full_page=full_page, animations="disabled")
+        return page.screenshot(animations="disabled", **kwargs)
     except TypeError:
-        return page.screenshot(type="png", full_page=full_page)
+        return page.screenshot(**kwargs)
+
+
+_GRAFANA_JS_MEASURE_LEFT_BAND = """() => {
+  const els = document.querySelectorAll('.react-grid-item, .panel-container, [data-panelid]');
+  let min = Infinity;
+  els.forEach((e) => {
+    const r = e.getBoundingClientRect();
+    if (r.width > 40 && r.height > 20) {
+      min = Math.min(min, r.left + (window.scrollX || 0));
+    }
+  });
+  return {
+    left: (min === Infinity || min < 0) ? 0 : Math.floor(min),
+    width: document.documentElement.scrollWidth,
+    height: document.documentElement.scrollHeight,
+    panels: els.length,
+  };
+}"""
+
+
+def _grafana_left_band_clip(page: Any) -> Optional[Dict[str, int]]:
+    """
+    Crop any dead band left of the dashboard, as a ``page.screenshot(clip=...)`` box.
+
+    :func:`_grafana_playwright_hide_left_nav` removes the mega-menu and collapses its wrapper, but
+    Grafana's chrome markup varies by version — when the reserved column survives anyway it captures
+    as a black stripe down the left of the PNG. Rather than chase selectors, measure where the
+    leftmost panel actually starts and cut everything before it. ``clip`` composes with
+    ``full_page``, so the full dashboard height is preserved. Returns ``None`` when there is nothing
+    to trim, so a correct capture is byte-identical to before.
+    """
+    if not _lark_env_truthy_or_default("GRAFANA_SCREENSHOT_CROP_LEFT_BAND", default=True):
+        return None
+    try:
+        m = page.evaluate(_GRAFANA_JS_MEASURE_LEFT_BAND)
+    except Exception as e:
+        logger.warning("Grafana screenshot: left-band measure failed (%s)", e)
+        return None
+    if not isinstance(m, dict) or not m.get("panels"):
+        return None
+    left = int(m.get("left") or 0)
+    doc_w = int(m.get("width") or 0)
+    doc_h = int(m.get("height") or 0)
+    min_band = max(2, _cfg_int("GRAFANA_SCREENSHOT_CROP_LEFT_MIN_PX", 8))
+    if left < min_band or doc_w - left < 400 or doc_h <= 0:
+        return None
+    # ``left`` is the panel's own edge, which includes its grid margin — cutting exactly there would
+    # leave the panels flush against the image border while the right side keeps its gutter.
+    gutter = max(0, _cfg_int("GRAFANA_SCREENSHOT_CROP_LEFT_GUTTER_PX", 8))
+    x = max(0, left - gutter)
+    if x < min_band:
+        return None
+    logger.info(
+        "Grafana screenshot: trimming %spx dead band left of the panels (panel edge %s, doc %sx%s)",
+        x,
+        left,
+        doc_w,
+        doc_h,
+    )
+    return {"x": x, "y": 0, "width": doc_w - x, "height": doc_h}
 
 
 def _grafana_stabilize_dashboard_render(
