@@ -516,6 +516,8 @@ _CFG: Dict[str, Any] = {
     "FREESPIN_CORE_METRICS_TO": "now",
     # 手动即时发送 core-metrics 整图（方便测试，不必等 21:30）
     "MONITORING_COREMETRICS_TRIGGER": "/coremetrics",
+    # 列出机器人所在的全部群（名称 + chat_id）；卡片形式，方便复制 chat_id 填配置
+    "MONITORING_ALLGROUP_TRIGGER": "/allgroup",
     # ── 群菜单（chat menu）─────────────────────────────────────────────────
     # Lark 群菜单只有 ``NONE`` / ``REDIRECT_LINK`` 两种 action，点击**不产生回调事件**，
     # 所以菜单项指向本服务的 ``GET /menu/coremetrics``，由本端把 core-metrics 整图发回该群。
@@ -6140,6 +6142,8 @@ MONITORING_FREESPIN9_TRIGGER = _cfg_str("MONITORING_FREESPIN9_TRIGGER", "/freesp
 MONITORING_FREESPIN915_TRIGGER = _cfg_str("MONITORING_FREESPIN915_TRIGGER", "/freespin915").strip()
 MONITORING_FREESPIN930_TRIGGER = _cfg_str("MONITORING_FREESPIN930_TRIGGER", "/freespin930").strip()
 MONITORING_COREMETRICS_TRIGGER = _cfg_str("MONITORING_COREMETRICS_TRIGGER", "/coremetrics").strip()
+MONITORING_ALLGROUP_TRIGGER = _cfg_str("MONITORING_ALLGROUP_TRIGGER", "/allgroup").strip()
+MONITORING_ALLGROUP_TRIGGER = _cfg_str("MONITORING_ALLGROUP_TRIGGER", "/allgroup").strip()
 FREESPIN_DASHBOARD_PATH = _cfg_str(
     "FREESPIN_DASHBOARD_PATH",
     "/d/8345e1da-af7a-416f-90a2-0326a3a163d9/freespin-carnival-v2",
@@ -6178,11 +6182,25 @@ def _monitoring_freespin_demo_slot(clean: str) -> Optional[int]:
     return None
 
 
+def _monitoring_im_matches_allgroup_command(clean: str) -> bool:
+    """``/allgroup`` — list every group the bot is in (name + chat_id)."""
+    if not MONITORING_ALLGROUP_TRIGGER:
+        return False
+    return _im_command_matches(clean or "", MONITORING_ALLGROUP_TRIGGER)
+
+
 def _monitoring_im_matches_coremetrics_command(clean: str) -> bool:
     """``/coremetrics`` — send the core-metrics whole-dashboard graph on demand (same as the 21:30 auto-send)."""
     if not MONITORING_COREMETRICS_TRIGGER:
         return False
     return _im_command_matches(clean or "", MONITORING_COREMETRICS_TRIGGER)
+
+
+def _monitoring_im_matches_allgroup_command(clean: str) -> bool:
+    """``/allgroup`` — list every group this bot is in, with its ``chat_id``."""
+    if not MONITORING_ALLGROUP_TRIGGER:
+        return False
+    return _im_command_matches(clean or "", MONITORING_ALLGROUP_TRIGGER)
 
 
 def _freespin_dashboard_url(
@@ -6480,6 +6498,86 @@ def _freespin_send_core_metrics_after_slot(
         logger.exception("core metrics graph send (after freespin slot) failed")
 
 
+def _allgroup_card_dict(groups: List[Dict[str, str]], current_chat_id: str) -> Dict[str, Any]:
+    """
+    Card listing every group the bot is in: name + ``chat_id``, one line each.
+
+    ``chat_id`` goes in inline code so it can be copied straight into a config key. The group the
+    command was sent from is marked, as is anything on ``CHAT_MENU_BLOCK_CHAT_IDS``.
+    """
+    blocked = _chat_menu_blocked_chat_ids()
+    known = {
+        (_cfg_str("MONITORING_ALERT_CHAT_ID", "") or "").strip(): "🚨 alerts",
+        (_cfg_str("FREESPIN_DAILY_CHAT_ID", "") or "").strip(): "🎰 daily freespin",
+    }
+    lines: List[str] = []
+    for i, g in enumerate(groups, 1):
+        cid = g["chat_id"]
+        name = (g["name"] or "(no name)").strip()
+        tags: List[str] = []
+        if cid == (current_chat_id or "").strip():
+            tags.append("📍 you are here")
+        role = known.get(cid, "")
+        if role:
+            tags.append(role)
+        if cid in blocked:
+            tags.append("🔕 menu blocked")
+        suffix = f"  ·  {' · '.join(tags)}" if tags else ""
+        lines.append(f"**{i}. 👥 {name}**{suffix}\n`{cid}`")
+    body = "\n\n".join(lines) if lines else "_The bot is not in any group yet._"
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "turquoise",
+            "title": {"tag": "plain_text", "content": f"👥 Groups · {len(groups)}"},
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": body},
+                {"tag": "hr"},
+                {
+                    "tag": "markdown",
+                    "content": "💡 _Tap a `chat_id` to copy it — that's what config keys like "
+                    "`MONITORING_ALERT_CHAT_ID` and the menu commands expect._",
+                },
+            ]
+        },
+    }
+
+
+def _monitoring_allgroup_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
+    """``/allgroup``: list every group the bot belongs to, with names and chat_ids, as a card."""
+    try:
+        _set_reply_to_mid("")
+        rt, rv = _monitoring_deploy_im_receive_target(chat_id, open_id)
+        if not rv:
+            return
+        groups = _chat_menu_list_groups()
+        logger.info("allgroup: %s group(s) listed", len(groups))
+        card = _allgroup_card_dict(groups, chat_id or "")
+        try:
+            _lark_send_interactive_card(rt, rv, card)
+        except Exception:
+            logger.warning("allgroup card send failed — falling back to text", exc_info=True)
+            text = "\n".join(f"👥 {g['name'] or '(no name)'} — {g['chat_id']}" for g in groups)
+            _lark_send_text_auto(rt, rv, text or "No groups.")
+    except Exception as e:
+        logger.exception("allgroup worker failed")
+        try:
+            _monitoring_deploy_send_ack(
+                chat_id,
+                open_id,
+                f"❌ **Could not list groups** — {e}\n"
+                "_Needs the `im:chat` or `im:chat:readonly` scope on the app._",
+            )
+        except Exception:
+            logger.exception("allgroup failure notify send failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
 def _monitoring_coremetrics_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
     """On-demand ``/coremetrics``: send the core-metrics whole graph to the requesting chat (standalone)."""
     try:
@@ -6692,6 +6790,7 @@ def _monitoring_at_mention_help_text() -> str:
         f"- `{fs}` — Freespin Carnival dashboard screenshot (last 30m)\n"
         f"- `{fs9}` / `{fs915}` / `{fs930}` — preview the daily 9pm / 9:15pm / 9:30pm Freespin send\n"
         f"- `{(MONITORING_COREMETRICS_TRIGGER or '/coremetrics').strip()}` — send the core-metrics whole graph now (same as the 9:30 auto-send)\n"
+        f"- `{(MONITORING_ALLGROUP_TRIGGER or '/allgroup').strip()}` — list every group the bot is in (name + `chat_id`)\n"
         "- `who am i` — show your own open_id / user_id (for config keys)\n"
         "- `track 2026-06-30 13:30` — why no alert at that time (admin)\n"
         "- `track login 2026-06-30 13:30` — one panel only"
@@ -14939,6 +15038,38 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         return
 
+    if _monitoring_im_matches_allgroup_command(clean or ""):
+        processed_ag = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        debounce_key_ag = f"{(chat_id or '').strip()}\n__allgroup__"
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                logger.info("duplicate IM event_id=%s — skip (allgroup)", im_event_id)
+                return
+            if processed_ag and processed_ag in _processed_lark_message_ids:
+                logger.info("duplicate allgroup stick=%r — skip", processed_ag[:96])
+                return
+            if debounce_key_ag in _monitoring_inflight_keys:
+                logger.info("allgroup skip — already in flight")
+                return
+            _monitoring_inflight_keys.add(debounce_key_ag)
+            if processed_ag:
+                _processed_lark_message_ids.add(processed_ag)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                    _processed_lark_im_event_ids.clear()
+                    _processed_lark_im_event_ids.add(im_event_id)
+        logger.info("allgroup command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
+        _spawn_reacting_worker(
+            mid,
+            _monitoring_allgroup_worker,
+            (chat_id, open_id, debounce_key_ag),
+            "allgroup",
+        )
+        return
+
     if _monitoring_im_matches_coremetrics_command(clean or ""):
         processed_cm = _monitoring_processed_stick(
             mid, im_event_id, chat_id or "", sender_debounce, msg_time
@@ -15057,6 +15188,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _monitoring_im_matches_freespin_command(clean or "")
         and _monitoring_freespin_demo_slot(clean or "") is None
         and not _monitoring_im_matches_coremetrics_command(clean or "")
+        and not _monitoring_im_matches_allgroup_command(clean or "")
         and not _monitoring_im_matches_whoami_command(clean or "")
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
