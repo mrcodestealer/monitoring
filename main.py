@@ -404,6 +404,30 @@ _CFG: Dict[str, Any] = {
     "MONITORING_SIMPLE_ALERT_TEXT": "0",
     # 1=告警卡片附带快捷静音按钮（Mute 30min / 1hour / 6hours）；只静音本次告警涉及的面板。
     "MONITORING_ALERT_QUICK_MUTE_ENABLE": "1",
+    # ---- 告警卡片「Report to SRE」按钮（仅 “Alert Triggered” 卡片上出现）----
+    # 点一下 → 把本次告警的截图转成一张 “Core Metrics Alert” 卡片发到下面这个群，
+    # 并 @ 当天 SRE BACKEND 值班。逻辑照搬 AlertBot 的 “Report to SRE”。
+    "MONITORING_SRE_REPORT_ENABLE": "1",
+    "MONITORING_SRE_REPORT_BUTTON_TEXT": "Report to SRE",
+    # 目标群：本 App 必须已在群里（/allgroup 可确认），否则 im/v1/messages 会报权限错。
+    "MONITORING_SRE_REPORT_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
+    "MONITORING_SRE_REPORT_CARD_TITLE": "Core Metrics Alert",
+    # ``{mention}`` 会替换成 @ 到的值班人（解析不出 open_id 时退化成纯文本姓名）
+    "MONITORING_SRE_REPORT_GREETING": "Hi team {mention}",
+    # 回调 value 有长度上限，单卡最多带几张截图 key 过去（超出会记日志，不静默丢弃）
+    "MONITORING_SRE_REPORT_MAX_IMG_KEYS": "6",
+    # ---- SRE 值班表（与 AlertBot / dutybot 同一张 wiki 表；本 App 已有读取权限）----
+    "OSE_SPREADSHEET_TOKEN": "O4Dfw4DVTiPpFukn801l5z3WgMd",
+    "OSE_SHEET_ID": "AS33r7",
+    "SRE_DUTY_SCAN_RANGE": "A1:ZZ200",
+    # 只 @ 这一段的值班（BACKEND=后端；留空 = 当天所有值班人）
+    "SRE_DUTY_SECTION": "BACKEND",
+    # 永不 @ 的人（离职等），逗号分隔
+    "SRE_DUTY_EXCLUDE": "Ziyang",
+    "SRE_DUTY_CACHE_SECONDS": "120",
+    # 姓名 → open_id 从「本机器人所在群的成员名单」现取并缓存。
+    # open_id 按 App 隔离，不能照搬 AlertBot 的 duty_openids.json。
+    "SRE_DUTY_MEMBER_CACHE_SECONDS": "600",
     # 1=一个告警一张卡片：每个触发的面板单独发一张卡（截图内嵌其中）。两个面板同时告警 → 两张卡。
     # 0=旧行为：所有面板合并成一条正文 + 截图分开发。
     "MONITORING_ALERT_ONE_CARD_PER_PANEL": "1",
@@ -1191,6 +1215,9 @@ MONITORING_DEPLOY_RESTART_CMD = _cfg_str(
     "systemctl restart grafanaplatformbot",
 ).strip()
 MONITORING_TRACK_ENABLE = _lark_env_truthy_or_default("MONITORING_TRACK_ENABLE", default=True)
+MONITORING_SRE_REPORT_ENABLE = _lark_env_truthy_or_default("MONITORING_SRE_REPORT_ENABLE", default=True)
+MONITORING_SRE_REPORT_CHAT_ID = _cfg_str("MONITORING_SRE_REPORT_CHAT_ID", "").strip()
+SRE_DUTY_SECTION = _cfg_str("SRE_DUTY_SECTION", "BACKEND").strip()
 TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
 MONITORING_ALERT_AT_USER_ENABLE = _lark_env_truthy_or_default(
     "MONITORING_ALERT_AT_USER_ENABLE",
@@ -7072,6 +7099,489 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
     return _mute_toast_response("Unknown action", "warning")
 
 
+# ---------------------------------------------------------------------------
+# SRE duty → @-mentions — ported from AlertBot's "Report to SRE" button
+# (C:/…/AlertBot: duty.py + sre_Duty.py). AlertBot itself is left untouched.
+#
+# Same source of truth as AlertBot: the OSE duty wiki sheet, the day's checkbox
+# column, and only the BACKEND section of the SRE roster.
+#
+# One deliberate difference. AlertBot maps a name → ``open_id`` through a JSON file
+# it collects itself (``duty_openids.json``). That file cannot be reused here: a Lark
+# ``open_id`` is minted **per app**, and this bot is a different app from AlertBot —
+# the same person is ``ou_0398…`` to this bot and ``ou_d4a9…`` to AlertBot. Copying the
+# map would render dead ``<at>`` tags and, worse, fail silently. So names are resolved
+# live against the member lists of the groups this bot is in: always this app's own
+# ids, and self-healing when people join or leave.
+# ---------------------------------------------------------------------------
+
+# Column-A names to look for in the duty sheet (start-match, case-insensitive).
+_SRE_DUTY_TARGET_NAMES: List[str] = [
+    "Alex Tai", "Kelvin", "Wei Siong", "Bowei", "Jay",
+    "Linus Lim", "Jeng Liang", "Misa", "Kai Xuan", "Yoon Hong",
+    "Adrian", "Clarence", "Khai Xuan",
+]
+
+# Roster sections. Only the section named by ``SRE_DUTY_SECTION`` is tagged, so a
+# platform alert never pages the frontend team. Someone on duty who belongs to no
+# section (e.g. Adrian) is dropped while a section filter is active — same as
+# AlertBot: better to under-tag than to page the wrong team.
+_SRE_DUTY_TEAMS: List[Tuple[str, List[str]]] = [
+    (
+        "BACKEND TEAM (FPMS, PMS, CPMS1.0, CPMS2.0/IGO, SMS, PULSAR, DOS/FLINK)",
+        ["Wei Siong", "BoWei", "KaiXuan", "Linus Lim", "Jeng Liang", "Misa", "Clarence", "Khai Xuan"],
+    ),
+    (
+        "FRONTEND TEAM (FRONTEND, POSTHOG, BI, AI/CHATBOT)",
+        ["Kelvin", "Alex Tai", "YoonHong", "Jay"],
+    ),
+]
+
+_SRE_DUTY_MONTHS: Dict[str, int] = {
+    "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
+    "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12,
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
+_sre_duty_sheet_cache: Tuple[float, Optional[List[Any]]] = (0.0, None)
+_sre_duty_sheet_lock = threading.Lock()
+_sre_duty_members_cache: Tuple[float, Dict[str, str]] = (0.0, {})
+_sre_duty_members_lock = threading.Lock()
+
+
+def _sre_duty_norm(name: str) -> str:
+    """Fold a name for comparison: ``"Kai Xuan"`` / ``"KaiXuan"`` → ``kaixuan``."""
+    return re.sub(r"[^0-9a-z]", "", (name or "").lower())
+
+
+def _sre_duty_cell_text(cell: Any) -> str:
+    """Sheet cells arrive as str, None, or a rich-text list of ``{"text": …}`` runs."""
+    if cell is None:
+        return ""
+    if isinstance(cell, str):
+        return cell
+    if isinstance(cell, list):
+        parts: List[str] = []
+        for item in cell:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(str(item.get("text") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    return str(cell)
+
+
+def _sre_duty_is_checked(cell: Any) -> bool:
+    """True for a ticked duty checkbox — the sheet renders it several ways."""
+    if cell is None:
+        return False
+    if isinstance(cell, bool):
+        return cell
+    if isinstance(cell, (int, float)):
+        return cell == 1
+    if isinstance(cell, str):
+        return cell.strip().lower() in ("✓", "✔", "是", "1", "true", "yes", "勾")
+    return False
+
+
+def _sre_duty_parse_month_year(text: str) -> Tuple[Optional[int], Optional[int]]:
+    """``"September 2026"`` → ``(9, 2026)``."""
+    if not isinstance(text, str):
+        return None, None
+    for mon_name, mon_num in _SRE_DUTY_MONTHS.items():
+        m = re.search(rf"{re.escape(mon_name)}\s+(\d{{4}})", text, re.IGNORECASE)
+        if m:
+            return mon_num, int(m.group(1))
+    return None, None
+
+
+def _sre_duty_sheet_values() -> List[Any]:
+    """The duty sheet grid, cached for ``SRE_DUTY_CACHE_SECONDS``. Raises on failure."""
+    global _sre_duty_sheet_cache
+    ttl = _cfg_int("SRE_DUTY_CACHE_SECONDS", 120)
+    now = time.monotonic()
+    cached_at, cached = _sre_duty_sheet_cache
+    if ttl > 0 and cached is not None and (now - cached_at) < ttl:
+        return cached
+
+    token = _cfg_str("OSE_SPREADSHEET_TOKEN", "").strip()
+    sheet_id = _cfg_str("OSE_SHEET_ID", "").strip()
+    if not token or not sheet_id:
+        raise RuntimeError("OSE_SPREADSHEET_TOKEN / OSE_SHEET_ID not configured")
+    scan = _cfg_str("SRE_DUTY_SCAN_RANGE", "A1:ZZ200").strip() or "A1:ZZ200"
+
+    tok = _lark_tenant_access_token_string()
+    url = (
+        f"{_lark_api_domain()}/open-apis/sheets/v2/spreadsheets/{token}"
+        f"/values/{sheet_id}!{scan}"
+    )
+    r = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {tok}"},
+        params={"valueRenderOption": "FormattedValue"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if int(j.get("code", -1)) != 0:
+        raise RuntimeError(f"duty sheet read failed: {j.get('code')} {j.get('msg')}")
+    values = ((j.get("data") or {}).get("valueRange") or {}).get("values") or []
+    if len(values) < 2:
+        raise RuntimeError(f"duty sheet has fewer than 2 rows (range {scan})")
+
+    with _sre_duty_sheet_lock:
+        _sre_duty_sheet_cache = (now, values)
+    return values
+
+
+def _sre_duty_names_for_date(target_date: Any, values: List[Any]) -> List[str]:
+    """Names ticked for ``target_date``: find the month header, then the day column."""
+    header_col = None
+    for col_idx, cell in enumerate(values[0]):
+        mon, year = _sre_duty_parse_month_year(_sre_duty_cell_text(cell))
+        if mon == target_date.month and year == target_date.year:
+            header_col = col_idx
+            break
+    if header_col is None:
+        return []
+
+    # The day number lives in one of the first few rows; verify the column really
+    # belongs to this month by walking back to its nearest month header.
+    date_col = None
+    for row_idx in range(1, min(5, len(values))):
+        row = values[row_idx] or []
+        for col in range(len(row)):
+            try:
+                day_num = int(_sre_duty_cell_text(row[col]).strip())
+            except (ValueError, TypeError):
+                continue
+            if day_num != target_date.day:
+                continue
+            header = ""
+            for hcol in range(col, -1, -1):
+                if hcol < len(values[0]) and values[0][hcol]:
+                    header = _sre_duty_cell_text(values[0][hcol])
+                    break
+            mon, year = _sre_duty_parse_month_year(header)
+            if mon == target_date.month and year == target_date.year:
+                date_col = col
+                break
+        if date_col is not None:
+            break
+    if date_col is None:
+        return []
+
+    # Anchored start-match: a plain substring match would let "Jay" hit an unrelated
+    # "Chris Jay Montecalvo [QA]" row further up and shadow the real one.
+    name_rows: Dict[str, int] = {}
+    for row_idx in range(2, len(values)):
+        row = values[row_idx] or []
+        if not row:
+            continue
+        cell_a = _sre_duty_cell_text(row[0]).strip().upper()
+        if not cell_a:
+            continue
+        for target in _SRE_DUTY_TARGET_NAMES:
+            if cell_a.startswith(target.upper()):
+                name_rows.setdefault(target, row_idx)
+                break
+
+    checked: List[str] = []
+    for name, row_idx in name_rows.items():
+        row = values[row_idx] or []
+        if date_col >= len(row):
+            continue
+        if _sre_duty_is_checked(_sre_duty_cell_text(row[date_col])):
+            checked.append(name)
+    return checked
+
+
+def _sre_duty_excluded(name: str) -> bool:
+    """People who must never be tagged (left the company) — ``SRE_DUTY_EXCLUDE``."""
+    n = _sre_duty_norm(name)
+    if not n:
+        return True
+    for raw in _cfg_str("SRE_DUTY_EXCLUDE", "").split(","):
+        if raw.strip() and _sre_duty_norm(raw) == n:
+            return True
+    return False
+
+
+def _sre_duty_keep_section(names: List[str]) -> List[str]:
+    """Keep only names in the ``SRE_DUTY_SECTION`` roster section (blank = keep all)."""
+    want = (SRE_DUTY_SECTION or "").strip().upper()
+    if not want:
+        return list(names)
+    allowed: Set[str] = set()
+    for title, members in _SRE_DUTY_TEAMS:
+        if str(title).upper().startswith(want):
+            allowed |= {_sre_duty_norm(m) for m in members}
+    if not allowed:
+        logger.warning("SRE_DUTY_SECTION=%r matches no roster section — tagging nobody", want)
+        return []
+    return [n for n in names if _sre_duty_norm(n) in allowed]
+
+
+def _sre_duty_today_names() -> List[str]:
+    """Today's SRE duty for the configured section, minus excluded people."""
+    values = _sre_duty_sheet_values()
+    raw = _sre_duty_names_for_date(datetime.now().date(), values)
+    in_section = _sre_duty_keep_section(raw)
+    kept = [n for n in in_section if not _sre_duty_excluded(n)]
+    dropped = [n for n in in_section if _sre_duty_excluded(n)]
+    if dropped:
+        logger.info("SRE duty: excluding %s (SRE_DUTY_EXCLUDE)", ", ".join(dropped))
+    logger.info(
+        "SRE duty today: sheet=%s section(%s)=%s tagged=%s",
+        raw, SRE_DUTY_SECTION or "*", in_section, kept,
+    )
+    return kept
+
+
+def _sre_duty_member_directory() -> Dict[str, str]:
+    """``display name → open_id`` for everyone in the groups this bot belongs to.
+
+    These are **this app's** open_ids, which is the whole point — see the note at the
+    top of this section. Cached for ``SRE_DUTY_MEMBER_CACHE_SECONDS``.
+    """
+    global _sre_duty_members_cache
+    ttl = _cfg_int("SRE_DUTY_MEMBER_CACHE_SECONDS", 600)
+    now = time.monotonic()
+    cached_at, cached = _sre_duty_members_cache
+    if ttl > 0 and cached and (now - cached_at) < ttl:
+        return cached
+
+    tok = _lark_tenant_access_token_string()
+    headers = {"Authorization": f"Bearer {tok}"}
+    directory: Dict[str, str] = {}
+    partial = False
+
+    # Reuse the paginated lister behind /allgroup: a single ``page_size=100`` request would stop at
+    # the first 100 groups, and anyone reachable only through group 101+ would resolve to plain text
+    # forever, with the "is the bot in a group with them?" warning pointing at the wrong cause.
+    for chat in _chat_menu_list_groups(limit=1000):
+        cid = str(chat.get("chat_id") or "").strip()
+        if not cid:
+            continue
+        page_token = ""
+        while True:
+            params: Dict[str, Any] = {"member_id_type": "open_id", "page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            mr = requests.get(
+                f"{_lark_api_domain()}/open-apis/im/v1/chats/{cid}/members",
+                headers=headers,
+                params=params,
+                timeout=30,
+            )
+            mj = mr.json()
+            if int(mj.get("code", -1)) != 0:
+                logger.warning(
+                    "SRE duty: cannot list members of %s: %s %s",
+                    cid, mj.get("code"), mj.get("msg"),
+                )
+                partial = True
+                break
+            data = mj.get("data") or {}
+            for m in data.get("items") or []:
+                nm = str(m.get("name") or "").strip()
+                oid = str(m.get("member_id") or "").strip()
+                if nm and oid:
+                    directory.setdefault(nm, oid)
+            page_token = str(data.get("page_token") or "")
+            if not page_token or not data.get("has_more"):
+                break
+
+    if partial:
+        # Never cache a half-built directory at full TTL: a rate-limit blip on the one group that
+        # holds today's duty person would otherwise degrade every click for 10 minutes to plain-text
+        # names — a card that looks like it paged people but sent no notification.
+        logger.warning("SRE duty: member directory INCOMPLETE (%d people) — not cached", len(directory))
+        return directory
+    with _sre_duty_members_lock:
+        _sre_duty_members_cache = (now, directory)
+    logger.info("SRE duty: member directory refreshed (%d people)", len(directory))
+    return directory
+
+
+def _sre_duty_resolve_open_id(name: str, directory: Dict[str, str]) -> Optional[str]:
+    """Find this app's ``open_id`` for a roster name.
+
+    Exact match on the folded name first. Only then a containment fallback — the sheet
+    spells "Kai Xuan" while Lark shows "KaiXuan Ng". The fallback needs >=4 chars and a
+    *unique* hit: "Kai Xuan" and "Khai Xuan" are two different people, so an ambiguous
+    match is dropped to plain text rather than guessed at.
+    """
+    target = _sre_duty_norm(name)
+    if not target:
+        return None
+    by_norm: Dict[str, str] = {}
+    for nm, oid in directory.items():
+        by_norm.setdefault(_sre_duty_norm(nm), oid)
+    if target in by_norm:
+        return by_norm[target]
+    if len(target) < 4:
+        return None
+    hits = {
+        oid
+        for key, oid in by_norm.items()
+        if len(key) >= 4 and (target in key or key in target)
+    }
+    if len(hits) == 1:
+        return hits.pop()
+    if hits:
+        logger.warning("SRE duty: %r matches %d people ambiguously — leaving as text", name, len(hits))
+    return None
+
+
+def _sre_duty_mention_text() -> Tuple[str, List[str], str]:
+    """``(mention_markup, names, error)`` for today's duty.
+
+    A name with no resolvable ``open_id`` stays as plain text (AlertBot does the same):
+    "Hi team Kai Xuan" is a recoverable annoyance, three dead ``<at>`` tags look like
+    people were paged when they were not.
+
+    The mention is **empty** when there is nobody to tag. AlertBot substitutes the word "team" here,
+    but its template is "Hi {mention}"; ours already says "Hi team", so borrowing that fallback
+    would post "Hi team team" on every holiday and every sheet outage.
+    """
+    try:
+        names = _sre_duty_today_names()
+    except Exception as e:
+        logger.exception("SRE duty lookup failed")
+        return "", [], str(e)[:200]
+    if not names:
+        return "", [], "no one is on SRE duty for today in the roster"
+
+    try:
+        directory = _sre_duty_member_directory()
+    except Exception as e:
+        logger.exception("SRE duty: member directory lookup failed")
+        return " ".join(names), names, f"could not resolve @-mentions: {str(e)[:160]}"
+
+    parts: List[str] = []
+    unresolved: List[str] = []
+    for n in names:
+        oid = _sre_duty_resolve_open_id(n, directory)
+        if oid:
+            parts.append(f'<at id="{oid}"></at>')
+        else:
+            parts.append(n)
+            unresolved.append(n)
+    if unresolved:
+        logger.warning(
+            "SRE duty: no open_id for %s — posted as plain text (is the bot in a group with them?)",
+            ", ".join(unresolved),
+        )
+    return " ".join(parts), names, ""
+
+
+def _sre_report_card_dict(
+    greeting: str, img_keys: List[str], note: str = "", kinds: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """The card posted into the SRE group: title, the ask, then the alert screenshot(s).
+
+    ``kinds`` names the panel(s) that fired. The button only renders when a screenshot exists, but
+    an image_key can still expire between the alert and the click — so the card always says what
+    fired in text, and never reduces to a bare "Hi team @…".
+    """
+    elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": greeting}]
+    labels = [_mute_channel_display_label(k) for k in (kinds or []) if (k or "").strip()]
+    if labels:
+        elements.append({"tag": "markdown", "content": "**Alerting:** " + " · ".join(labels)})
+    if note:
+        elements.append({"tag": "markdown", "content": note})
+    for ik in img_keys:
+        elements.append(_lark_card_full_image_element(ik, "Grafana"))
+    title = _cfg_str("MONITORING_SRE_REPORT_CARD_TITLE", "Core Metrics Alert")
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "red",
+            "title": {"tag": "plain_text", "content": title[:190]},
+        },
+        "body": {"elements": elements},
+    }
+
+
+def _sre_report_card_click_worker(img_keys: List[str], kinds: List[str], operator_open_id: str) -> None:
+    """Button click → post one "Core Metrics Alert" card into the SRE group, @-ing duty."""
+    chat = MONITORING_SRE_REPORT_CHAT_ID
+    try:
+        # Standalone send into a FIXED group: without this, _lark_send_interactive_card
+        # would honour MONITORING_REPLY_IN_THREAD and thread the card onto the alert
+        # message in the alerting chat instead — same guard as _dashboard_card_click_worker.
+        _set_reply_to_mid("")
+        if not chat:
+            logger.error("SRE report: MONITORING_SRE_REPORT_CHAT_ID is empty — nothing sent")
+            return
+        mention, names, err = _sre_duty_mention_text()
+        greeting = _cfg_str("MONITORING_SRE_REPORT_GREETING", "Hi team {mention}").replace(
+            "{mention}", mention
+        )
+        # An empty mention leaves a double space / dangling tail behind — tidy it so the degraded
+        # card still reads as a sentence rather than as a rendering bug.
+        greeting = re.sub(r"[ \t]{2,}", " ", greeting).strip()
+        note = f"_⚠️ SRE duty roster: {err}_" if err else ""
+        card = _sre_report_card_dict(greeting, img_keys, note, kinds)
+        _lark_send_interactive_card("chat_id", chat, card)
+        logger.info(
+            "SRE report card sent chat=%s duty=%s images=%s kinds=%s by=%s%s",
+            chat, names or "-", len(img_keys), kinds or "-", operator_open_id or "?",
+            f" (duty error: {err})" if err else "",
+        )
+    except Exception as e:
+        logger.exception("SRE report card send failed (chat=%s)", chat)
+        if (operator_open_id or "").strip():
+            try:
+                _lark_send_text(
+                    "open_id",
+                    operator_open_id.strip(),
+                    f"Report to SRE failed: {e}",
+                )
+            except Exception:
+                logger.exception("SRE report failure notice send failed")
+
+
+def _alert_sre_report_button_elements(
+    alert_kinds: List[str], img_keys: List[str]
+) -> List[Dict[str, Any]]:
+    """The "Report to SRE" button row shown on alert cards.
+
+    The screenshot keys ride along inside the callback payload: the alert path uploads
+    them, embeds them and drops them, so there is nothing to look them up from later.
+    Image keys stay valid for later messages, and this is the same app that uploaded
+    them, so the second card re-embeds them instead of re-capturing Grafana.
+    """
+    if not MONITORING_SRE_REPORT_CHAT_ID:
+        return []
+    cap = max(1, _cfg_int("MONITORING_SRE_REPORT_MAX_IMG_KEYS", 6))
+    keys = [k.strip() for k in (img_keys or []) if (k or "").strip()]
+    if len(keys) > cap:
+        logger.warning(
+            "SRE report button: card has %d screenshots, only the first %d ride the callback "
+            "(raise MONITORING_SRE_REPORT_MAX_IMG_KEYS to carry more)",
+            len(keys), cap,
+        )
+        keys = keys[:cap]
+    payload: Dict[str, Any] = {
+        "k": "monitoring_btn",
+        "v": "sre_report",
+        "imgs": ",".join(keys),
+        "kinds": ",".join([k for k in (alert_kinds or []) if (k or "").strip()]),
+    }
+    return [
+        _monitoring_card_v2_callback_button(
+            _cfg_str("MONITORING_SRE_REPORT_BUTTON_TEXT", "Report to SRE")[:40],
+            "danger",
+            payload,
+            element_id="mon_sre_rep",
+        )
+    ]
+
+
 def _lark_dispatch_card_action(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Route card.action; optional dict → merge into HTTP 200 JSON (toast)."""
     val = _lark_card_action_value(data)
@@ -7080,8 +7590,8 @@ def _lark_dispatch_card_action(data: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _mute_purge_expired()
         return _mute_card_action_dispatch(data, val)
     if k == "monitoring_btn":
-        _handle_monitoring_card_action(data)
-        return None
+        toast = _handle_monitoring_card_action(data)
+        return toast
     logger.info("card.action ignored value=%r", val or None)
     return None
 
@@ -7157,6 +7667,12 @@ def _monitoring_interactive_card_dict(
         elements.extend(
             _alert_quick_mute_button_elements(receive_id_type, receive_id, list(alert_kinds))
         )
+    # "Report to SRE" — a real watchdog alert card only. ``keys`` and ``alert_kinds`` are both
+    # required: without a screenshot or a panel name the report would page duty with an empty card,
+    # and ``alert_kinds`` is what keeps the button off the ``/mo`` reply (which merely quotes the
+    # "[ALERT]" banner, so anyone running /mo mid-alert would otherwise get a page-the-SRE button).
+    if is_alert_card and MONITORING_SRE_REPORT_ENABLE and keys and alert_kinds:
+        elements.extend(_alert_sre_report_button_elements(list(alert_kinds), keys))
     if _lark_env_truthy("MONITORING_MESSAGE_CARD_BUTTON_ENABLE"):
         cb_payload: Dict[str, Any] = {"k": "monitoring_btn", "v": "refresh"}
         rt = (receive_id_type or "").strip()
@@ -13706,23 +14222,40 @@ def _dashboard_card_click_worker(kind: str, chat_id: str, open_id: str) -> None:
             logger.exception("%s card-click failure notify send failed", label)
 
 
-def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
+def _handle_monitoring_card_action(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     val = _lark_card_action_value(data)
     k = _lark_dict_pick_str(val, "k")
     v = _lark_dict_pick_str(val, "v")
-    if k != "monitoring_btn" or v not in ("refresh", "coremetrics", "freespin"):
-        return
+    if k != "monitoring_btn" or v not in ("refresh", "coremetrics", "freespin", "sre_report"):
+        return None
     ev_id = _lark_im_payload_event_id(data)
     with _card_action_dedup_lock:
         if ev_id and ev_id in _monitoring_card_action_event_ids:
             logger.info("duplicate card.action event_id=%r — skip", ev_id)
-            return
+            return None
         if ev_id:
             _monitoring_card_action_event_ids.add(ev_id)
             if len(_monitoring_card_action_event_ids) > 2000:
                 _monitoring_card_action_event_ids.clear()
                 _monitoring_card_action_event_ids.add(ev_id)
     chat_id, open_id = _lark_card_action_target_ids(data)
+    if v == "sre_report":
+        # Destination is fixed (MONITORING_SRE_REPORT_CHAT_ID), so rid_t/rid are irrelevant here —
+        # read the operator before the override below reassigns open_id, so a failure can be
+        # reported back to whoever pressed the button.
+        img_keys = [s.strip() for s in _lark_dict_pick_str(val, "imgs").split(",") if s.strip()]
+        kinds = [s.strip() for s in _lark_dict_pick_str(val, "kinds").split(",") if s.strip()]
+        logger.info(
+            "card.action sre_report accepted images=%s kinds=%s by=%r event_id=%r",
+            len(img_keys), kinds or "-", open_id or None, ev_id or None,
+        )
+        threading.Thread(
+            target=_sre_report_card_click_worker,
+            args=(img_keys, kinds, open_id),
+            daemon=True,
+            name="sre-report-card-action",
+        ).start()
+        return _mute_toast_response("Reporting to SRE…", "info")
     # Prefer original card target from callback payload so group-card clicks reply in the same group
     # instead of falling back to operator open_id (private message).
     rid_t = _lark_dict_pick_str(val, "rid_t", "receive_id_type")
@@ -13746,7 +14279,7 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
             daemon=True,
             name=f"{v}-card-action",
         ).start()
-        return
+        return None
     logger.info("card.action refresh accepted chat=%r open=%r event_id=%r", bool(chat_id), bool(open_id), ev_id or None)
     threading.Thread(
         target=_monitoring_send_screenshot_on_card_click,
@@ -13754,6 +14287,7 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
         daemon=True,
         name="monitoring-card-action",
     ).start()
+    return None
 
 
 def _monitoring_ai_extract_ollama_text(data: Any) -> str:
