@@ -7465,7 +7465,10 @@ def _sre_duty_mention_text() -> Tuple[str, List[str], str]:
     for n in names:
         oid = _sre_duty_resolve_open_id(n, directory)
         if oid:
-            parts.append(f'<at id="{oid}"></at>')
+            # Unquoted id — card schema 2.0 ``markdown`` only renders a mention in this form
+            # (``_append_monitoring_alert_target_user_mention`` uses the same). AlertBot's quoted
+            # ``<at id="ou_…">`` is schema 1.0 ``lark_md`` syntax and shows up as literal text here.
+            parts.append(f"<at id={oid}></at>")
         else:
             parts.append(n)
             unresolved.append(n)
