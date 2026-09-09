@@ -15261,6 +15261,36 @@ def _lark_customized_event_to_schema2_dict(ce: Any) -> Dict[str, Any]:
     return _lark_ws_sdk_event_to_dict(ce)
 
 
+def _on_ws_p2_card_action_trigger(data: Any) -> Any:
+    """WebSocket ``card.action.trigger`` → the same dispatcher the HTTP webhook uses.
+
+    Without this processor the SDK logs ``processor not found, type: card.action.trigger`` and
+    Feishu shows **200671** ("callback returned non-HTTP-200") on **every** card button — mute,
+    Resend screenshot, Core Metrics, Free Spin and Report to SRE alike — because the long
+    connection never answers the interaction. ``LARK_EVENT_MODE=ws`` delivers card clicks here,
+    not to ``POST /webhook/event``, so registering only IM events silently breaks all buttons.
+    """
+    from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+
+    try:
+        payload = _lark_ws_sdk_event_to_dict(data)
+        ev = payload.get("event") if isinstance(payload.get("event"), dict) else None
+        if ev is not None:
+            # HTTP payloads carry these directly on ``event``; the SDK model nests them under
+            # ``context``. Flatten so _lark_card_action_target_ids / _lark_card_action_message_id
+            # resolve the origin chat the same way on both transports.
+            ctx = ev.get("context") if isinstance(ev.get("context"), dict) else {}
+            for key in ("open_chat_id", "open_message_id"):
+                if ctx.get(key) and not ev.get(key):
+                    ev[key] = ctx[key]
+        extra = _lark_dispatch_card_action(payload)
+        if isinstance(extra, dict) and extra:
+            return P2CardActionTriggerResponse(extra)
+    except Exception:
+        logger.exception("WS card.action handler failed")
+    return P2CardActionTriggerResponse({})
+
+
 def _process_im_message_event(data: Dict[str, Any]) -> None:
     """
     Shared handler for ``im.message`` from HTTP webhook or WebSocket (``CustomizedEvent`` v1/v2).
@@ -16183,6 +16213,17 @@ def start_lark_ws_client_blocking() -> None:
     bld = EventDispatcherHandler.builder(enc, ver).register_p2_im_message_receive_v1(
         _on_ws_p2_im_message_receive_v1
     )
+    # Card buttons arrive on the long connection too. Without this the SDK answers
+    # "processor not found, type: card.action.trigger" and every button shows Feishu 200671.
+    if hasattr(bld, "register_p2_card_action_trigger"):
+        bld = bld.register_p2_card_action_trigger(_on_ws_p2_card_action_trigger)
+        logger.info("Lark WS: card.action.trigger registered (card buttons work on the long connection)")
+    else:
+        bld = bld.register_p2_customized_event("card.action.trigger", _on_ws_p2_card_action_trigger)
+        logger.warning(
+            "lark_oapi has no register_p2_card_action_trigger — falling back to a customized "
+            "event handler; upgrade lark_oapi if card buttons misbehave."
+        )
     if _lark_env_truthy("LARK_WS_REGISTER_IM_MESSAGE_V2"):
         bld = bld.register_p2_customized_event(
             "im.message.receive_v2", _on_ws_im_message_p2_customized
