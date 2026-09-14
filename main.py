@@ -409,8 +409,9 @@ _CFG: Dict[str, Any] = {
     # 并 @ 当天 SRE BACKEND 值班。逻辑照搬 AlertBot 的 “Report to SRE”。
     "MONITORING_SRE_REPORT_ENABLE": "1",
     "MONITORING_SRE_REPORT_BUTTON_TEXT": "Report to SRE",
-    # 目标群：本 App 必须已在群里（/allgroup 可确认），否则 im/v1/messages 会报权限错。
-    "MONITORING_SRE_REPORT_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
+    # 目标群 = OSE & SRE（值班的人都在这个群里，@ 才会真正通知到；oc_ad9b… Laboratory 仅用于测试）。
+    # 本 App 必须已在群里（/allgroup 可确认），否则 im/v1/messages 会报权限错。
+    "MONITORING_SRE_REPORT_CHAT_ID": "oc_7713b00dc15c884caf5ee615ef948ef3",
     "MONITORING_SRE_REPORT_CARD_TITLE": "Core Metrics Alert",
     # ``{mention}`` 会替换成 @ 到的值班人（解析不出 open_id 时退化成纯文本姓名）
     "MONITORING_SRE_REPORT_GREETING": "Hi team {mention}",
