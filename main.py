@@ -363,7 +363,13 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 80,
     # Withdraw only: spike/drop vs **median baseline** of eval window (not bucket-to-bucket %).
     # 例 median=200、25% → spike 需 >250；median=30 时 40 仅 +33% vs baseline，不告警。
-    "MONITORING_WITHDRAW_MIN_BASELINE_VALUE": "0",
+    # 本盘现已跌到个位数/分钟（median 1~2），百分比规则在这个量级下没有意义：median=1 时任何 2 都算
+    # 「+100% SPIKE」、任何 0 都算「-100% DROP」——5 格判窗里约 70% 的取值组合都会触发。
+    # 故设下限 10：median 低于该值时直接跳过百分比比较（见 _median_baseline_alert_analysis）。
+    "MONITORING_WITHDRAW_MIN_BASELINE_VALUE": "10",
+    # 提款「低量模式」：一次跳变的 from/to 峰值低于该值时，分钟级波动（**含 SPIKE**）一律按正常业务
+    # 节奏处理，在调用视觉模型之前就抑制（见 _monitoring_ai_deposit_withdraw_routine_volatility）。
+    "MONITORING_WITHDRAW_LOW_VOLUME_PEAK": "20",
     "MONITORING_FPMS_NT_LOGIN_ENABLE": "1",
     # Authenticate logins: spike/drop vs eval-window **median baseline**.
     # Raised from 25% -> 100%: this panel's post-incident plateau naturally jitters
@@ -14556,6 +14562,11 @@ def _monitoring_ai_deposit_withdraw_routine_volatility(alert_text: str) -> Optio
             if peak > 450 or peak < 80 or delta > 80:
                 return None
         elif "提款" in header or "InitiateWithdrawal" in header:
+            # Low-volume mode: at a few withdrawals a minute a percentage move is noise in *either*
+            # direction — 1→6 reads as "+500%", 1→0 as "-100%". The 20..150 DROP band below was
+            # written when this panel ran ~100-175/min and cannot match single-digit traffic.
+            if peak < _cfg_float("MONITORING_WITHDRAW_LOW_VOLUME_PEAK", 20.0):
+                continue
             if direction != "DROP":
                 return None
             if fv > 150 or fv < 20 or delta > 40:
