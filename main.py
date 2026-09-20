@@ -423,6 +423,10 @@ _CFG: Dict[str, Any] = {
     "MONITORING_SRE_REPORT_GREETING": "Hi team {mention}",
     # 回调 value 有长度上限，单卡最多带几张截图 key 过去（超出会记日志，不静默丢弃）
     "MONITORING_SRE_REPORT_MAX_IMG_KEYS": "6",
+    # 1=报告卡片末尾再附一张「整块 dashboard」截图（点按钮时现截；告警本身不会多花时间）。
+    # 告警只会截「单面板」或「整图」二选一，所以整图必须点的时候才有。
+    "MONITORING_SRE_REPORT_WHOLE_GRAPH": "1",
+    "MONITORING_SRE_REPORT_WHOLE_GRAPH_RANGE": "now-3h",
     # ---- SRE 值班表（与 AlertBot / dutybot 同一张 wiki 表；本 App 已有读取权限）----
     "OSE_SPREADSHEET_TOKEN": "O4Dfw4DVTiPpFukn801l5z3WgMd",
     "OSE_SHEET_ID": "AS33r7",
@@ -7488,22 +7492,38 @@ def _sre_duty_mention_text() -> Tuple[str, List[str], str]:
 
 
 def _sre_report_card_dict(
-    greeting: str, img_keys: List[str], note: str = "", kinds: Optional[List[str]] = None
+    greeting: str,
+    img_keys: List[str],
+    note: str = "",
+    kinds: Optional[List[str]] = None,
+    series: Optional[List[str]] = None,
+    whole_keys: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """The card posted into the SRE group: title, the ask, then the alert screenshot(s).
+    """The card posted into the SRE group, in the layout SRE asked for::
 
-    ``kinds`` names the panel(s) that fired. The button only renders when a screenshot exists, but
-    an image_key can still expire between the alert and the click — so the card always says what
-    fired in text, and never reduces to a bare "Hi team @…".
+        Hi team @Bo Wei @Linus Lim @Misa @Khai Xuan
+        HTTP · 请求总数/1m      ← graph name   (kinds)
+        http                    ← series name  (series)
+        {picture 1}             ← the alerting panel/series shot (img_keys)
+        {picture 2}             ← the whole dashboard (whole_keys)
+
+    The graph and series names are always rendered as text: the button only appears when a
+    screenshot exists, but an image_key can still expire between the alert and the click, and a
+    report must never reduce to a bare "Hi team @…".
     """
     elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": greeting}]
     labels = [_mute_channel_display_label(k) for k in (kinds or []) if (k or "").strip()]
     if labels:
-        elements.append({"tag": "markdown", "content": "**Alerting:** " + " · ".join(labels)})
+        elements.append({"tag": "markdown", "content": " · ".join(labels)})
+    names = [s.strip() for s in (series or []) if (s or "").strip()]
+    if names:
+        elements.append({"tag": "markdown", "content": ", ".join(names)})
     if note:
         elements.append({"tag": "markdown", "content": note})
     for ik in img_keys:
         elements.append(_lark_card_full_image_element(ik, "Grafana"))
+    for ik in whole_keys or []:
+        elements.append(_lark_card_full_image_element(ik, "Grafana dashboard"))
     title = _cfg_str("MONITORING_SRE_REPORT_CARD_TITLE", "Core Metrics Alert")
     return {
         "schema": "2.0",
@@ -7516,7 +7536,40 @@ def _sre_report_card_dict(
     }
 
 
-def _sre_report_card_click_worker(img_keys: List[str], kinds: List[str], operator_open_id: str) -> None:
+def _sre_report_whole_dashboard_image_key() -> Optional[str]:
+    """Fresh whole-dashboard capture — the report card's second picture.
+
+    There is nothing to reuse from the alert: :func:`_grafana_alert_screenshot_pairs` returns
+    **either** per-panel solo captures **or** a whole-dashboard fallback, never both, so on a normal
+    alert only the panel shot exists. Capturing here (click time, on the worker thread, after the
+    toast has already answered Feishu) means an alert nobody escalates pays nothing for it, and the
+    dashboard shown is current as of the escalation.
+    """
+    if not _lark_env_truthy("MONITORING_SRE_REPORT_WHOLE_GRAPH"):
+        return None
+    if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+        logger.info("SRE report: GRAFANA_SCREENSHOT_ENABLE=0 — skipping the whole-dashboard capture")
+        return None
+    rng = _cfg_str("MONITORING_SRE_REPORT_WHOLE_GRAPH_RANGE", "now-3h").strip() or "now-3h"
+    sess = grafana_login_session()
+    su, eu = _monitoring_watch_eval_window_unix()
+    png = _grafana_headless_screenshot_png(
+        sess,
+        su,
+        eu,
+        relative_from=rng,
+        relative_to="now",
+        timezone_param=_cfg_str("MONITORING_WATCH_SCREENSHOT_TIMEZONE", "browser").strip() or None,
+    )
+    return _lark_upload_png_image_key(png)
+
+
+def _sre_report_card_click_worker(
+    img_keys: List[str],
+    kinds: List[str],
+    series: List[str],
+    operator_open_id: str,
+) -> None:
     """Button click → post one "Core Metrics Alert" card into the SRE group, @-ing duty."""
     chat = MONITORING_SRE_REPORT_CHAT_ID
     try:
@@ -7535,12 +7588,20 @@ def _sre_report_card_click_worker(img_keys: List[str], kinds: List[str], operato
         # card still reads as a sentence rather than as a rendering bug.
         greeting = re.sub(r"[ \t]{2,}", " ", greeting).strip()
         note = f"_⚠️ SRE duty roster: {err}_" if err else ""
-        card = _sre_report_card_dict(greeting, img_keys, note, kinds)
+        # Best-effort: a Grafana hiccup must not cost SRE the panel shot and the @-mentions.
+        whole_keys: List[str] = []
+        try:
+            wk = _sre_report_whole_dashboard_image_key()
+            if wk:
+                whole_keys.append(wk)
+        except Exception:
+            logger.exception("SRE report: whole-dashboard capture failed — sending without it")
+        card = _sre_report_card_dict(greeting, img_keys, note, kinds, series, whole_keys)
         _lark_send_interactive_card("chat_id", chat, card)
         logger.info(
-            "SRE report card sent chat=%s duty=%s images=%s kinds=%s by=%s%s",
-            chat, names or "-", len(img_keys), kinds or "-", operator_open_id or "?",
-            f" (duty error: {err})" if err else "",
+            "SRE report card sent chat=%s duty=%s images=%s whole=%s kinds=%s series=%s by=%s%s",
+            chat, names or "-", len(img_keys), len(whole_keys), kinds or "-", series or "-",
+            operator_open_id or "?", f" (duty error: {err})" if err else "",
         )
     except Exception as e:
         logger.exception("SRE report card send failed (chat=%s)", chat)
@@ -7556,7 +7617,7 @@ def _sre_report_card_click_worker(img_keys: List[str], kinds: List[str], operato
 
 
 def _alert_sre_report_button_elements(
-    alert_kinds: List[str], img_keys: List[str]
+    alert_kinds: List[str], img_keys: List[str], alert_series: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
     """The "Report to SRE" button row shown on alert cards.
 
@@ -7581,6 +7642,11 @@ def _alert_sre_report_button_elements(
         "v": "sre_report",
         "imgs": ",".join(keys),
         "kinds": ",".join([k for k in (alert_kinds or []) if (k or "").strip()]),
+        # The series name is payload-derived and the alert payload is gone by click time, so it has
+        # to ride along here. Commas separate names, so drop any that contain one.
+        "series": ",".join(
+            [s.strip() for s in (alert_series or []) if (s or "").strip() and "," not in s]
+        ),
     }
     return [
         _monitoring_card_v2_callback_button(
@@ -7657,6 +7723,7 @@ def _monitoring_interactive_card_dict(
     lark_img_key: Optional[str] = None,
     alert_kinds: Optional[List[str]] = None,
     lark_img_keys: Optional[List[str]] = None,
+    alert_series: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Feishu card JSON v2 — markdown card, embedded PNG(s), optional alert quick-mute row.
@@ -7682,7 +7749,9 @@ def _monitoring_interactive_card_dict(
     # and ``alert_kinds`` is what keeps the button off the ``/mo`` reply (which merely quotes the
     # "[ALERT]" banner, so anyone running /mo mid-alert would otherwise get a page-the-SRE button).
     if is_alert_card and MONITORING_SRE_REPORT_ENABLE and keys and alert_kinds:
-        elements.extend(_alert_sre_report_button_elements(list(alert_kinds), keys))
+        elements.extend(
+            _alert_sre_report_button_elements(list(alert_kinds), keys, list(alert_series or []))
+        )
     if _lark_env_truthy("MONITORING_MESSAGE_CARD_BUTTON_ENABLE"):
         cb_payload: Dict[str, Any] = {"k": "monitoring_btn", "v": "refresh"}
         rt = (receive_id_type or "").strip()
@@ -11858,6 +11927,16 @@ def _lark_send_alert_cards_per_panel(
                 keys.append(_lark_upload_png_image_key(png))
             except Exception:
                 logger.exception("alert card: image upload failed kind=%r", kind)
+        # Legend label(s) of the series that actually spiked — "http", or one per spiked series on
+        # a per-series panel like 错误请求数/1m. Recomputed here because the capture pipeline drops
+        # the label (_grafana_capture_solo_jobs returns only (title, png)).
+        try:
+            series = _grafana_alert_isolate_series_labels(
+                _monitoring_panel_title_for_kind(kind) or "", payload
+            )
+        except Exception:
+            logger.exception("alert card: series label lookup failed kind=%r", kind)
+            series = []
         try:
             card = _monitoring_interactive_card_dict(
                 body,
@@ -11866,6 +11945,7 @@ def _lark_send_alert_cards_per_panel(
                 None,
                 alert_kinds=[kind],
                 lark_img_keys=keys,
+                alert_series=series,
             )
             _lark_send_interactive_card(receive_id_type, rid, card)
             sent += 1
@@ -14255,13 +14335,14 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> Optional[Dict[str, A
         # reported back to whoever pressed the button.
         img_keys = [s.strip() for s in _lark_dict_pick_str(val, "imgs").split(",") if s.strip()]
         kinds = [s.strip() for s in _lark_dict_pick_str(val, "kinds").split(",") if s.strip()]
+        series = [s.strip() for s in _lark_dict_pick_str(val, "series").split(",") if s.strip()]
         logger.info(
-            "card.action sre_report accepted images=%s kinds=%s by=%r event_id=%r",
-            len(img_keys), kinds or "-", open_id or None, ev_id or None,
+            "card.action sre_report accepted images=%s kinds=%s series=%s by=%r event_id=%r",
+            len(img_keys), kinds or "-", series or "-", open_id or None, ev_id or None,
         )
         threading.Thread(
             target=_sre_report_card_click_worker,
-            args=(img_keys, kinds, open_id),
+            args=(img_keys, kinds, series, open_id),
             daemon=True,
             name="sre-report-card-action",
         ).start()
