@@ -487,6 +487,22 @@ _CFG: Dict[str, Any] = {
     # 告警很稀疏时 keep_alive 会过期 → 下次告警又是 23GB 冷加载 → 超时 → 「AI review unavailable」。
     "MONITORING_AI_WARM_ENABLE": "1",
     "MONITORING_AI_WARM_INTERVAL_SECONDS": "1200",
+    # ---- Ollama 健康看门狗：定期确认 AI 真的活着；死了就通知 + 自动重启，恢复后再通知 ----
+    "MONITORING_AI_HEALTH_ENABLE": "1",
+    "MONITORING_AI_HEALTH_INTERVAL_SECONDS": "60",
+    # 探活分两步：先 /api/tags 确认进程在，再对**已驻留**的模型要 1 个 token 确认没卡死
+    "MONITORING_AI_HEALTH_PING_TIMEOUT_SECONDS": "10",
+    "MONITORING_AI_HEALTH_GEN_TIMEOUT_SECONDS": "45",
+    # 连续失败几次才判定为 dead（避免一次网络抖动就重启）
+    "MONITORING_AI_HEALTH_FAILS_BEFORE_DEAD": "2",
+    # 死亡/恢复通知发到哪个群（空 = 回退 MONITORING_ALERT_CHAT_ID）
+    "MONITORING_AI_HEALTH_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
+    "MONITORING_AI_RESTART_ENABLE": "1",
+    # 由运维配置的重启命令（与其它 _CFG 同信任级别）；systemd 之外可改成 docker restart 等
+    "MONITORING_AI_RESTART_COMMAND": "systemctl restart ollama",
+    "MONITORING_AI_RESTART_TIMEOUT_SECONDS": "90",
+    # 两次自动重启之间的最小间隔，避免模型加载期间反复重启
+    "MONITORING_AI_RESTART_COOLDOWN_SECONDS": "600",
     # fail-open 提示里附带具体原因（no screenshot / model timeout / ollama unreachable …）
     "MONITORING_AI_FAIL_NOTE_SHOW_REASON": "1",
     # AI 不可达 / 无法判定时：1=照常发送（不漏报），0=抑制不发
@@ -14739,6 +14755,263 @@ def _start_monitoring_ai_warm_if_enabled() -> None:
     threading.Thread(target=_monitoring_ai_warm_loop, daemon=True, name="ai-warm").start()
 
 
+# ---------------------------------------------------------------------------
+# Ollama health watchdog. The AI gate fails open, so a dead model degrades silently into
+# "AI review unavailable" notes on every alert — nobody is told the reviewer itself is down.
+# This probes it on a timer, announces a death, restarts it, and announces the recovery.
+# ---------------------------------------------------------------------------
+_ai_health_state: Dict[str, Any] = {
+    "healthy": None,      # None = not probed yet, True/False afterwards
+    "fails": 0,
+    "down_since": 0.0,
+    "last_restart": 0.0,
+    "last_detail": "",
+}
+_ai_health_lock = threading.Lock()
+
+
+def _monitoring_ai_health_chat_id() -> str:
+    cid = _cfg_str("MONITORING_AI_HEALTH_CHAT_ID", "").strip()
+    return cid or _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
+
+
+def _monitoring_ai_health_probe() -> Tuple[bool, str]:
+    """
+    ``(healthy, detail)``.
+
+    Two stages, because "daemon answers" is not the failure that actually bit us: the alert that
+    prompted this timed out *generating*, which a ``/api/tags`` ping would have called healthy.
+    A model that is merely cold is **not** dead — that path reloads it and waits for the next
+    cycle rather than restarting the daemon underneath a legitimate 23GB load.
+    """
+    url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+    model = _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
+    ping_t = max(2.0, _cfg_float("MONITORING_AI_HEALTH_PING_TIMEOUT_SECONDS", 10.0))
+    gen_t = max(5.0, _cfg_float("MONITORING_AI_HEALTH_GEN_TIMEOUT_SECONDS", 45.0))
+    if not url or not model:
+        return True, "health check skipped (no url/model configured)"
+
+    try:
+        r = requests.get(f"{url}/api/tags", timeout=ping_t)
+        r.raise_for_status()
+    except Exception as e:
+        return False, f"daemon unreachable at {url} ({e.__class__.__name__}: {e})"
+
+    resident = False
+    try:
+        r = requests.get(f"{url}/api/ps", timeout=ping_t)
+        r.raise_for_status()
+        for m in (r.json().get("models") or []):
+            name = str(m.get("model") or m.get("name") or "")
+            if model and (model in name or name in model):
+                resident = True
+                break
+    except Exception:
+        resident = True  # old Ollama without /api/ps — let the generate probe decide
+
+    if not resident:
+        ok = _monitoring_ai_preload_model("health probe: model not resident")
+        return ok, ("model was not resident — reloaded" if ok else "model not resident and reload failed")
+
+    t0 = time.monotonic()
+    try:
+        r = requests.post(
+            f"{url}/api/chat",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": False,
+                "keep_alive": _monitoring_ai_keep_alive_value(),
+                "options": {"num_predict": 1},
+            },
+            timeout=gen_t,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return False, f"model resident but no token within {gen_t:.0f}s ({e.__class__.__name__}: {e})"
+    return True, f"responsive in {time.monotonic() - t0:.1f}s"
+
+
+def _monitoring_ai_restart_ollama() -> str:
+    """Run the operator-configured restart command. Returns a human line for the card."""
+    if not _lark_env_truthy_or_default("MONITORING_AI_RESTART_ENABLE", default=True):
+        return "⏸️ auto-restart disabled (`MONITORING_AI_RESTART_ENABLE=0`)"
+    cmd = _cfg_str("MONITORING_AI_RESTART_COMMAND", "systemctl restart ollama").strip()
+    if not cmd:
+        return "⏸️ no restart command configured"
+    cool = max(0.0, _cfg_float("MONITORING_AI_RESTART_COOLDOWN_SECONDS", 600.0))
+    now = time.time()
+    with _ai_health_lock:
+        prev = float(_ai_health_state.get("last_restart") or 0.0)
+        if cool > 0 and prev and (now - prev) < cool:
+            left = cool - (now - prev)
+            return f"⏳ restart skipped — cooldown, {left:.0f}s left (last restart {now - prev:.0f}s ago)"
+        _ai_health_state["last_restart"] = now
+    t = max(10.0, _cfg_float("MONITORING_AI_RESTART_TIMEOUT_SECONDS", 90.0))
+    t0 = time.monotonic()
+    try:
+        # shell=True: the command is operator-supplied config, same trust level as the rest of _CFG.
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t)
+        dt = time.monotonic() - t0
+        if p.returncode == 0:
+            logger.info("monitoring AI restart: %r succeeded in %.1fs", cmd, dt)
+            return f"✅ `{cmd}` succeeded in {dt:.1f}s"
+        err = ((p.stderr or p.stdout or "").strip().splitlines() or [""])[0][:160]
+        logger.warning("monitoring AI restart: %r exited %s — %s", cmd, p.returncode, err)
+        return f"❌ `{cmd}` exited {p.returncode} — {err or 'no output'}"
+    except subprocess.TimeoutExpired:
+        logger.warning("monitoring AI restart: %r timed out after %.0fs", cmd, t)
+        return f"❌ `{cmd}` timed out after {t:.0f}s"
+    except Exception as e:
+        logger.exception("monitoring AI restart failed")
+        return f"❌ `{cmd}` failed — {e.__class__.__name__}: {e}"
+
+
+def _monitoring_ai_health_card(*, dead: bool, detail: str, restart_line: str = "", downtime: str = "") -> Dict[str, Any]:
+    url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+    model = _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
+    stamp = time.strftime("%m-%d %H:%M:%S")
+    if dead:
+        title = "🔴 AI is dead — restarting it"
+        lines = [
+            "**🔴 Detected AI is dead — restarting it**",
+            "",
+            f"**Model:** `{model}`",
+            f"**Endpoint:** `{url}`",
+            f"**Cause:** {detail}",
+            f"**Detected:** {stamp}",
+        ]
+        if restart_line:
+            lines.append(f"**Restart:** {restart_line}")
+        lines.append("")
+        lines.append("_Alerts keep sending meanwhile — the AI gate fails open, just without an explanation._")
+    else:
+        title = "🟢 AI recovered"
+        lines = [
+            "**🟢 Ollama is back — AI review is working again**",
+            "",
+            f"**Model:** `{model}`",
+            f"**Endpoint:** `{url}`",
+            f"**Probe:** {detail}",
+        ]
+        if downtime:
+            lines.append(f"**Was down for:** {downtime}")
+        lines.append(f"**Recovered:** {stamp}")
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": "red" if dead else "green",
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "body": {"elements": [{"tag": "markdown", "content": "\n".join(lines)}]},
+    }
+
+
+def _monitoring_ai_health_notify(card: Dict[str, Any]) -> None:
+    chat_id = _monitoring_ai_health_chat_id()
+    if not chat_id:
+        logger.warning("monitoring AI health: no chat id configured — notification skipped")
+        return
+    try:
+        _set_reply_to_mid("")  # standalone card, never threaded onto some unrelated message
+        _lark_send_interactive_card("chat_id", chat_id, card)
+    except Exception:
+        logger.exception("monitoring AI health: card send failed")
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = int(max(0.0, seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
+def _monitoring_ai_health_record(healthy: bool, detail: str) -> None:
+    """Fold one probe result into the state machine, announcing only on transitions."""
+    need = max(1, _cfg_int("MONITORING_AI_HEALTH_FAILS_BEFORE_DEAD", 2))
+    now = time.time()
+    announce_dead = False
+    announce_back = False
+    downtime = ""
+    with _ai_health_lock:
+        was = _ai_health_state.get("healthy")
+        _ai_health_state["last_detail"] = detail
+        if healthy:
+            _ai_health_state["fails"] = 0
+            if was is False:
+                down = now - float(_ai_health_state.get("down_since") or now)
+                downtime = _fmt_duration(down)
+                announce_back = True
+            _ai_health_state["healthy"] = True
+            _ai_health_state["down_since"] = 0.0
+        else:
+            _ai_health_state["fails"] = int(_ai_health_state.get("fails") or 0) + 1
+            if _ai_health_state["fails"] >= need and was is not False:
+                _ai_health_state["healthy"] = False
+                _ai_health_state["down_since"] = now
+                announce_dead = True
+    if announce_dead:
+        logger.error("monitoring AI health: DEAD — %s", detail)
+        restart_line = _monitoring_ai_restart_ollama()
+        _monitoring_ai_health_notify(
+            _monitoring_ai_health_card(dead=True, detail=detail, restart_line=restart_line)
+        )
+    elif announce_back:
+        logger.info("monitoring AI health: recovered after %s — %s", downtime, detail)
+        _monitoring_ai_health_notify(
+            _monitoring_ai_health_card(dead=False, detail=detail, downtime=downtime)
+        )
+
+
+def _monitoring_ai_health_report_failure(reason: str) -> None:
+    """
+    A real gate call failed — count it immediately instead of waiting for the next probe.
+
+    The alert path is the most authoritative signal there is: it is the actual workload timing out.
+    """
+    if not _lark_env_truthy_or_default("MONITORING_AI_HEALTH_ENABLE", default=True):
+        return
+    r = (reason or "").strip()
+    if not r:
+        return
+    try:
+        _monitoring_ai_health_record(False, f"alert review failed — {r}")
+    except Exception:
+        logger.exception("monitoring AI health: failure report failed")
+
+
+def _monitoring_ai_health_loop() -> None:
+    interval = max(15.0, _cfg_float("MONITORING_AI_HEALTH_INTERVAL_SECONDS", 60.0))
+    time.sleep(min(30.0, interval))  # let the boot warm-up finish before judging
+    while True:
+        try:
+            healthy, detail = _monitoring_ai_health_probe()
+            _monitoring_ai_health_record(healthy, detail)
+        except Exception:
+            logger.exception("monitoring AI health: probe cycle failed")
+        time.sleep(interval)
+
+
+def _start_monitoring_ai_health_if_enabled() -> None:
+    """Watch Ollama; announce death + restart, then announce recovery."""
+    if not _lark_env_truthy_or_default("MONITORING_AI_GATE_ENABLE", default=True):
+        logger.info("monitoring AI health: skipped — AI gate disabled")
+        return
+    if not _lark_env_truthy_or_default("MONITORING_AI_HEALTH_ENABLE", default=True):
+        logger.info("monitoring AI health: disabled (MONITORING_AI_HEALTH_ENABLE=0)")
+        return
+    threading.Thread(target=_monitoring_ai_health_loop, daemon=True, name="ai-health").start()
+    logger.info(
+        "monitoring AI health watchdog started interval=%.0fs notify=%s restart=%r",
+        _cfg_float("MONITORING_AI_HEALTH_INTERVAL_SECONDS", 60.0),
+        (_monitoring_ai_health_chat_id() or "(none)")[:18],
+        _cfg_str("MONITORING_AI_RESTART_COMMAND", "systemctl restart ollama"),
+    )
+
+
 def _monitoring_ai_fail_open_note(reason: str = "") -> str:
     """
     Fail-open note, with the concrete cause appended when known — the same note used to appear for
@@ -14785,6 +15058,7 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
             fail_reason or "unknown",
             "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
         )
+        _monitoring_ai_health_report_failure(fail_reason)
         note_uv = _monitoring_ai_fail_open_note(fail_reason)
         if fail_open and note_uv:
             reply = f"{reply}\n\n{note_uv}"
@@ -17139,6 +17413,7 @@ def run_monitoring_bot() -> None:
     )
     _start_grafana_playwright_keeper_if_enabled()
     _start_monitoring_ai_warm_if_enabled()
+    _start_monitoring_ai_health_if_enabled()
     _start_monitoring_watchdog_if_enabled()
     _start_freespin_daily_sender_if_enabled()
     _start_freespin_boot_warm_if_enabled()
