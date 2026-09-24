@@ -69,6 +69,13 @@ from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
 import requests
 from flask import Flask, Response, g, jsonify, request
 
+_health_report_import_error = ""
+try:
+    import health_report  # shared daily health card (health_report.py next to this file)
+except Exception as _e:  # a missing / broken copy must never stop the bot from booting
+    health_report = None  # type: ignore[assignment]
+    _health_report_import_error = f"{_e.__class__.__name__}: {_e}"  # logged by the starter (no logger yet)
+
 # ---------------------------------------------------------------------------
 # 单一配置：只改这里（也可用 systemd Environment= 覆盖同名变量，无需 .env）
 # 勿将含真实密钥的 main.py 提交到公开仓库；泄露请到飞书/Grafana 后台轮换。
@@ -780,6 +787,8 @@ _monitoring_card_action_event_ids: set = set()
 _card_action_dedup_lock = threading.Lock()
 _monitoring_watch_last_alert_at: float = 0.0
 _monitoring_watch_started: bool = False
+# time.time() of the watchdog's last successful Grafana fetch (0.0 = none yet); read by the daily health report
+_monitoring_watch_last_ok_at: float = 0.0
 # (start_unix, end_unix, confirm_deadline_monotonic) — watchdog 冻结判窗待复核；None=无挂起
 _monitoring_watch_pending_confirm: Optional[Tuple[int, int, float]] = None
 _lark_bot_open_id_resolve_lock = threading.Lock()
@@ -11278,6 +11287,9 @@ class GrafanaPlaywrightKeeper:
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
         self._fatal: Optional[BaseException] = None
+        # Job outcomes for the daily health card: a Chromium that dies after warm-up only shows here.
+        self._last_job_at = 0.0
+        self._job_fail_streak = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -11465,6 +11477,8 @@ class GrafanaPlaywrightKeeper:
                             job_page.close()
                         except Exception:
                             pass
+                    self._last_job_at = time.time()
+                    self._job_fail_streak = self._job_fail_streak + 1 if "err" in box else 0
                     ev.set()
         except Exception as ex:
             self._fatal = ex
@@ -15096,6 +15110,8 @@ def _monitoring_watchdog_deliver_alert(
 
     ai_ok, reply_after = _monitoring_ai_gate_decide(alert_pngs, reply)
     if not ai_ok:
+        if health_report is not None:
+            health_report.bump("Watchdog alerts suppressed by AI gate")
         logger.info(
             "monitoring watchdog: alert suppressed by AI gate (%s) chat_prefix=%s...",
             ctx,
@@ -15117,6 +15133,8 @@ def _monitoring_watchdog_deliver_alert(
                 len(pairs),
                 alert_chat[:16],
             )
+            if health_report is not None:
+                health_report.bump("Watchdog alerts sent")
             return True
         logger.warning(
             "monitoring watchdog: no per-panel blocks (%s) — falling back to combined card", ctx
@@ -15142,6 +15160,8 @@ def _monitoring_watchdog_deliver_alert(
         used_card,
         embedded,
     )
+    if health_report is not None:
+        health_report.bump("Watchdog alerts sent")  # card/text is out; the extra PNGs below are best-effort
     if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
         try:
             n_img = _lark_send_monitoring_alert_pngs(
@@ -15164,7 +15184,7 @@ def _monitoring_watchdog_deliver_alert(
 
 def _monitoring_watchdog_loop() -> None:
     """Periodic Grafana check; alert chat on >= threshold drop/spike."""
-    global _monitoring_watch_last_alert_at, _monitoring_watch_pending_confirm
+    global _monitoring_watch_last_alert_at, _monitoring_watch_pending_confirm, _monitoring_watch_last_ok_at
     sec = max(15.0, _cfg_float("MONITORING_WATCH_INTERVAL_SECONDS", 20.0))
     cool = max(0.0, _cfg_float("MONITORING_WATCH_ALERT_COOLDOWN_SECONDS", 300.0))
     confirm_s = MONITORING_WATCH_CONFIRM_SECONDS
@@ -15234,6 +15254,7 @@ def _monitoring_watchdog_loop() -> None:
                         start_unix=ps,
                         end_unix=pe,
                     )
+                    _monitoring_watch_last_ok_at = time.time()
                 except Exception:
                     logger.exception("monitoring watchdog confirm fetch failed")
                     time.sleep(sec)
@@ -15296,6 +15317,7 @@ def _monitoring_watchdog_loop() -> None:
 
                 sess = grafana_login_session()
                 payload = fetch_monitoring_payload(session=sess, for_watchdog=True)
+                _monitoring_watch_last_ok_at = time.time()
                 if not _monitoring_payload_hit_alert(payload):
                     time.sleep(sec)
                     continue
@@ -15350,6 +15372,267 @@ def _start_monitoring_watchdog_if_enabled() -> None:
             return
         _monitoring_watch_started = True
     threading.Thread(target=_monitoring_watchdog_loop, daemon=True, name="monitoring-watchdog").start()
+
+
+# ---------------------------------------------------------------------------
+# Daily health report (shared health_report.py): one status card a day to the ops group.
+# Its HEALTH_REPORT_* knobs are read from os.environ (systemd Environment=), not _CFG; module
+# defaults are 09:00 UTC+8 to oc_ad9b… (Laboratory). The checks below are read-only: they
+# report in-memory state or make one short GET / token call — never send, restart or log in.
+# ---------------------------------------------------------------------------
+_health_boot_at = time.time()
+
+
+def _health_host(url: str) -> str:
+    """Hostname only — a full URL could carry credentials."""
+    from urllib.parse import urlparse
+
+    try:
+        return urlparse(url).hostname or "?"
+    except Exception:
+        return "?"
+
+
+def _health_check_lark_api() -> Tuple[Any, str]:
+    """Fresh tenant-token fetch; does not touch the send path's token cache."""
+    if not APP_ID or not APP_SECRET:
+        return "fail", "APP_ID / APP_SECRET not configured"
+    base = _lark_api_domain()
+    host = _health_host(base)
+    t0 = time.monotonic()
+    try:
+        r = requests.post(
+            f"{base}/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": str(APP_ID).strip(), "app_secret": str(APP_SECRET).strip()},
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            timeout=10,
+        )
+    except Exception as e:
+        return "fail", f"{host}: {e.__class__.__name__}"
+    ms = (time.monotonic() - t0) * 1000.0
+    try:
+        j = r.json()
+    except ValueError:
+        j = None
+    if not isinstance(j, dict):
+        return "fail", f"{host}: HTTP {r.status_code}, non-JSON reply"
+    if r.status_code != 200 or j.get("code") != 0 or not j.get("tenant_access_token"):
+        return "fail", f"{host}: HTTP {r.status_code}, code {j.get('code')} {str(j.get('msg') or '')[:80]}".rstrip()
+    return "ok", f"{host}: tenant token OK in {ms:.0f} ms"
+
+
+def _health_check_webhook_server() -> Tuple[Any, str]:
+    """Local GET /health on the listener that takes Lark events (http mode) and card callbacks."""
+    import sys
+
+    mode = _cfg_str("LARK_EVENT_MODE", "http").strip().lower() or "http"
+    if mode == "ws" and _cfg_str("ENABLE_HTTP", "1").strip().lower() not in ("1", "true", "yes", "on"):
+        return None, "disabled by ENABLE_HTTP"
+    port = _cfg_listen_port()
+    t0 = time.monotonic()
+    try:
+        r = requests.get(f"http://127.0.0.1:{port}/health", timeout=5)
+    except Exception as e:
+        return "fail", f"port {port}: {e.__class__.__name__}"
+    ms = (time.monotonic() - t0) * 1000.0
+    if r.status_code != 200:
+        return "fail", f"port {port}: HTTP {r.status_code}"
+    stack = _cfg_str("HTTP_SERVER", "flask").strip().lower()
+    # run_http() imports waitress lazily and serves Flask when that import fails (one boot warning only).
+    if stack in ("waitress", "wsgi") and "waitress" not in sys.modules:
+        return "warn", f"port {port}: HTTP 200 in {ms:.0f} ms — waitress not installed, Flask fallback serving ({mode} mode)"
+    # Feishu gives callbacks ~1-3s end to end; a slow local /health means the thread pool is saturated.
+    return ("ok" if ms < 1000 else "warn"), f"port {port}: HTTP 200 in {ms:.0f} ms ({stack}, {mode} mode)"
+
+
+def _health_check_grafana() -> Tuple[Any, str]:
+    """Grafana's unauthenticated /api/health — no login, no dashboard query."""
+    host = _health_host(GRAFANA_BASE_URL)
+    t0 = time.monotonic()
+    try:
+        r = requests.get(f"{GRAFANA_BASE_URL}/api/health", timeout=10)
+    except Exception as e:
+        return "fail", f"{host}: {e.__class__.__name__}"
+    ms = (time.monotonic() - t0) * 1000.0
+    if r.status_code != 200:
+        return "fail", f"{host}: HTTP {r.status_code} in {ms:.0f} ms"
+    try:
+        j = r.json()
+    except ValueError:
+        j = None
+    j = j if isinstance(j, dict) else {}
+    db = str(j.get("database") or "?")
+    ver = str(j.get("version") or "")[:20]
+    return ("ok" if db == "ok" else "warn"), f"{host}: HTTP 200 in {ms:.0f} ms, database {db}" + (
+        f", v{ver}" if ver else ""
+    )
+
+
+def _health_check_watchdog() -> Tuple[Any, str]:
+    """Age of the watchdog's last successful Grafana fetch."""
+    if not _monitoring_watch_started:
+        return None, "disabled by MONITORING_WATCH_ENABLE"
+    sec = max(15.0, _cfg_float("MONITORING_WATCH_INTERVAL_SECONDS", 20.0))
+    # A cycle that raises an alert blocks for minutes (confirm wait, screenshots, AI review) — hence the floors.
+    warn_after = max(3 * sec, 600.0)
+    fail_after = max(15 * sec, 1800.0)
+    now = time.time()
+    last = _monitoring_watch_last_ok_at
+    if _monitoring_watch_in_daily_quiet_local(now):
+        return "ok", "daily quiet window, not polling" + (f"; last poll {_fmt_duration(now - last)} ago" if last else "")
+    if not last:
+        up = now - _health_boot_at
+        if up < warn_after:
+            return "ok", f"no poll yet (started {_fmt_duration(up)} ago)"
+        return "fail", f"no successful Grafana poll since boot {_fmt_duration(up)} ago"
+    age = now - last
+    detail = f"last successful poll {_fmt_duration(age)} ago (every {sec:.0f}s)"
+    if age > fail_after:
+        return "fail", detail
+    if age > warn_after:
+        return "warn", detail
+    return "ok", detail
+
+
+def _health_check_ollama() -> Tuple[Any, str]:
+    """AI-gate model server: the ai-health watchdog's latest verdict (<= 1 interval old), else a /api/tags ping."""
+    if not _lark_env_truthy_or_default("MONITORING_AI_GATE_ENABLE", default=True):
+        return None, "disabled by MONITORING_AI_GATE_ENABLE"
+    model = _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
+    url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+    host = _health_host(url)
+    with _ai_health_lock:
+        st = dict(_ai_health_state)
+    healthy = st.get("healthy")
+    detail = str(st.get("last_detail") or "")
+    detail = (detail.replace(url, host) if url else detail)[:140]
+    now = time.time()
+    if healthy is True:
+        fails = int(st.get("fails") or 0)
+        if fails:
+            return "warn", f"{model}: last probe failed ({fails}x) — {detail}"
+        return "ok", f"{model}: {detail or 'healthy'}"
+    if healthy is False:
+        down = _fmt_duration(now - float(st.get("down_since") or now))
+        restart = float(st.get("last_restart") or 0.0)
+        tail = f"; last restart {_fmt_duration(now - restart)} ago" if restart else ""
+        return "fail", f"{model}: down for {down} — {detail}{tail}"
+    # Not probed yet, or MONITORING_AI_HEALTH_ENABLE=0: just check the daemon answers.
+    t0 = time.monotonic()
+    try:
+        r = requests.get(f"{url}/api/tags", timeout=5)
+    except Exception as e:
+        return "fail", f"{host}: {e.__class__.__name__}"
+    if r.status_code != 200:
+        return "fail", f"{host}: HTTP {r.status_code}"
+    return "ok", f"{host}: daemon up in {(time.monotonic() - t0) * 1000.0:.0f} ms (no model probe yet)"
+
+
+def _health_check_chromium() -> Tuple[Any, str]:
+    """Persistent Playwright Chromium that renders alert / menu screenshots."""
+    if not _grafana_persistent_browser_enabled():
+        return None, "disabled by GRAFANA_SCREENSHOT_ENABLE / GRAFANA_PERSISTENT_BROWSER"
+    k = _grafana_pw_keeper
+    if k is None:
+        return "fail", "keeper not started; screenshots launch a new browser each time"
+    fatal = k._fatal
+    if isinstance(fatal, ImportError):
+        return "fail", "Playwright not installed"
+    if fatal is not None:
+        return "fail", f"keeper crashed ({fatal.__class__.__name__}); screenshots fall back to a one-off browser"
+    if k._thread is None or not k._thread.is_alive():
+        return "fail", "keeper thread not running"
+    if not k._ready.is_set():
+        up = time.time() - _health_boot_at
+        # request_png itself waits this long for the warm-up before giving up.
+        warm = max(120.0, float(GRAFANA_SCREENSHOT_TIMEOUT_MS) / 1000.0 + 45.0)
+        if up < 3 * warm:
+            return "ok", f"warming up (started {_fmt_duration(up)} ago)"
+        return "warn", f"warm-up not finished after {_fmt_duration(up)}"
+    q = k._q.qsize()
+    streak = k._job_fail_streak
+    if streak:
+        ago = _fmt_duration(time.time() - k._last_job_at)
+        return "warn", f"last {streak} screenshot job(s) failed, latest {ago} ago; screenshots fall back to a one-off browser"
+    return ("ok" if q < 5 else "warn"), f"Chromium ready, {q} screenshot job(s) queued"
+
+
+def _health_check_alert_mutes() -> Tuple[Any, str]:
+    """Active /m mutes silence watchdog alerts; flag one that still has more than 12 h to run (longest choice is 1 day)."""
+    now = time.time()
+    graphs = {k: float(v or 0.0) for k, v in dict(_MONITORING_MUTE_UNTIL).items() if float(v or 0.0) > now}
+    series = [float(v or 0.0) for v in dict(_MONITORING_SERIES_MUTE_UNTIL).values() if float(v or 0.0) > now]
+    if not graphs and not series:
+        return "ok", "none active"
+    parts: List[str] = []
+    if graphs:
+        names = ", ".join(_mute_channel_display_label(k) for k in sorted(graphs))
+        parts.append(f"{len(graphs)} graph(s) ({names[:90]})")
+    if series:
+        parts.append(f"{len(series)} series")
+    left = max(list(graphs.values()) + series) - now
+    detail = f"{' + '.join(parts)} muted; longest has {_fmt_duration(left)} left"
+    return ("warn" if left > 12 * 3600 else "ok"), detail
+
+
+def _health_report_send_card(chat_id: str, card: Dict[str, Any]) -> Any:
+    """Post the report as a fresh message via the module's Lark sender with this bot's app.
+
+    Unlike ``_lark_send_interactive_card`` (``raise_for_status`` drops Lark's code on HTTP 400) it
+    raises LarkError(code), so 230002 / 99991672 stop the retries with a hint, and it carries the
+    report's Lark uuid, so a retry after a timed-out send that did arrive posts no second card.
+    Built per call so it follows ``_lark_api_domain()`` (the WS region override); never threaded."""
+    return health_report.make_lark_sender(
+        str(APP_ID or "").strip(), str(APP_SECRET or "").strip(), _lark_api_domain()
+    )(chat_id, card)
+
+
+def _health_report_expected_threads() -> List[str]:
+    """Long-lived threads the boot starters launched in this configuration (one-shot warmers excluded)."""
+    gate = _lark_env_truthy_or_default("MONITORING_AI_GATE_ENABLE", default=True)
+    names: List[str] = []
+    if _grafana_pw_keeper is not None:
+        names.append("grafana-playwright-keeper")
+    if (
+        gate
+        and _lark_env_truthy_or_default("MONITORING_AI_WARM_ENABLE", default=True)
+        and _cfg_float("MONITORING_AI_WARM_INTERVAL_SECONDS", 1200.0) > 0
+    ):
+        names.append("ai-warm")
+    if gate and _lark_env_truthy_or_default("MONITORING_AI_HEALTH_ENABLE", default=True):
+        names.append("ai-health")
+    if _monitoring_watch_started:
+        names.append("monitoring-watchdog")
+    if _freespin_daily_started:
+        names.append("freespin-daily")
+    mode = _cfg_str("LARK_EVENT_MODE", "http").strip().lower() or "http"
+    if mode == "ws" and _cfg_str("ENABLE_HTTP", "1").strip().lower() in ("1", "true", "yes", "on"):
+        names.append("http-sidecar")
+    return names
+
+
+def _start_daily_health_report_if_enabled() -> None:
+    """Start the daily health card thread (HEALTH_REPORT_ENABLE=0 turns it off); never breaks boot."""
+    if health_report is None:
+        logger.warning("health report: health_report.py not importable (%s) — daily report off", _health_report_import_error)
+        return
+    try:
+        health_report.start(
+            "monitoring",
+            send_card=_health_report_send_card,
+            checks=[
+                ("Lark API", _health_check_lark_api),
+                ("Webhook server", _health_check_webhook_server),
+                ("Grafana", _health_check_grafana),
+                ("Grafana watchdog", _health_check_watchdog),
+                ("Ollama (AI gate)", _health_check_ollama),
+                ("Chromium (screenshots)", _health_check_chromium),
+                ("Alert mutes", _health_check_alert_mutes),
+            ],
+            expect_threads=_health_report_expected_threads(),
+        )
+    except Exception:
+        logger.exception("health report: start failed — bot keeps running without it")
 
 
 def _run_monitoring_background_job(
@@ -15684,6 +15967,9 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         mtype or None,
         (chat_resolved[:12] + "…") if len(chat_resolved) > 12 else (chat_resolved or None),
     )
+    if health_report is not None:
+        health_report.bump("Lark events")
+        health_report.mark("Last Lark event")
     logger.debug("im.message msg_keys=%s", list(msg.keys())[:24] if isinstance(msg, dict) else [])
     if _monitoring_chat_is_ignored(chat_resolved, _lark_message_chat_id_aliases(msg)):
         logger.info(
@@ -17417,6 +17703,7 @@ def run_monitoring_bot() -> None:
     _start_monitoring_watchdog_if_enabled()
     _start_freespin_daily_sender_if_enabled()
     _start_freespin_boot_warm_if_enabled()
+    _start_daily_health_report_if_enabled()
     port = _cfg_listen_port()
     if MONITORING_AT_MENTION_ENABLE or MONITORING_TRIGGER_REQUIRES_AT_BOT:
         _oid = _lark_effective_bot_open_id()

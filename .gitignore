@@ -3,3 +3,7 @@
 # and git refuses to overwrite it with the tracked copy.
 __pycache__/
 *.py[cod]
+# Daily health report state (health_report.py) — local to each host, must not block `git pull`.
+.health_report_state.json
+.health_report_state.json.tmp
+.health_report_state.lock
